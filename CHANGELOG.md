@@ -18,6 +18,20 @@
   snapshot files pruned alongside; armed state survives restarts.
   `[away]` config section (cadence, gap/cooldowns, listen window,
   greetings, snapshot dir).
+- **Away mode runtime features (same-day amendment, all hot-configurable
+  via `scene.away.*` in `PUT /api/config`).** ① Voice arm/disarm:
+  short utterances ("我要出门了" / "我回来了") arm/disarm ahead of the
+  LLM (keyword intent, question-shaped utterances excluded). ② Disarm
+  summary: window stats upgraded to a one-liner by the local LLM —
+  `POST /api/away` disarm response `summary` field, spoken on voice
+  disarm. ③ Deterrence escalation: unanswered strangers re-asked once
+  (`reask` state, half window) then played the deterrence message
+  (`reask_text`/`deterrence_text`). ④ Scheduled arm/disarm
+  (`schedule_arm`/`schedule_disarm` HH:MM boundary edges,
+  `schedule_weekdays_only`). ⑤ Opt-in visitor push webhook
+  (`push_url`; JSON POST, text-only, fail-open; empty = zero egress).
+  ⑥ Audio link: voted sound alarms land as away activity records while
+  armed (`audio_link`).
 
 - **Agent tools & skills framework (SPEC §3.5 / appendix A #43).** The
   dialogue assistant can now call tools: built-ins (`time.now`,

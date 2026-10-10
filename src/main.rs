@@ -865,6 +865,14 @@ async fn main() -> anyhow::Result<()> {
         pool: pool.clone(),
         event_tx: Arc::clone(&event_tx),
     });
+    // Schedule watcher (#44 amendment): scene.away.schedule_arm/disarm
+    // boundary-minute edges; no-op while both times are empty.
+    web::away::spawn_scheduler(
+        Arc::clone(&away_engine),
+        pool.clone(),
+        Arc::clone(&event_tx),
+        Some(Arc::clone(&chat_engine)),
+    );
     if !voice_engine.is_active() {
         tracing::info!(reason = %voice_engine.inactive_reason(), "voice: interaction disabled");
     }
@@ -1012,6 +1020,9 @@ async fn main() -> anyhow::Result<()> {
         let records_pool = pool.clone();
         let grounding_sound = Arc::clone(&grounding_state);
         let sound_pool_for_scene = pool.clone();
+        // Away audio link (#44 amendment): sound alarms become away
+        // activity records while armed.
+        let away_for_sound = Arc::clone(&away_engine);
         let streams_for_sound = Arc::clone(&segment_registry);
         let desktop_sound_alarm = Arc::clone(&desktop);
         tokio::spawn(async move {
@@ -1067,6 +1078,21 @@ async fn main() -> anyhow::Result<()> {
                         });
                         // Desktop notification (SPEC appendix A #42).
                         desktop_sound_alarm.notify_alarm("audio", 1, Some(&ev.class));
+                        // Away audio link (#44): one activity record per
+                        // cooldown while armed (observe_audio gates the
+                        // audio_link setting + cooldown internally).
+                        if away_for_sound.is_armed()
+                            && let Some(labels) =
+                                away_for_sound.observe_audio(&ev.class, ev.score, ev.timestamp_ms)
+                        {
+                            mibee_eye::away_monitor::record_audio_event(
+                                &away_for_sound,
+                                &sound_pool_for_scene,
+                                &bridge_tx,
+                                &labels,
+                            )
+                            .await;
+                        }
                         if alarm_notify_gate.load(std::sync::atomic::Ordering::SeqCst) {
                             let notifier =
                                 notifier_slot.lock().expect("gb notifier slot lock").clone();
@@ -1222,6 +1248,10 @@ async fn main() -> anyhow::Result<()> {
         let agent_config_for_voice = config.agent.clone();
         let wake_word_for_voice = config.voice.wake_word.clone();
         let voice_engine_for_arming = Arc::clone(&voice_engine);
+        // Away voice control (#44): short utterances arm/disarm the
+        // watch ahead of the decision/LLM pipeline.
+        let away_for_voice = Arc::clone(&away_engine);
+        let tts_for_away_cmd = Arc::clone(&tts_engine);
         // Conversation session (#30-B): the last 120 s of turns give
         // follow-ups ("再说详细点") their context. The slot also owns the
         // conversation trace (SPEC §3.3): all turns inside the window land
@@ -1323,6 +1353,74 @@ async fn main() -> anyhow::Result<()> {
                             conv.id(),
                         )
                         .user_text(ev.transcript.clone());
+                        // Away voice control (#44 amendment): "我要出门了"
+                        // / "我回来了" arm/disarm the watch directly — a
+                        // built-in intent, answered without the LLM.
+                        let away_cmd_started = std::time::Instant::now();
+                        if let Some(want_active) = web::away::match_voice_command(&ev.transcript)
+                            && away_for_voice.settings_snapshot().voice_control
+                        {
+                            let result = web::away::set_active(
+                                &away_for_voice,
+                                &records_pool,
+                                &bridge_tx,
+                                want_active,
+                                Some(&chat_for_voice),
+                            )
+                            .await;
+                            let (reply, note) = match &result {
+                                Ok(None) if want_active => (
+                                    "好的，离家模式已布防，路上注意安全。".to_string(),
+                                    "已布防".to_string(),
+                                ),
+                                Ok(summary) => match summary {
+                                    Some(s) => (
+                                        format!("欢迎回家！离家模式已撤防。{s}"),
+                                        format!("已撤防 · {s}"),
+                                    ),
+                                    None => (
+                                        "欢迎回家！离家模式已撤防。".to_string(),
+                                        "已撤防（无事件）".to_string(),
+                                    ),
+                                },
+                                Err(reason) => (
+                                    format!("抱歉，当前无法布防：{reason}"),
+                                    format!("布防失败：{reason}"),
+                                ),
+                            };
+                            let _ = bridge_tx.send(web::routes::events::CameraEvent::ChatReply {
+                                source: "voice".into(),
+                                reply: reply.clone(),
+                                grounded: "none".into(),
+                                timestamp_ms: unix_now_ms(),
+                            });
+                            if tts_for_away_cmd.is_active() {
+                                voice_engine_for_arming.begin_playback_mute();
+                                let tts = Arc::clone(&tts_for_away_cmd);
+                                let text = reply.clone();
+                                if let Err(e) =
+                                    tokio::task::spawn_blocking(move || tts.speak(&text)).await
+                                {
+                                    tracing::warn!(error = %e, "away: command speak failed");
+                                }
+                                voice_engine_for_arming.end_playback_mute();
+                            }
+                            voice_engine_for_arming.arm_follow_up();
+                            desktop_for_voice.notify_conversation(&reply);
+                            convlog_for_voice
+                                .finish(
+                                    draft
+                                        .think(
+                                            "away.command",
+                                            "builtin",
+                                            note,
+                                            away_cmd_started.elapsed().as_millis() as u64,
+                                        )
+                                        .reply(reply, "builtin"),
+                                )
+                                .await;
+                            continue;
+                        }
                         // Decision triage (SPEC appendix A #26): one Laya
                         // typed decision classifies the transcript before
                         // any local-LLM tokens are spent. `ignore` skips

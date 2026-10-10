@@ -200,13 +200,18 @@ description of the scene. Capability key `away`
 
 Event object:
 `{"id","camera_id","kind":"person"|"activity","started_ms","labels","face_name"?,"description"?,"visitor_reply"?,"snapshot"?,"state"}`.
-Person states: `greeting → listening → answered|silent`, or terminal
-`known` / `no_voice`; activity rows are `recorded`. Every create and
+Person states: `greeting → listening → answered|silent` (with the
+deterrence knob on: `listening → reask → silent`), or terminal `known` /
+`no_voice`; activity rows are `recorded`. Disarming returns an additive
+`summary` field when events accumulated and the summary knob is on. Every create and
 state migration rides the SSE `away_event` (upsert by `id`); arm/disarm
 broadcasts `away_state`. Armed state survives service restarts. Records
 are SQLite FIFO-capped at 1000; pruning and clear-all also delete the
 snapshot files. Config lives in `[away]` (cadence, gap/cooldowns,
-listen window, greetings); see `docs/en/configuration.md`.
+listen window, greetings); the six runtime features (voice arm/disarm,
+disarm summary, deterrence, schedule, visitor push webhook, audio link)
+are hot-configurable via `scene.away.*` in `PUT /api/config` — see
+`docs/en/configuration.md`.
 
 ### Devices (SPEC §4.8)
 

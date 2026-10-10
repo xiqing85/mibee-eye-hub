@@ -46,6 +46,8 @@ async function toggleAway() {
   }
   applyState(r.data);
   toast(armed ? t('awayArmedToast') : t('awayDisarmedToast'), 'info');
+  // Disarm summary (SPEC §3.6 additive): what happened while armed.
+  if (!armed && r.data && r.data.summary) toast(r.data.summary, 'info');
 }
 
 export async function refreshAwayStatus() {

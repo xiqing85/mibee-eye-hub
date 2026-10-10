@@ -571,6 +571,53 @@ pub fn overlay_scene_from_rows(config: &mut AppConfig, rows: &[(String, String)]
             "scene.tools.weather_timeout_secs" => value.parse::<u64>().ok().map(|v| {
                 config.tools.timeout_secs = v;
             }),
+            "scene.away.voice_control" => value
+                .parse::<bool>()
+                .ok()
+                .map(|v| config.away.voice_control = v),
+            "scene.away.summary_on_disarm" => value
+                .parse::<bool>()
+                .ok()
+                .map(|v| config.away.summary_on_disarm = v),
+            "scene.away.deterrence" => value
+                .parse::<bool>()
+                .ok()
+                .map(|v| config.away.deterrence = v),
+            "scene.away.deterrence_text" => {
+                config.away.deterrence_text = value.clone();
+                Some(())
+            }
+            "scene.away.reask_text" => {
+                config.away.reask_text = value.clone();
+                Some(())
+            }
+            "scene.away.schedule_arm" => {
+                if web::away::valid_schedule_time(value) {
+                    config.away.schedule_arm = value.clone();
+                }
+                Some(())
+            }
+            "scene.away.schedule_disarm" => {
+                if web::away::valid_schedule_time(value) {
+                    config.away.schedule_disarm = value.clone();
+                }
+                Some(())
+            }
+            "scene.away.schedule_weekdays_only" => value
+                .parse::<bool>()
+                .ok()
+                .map(|v| config.away.schedule_weekdays_only = v),
+            "scene.away.push_url" => {
+                if value.is_empty() || value.starts_with("http://") || value.starts_with("https://")
+                {
+                    config.away.push_url = value.clone();
+                }
+                Some(())
+            }
+            "scene.away.audio_link" => value
+                .parse::<bool>()
+                .ok()
+                .map(|v| config.away.audio_link = v),
             _ => None,
         };
         if applied.is_none() && key.starts_with("scene.") {
