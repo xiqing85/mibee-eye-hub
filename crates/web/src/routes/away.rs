@@ -18,7 +18,6 @@ use sqlx::SqlitePool;
 use crate::away::AwayEngine;
 use crate::db;
 use crate::errors::ApiError;
-use crate::routes::events::CameraEvent;
 use crate::routes::events::EventBus;
 use security::middleware::AuthenticatedUser;
 
@@ -26,13 +25,6 @@ use security::middleware::AuthenticatedUser;
 pub struct ListParams {
     /// Max events to return (SPEC §3.6: default 50, cap 200).
     pub limit: Option<i64>,
-}
-
-fn unix_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// `GET /api/away` — armed state + stats (SPEC §3.6).
@@ -53,40 +45,29 @@ pub async fn get_away(
 
 /// `POST /api/away` — arm/disarm (SPEC §3.6). Armed state persists as
 /// the `away.active` setting so a service restart keeps the watch on.
+/// Disarm carries the additive `summary` field when something happened
+/// while armed and `scene.away.summary_on_disarm` is on.
 #[tracing::instrument(skip_all)]
 pub async fn post_away(
     Extension(away): Extension<Arc<AwayEngine>>,
     Extension(pool): Extension<SqlitePool>,
     Extension(event_tx): Extension<Arc<EventBus>>,
+    Extension(chat): Extension<Arc<streaming::llm::ChatEngine>>,
     Extension(_user): Extension<AuthenticatedUser>,
     Json(payload): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Some(active) = payload.get("active").and_then(|v| v.as_bool()) else {
         return Err(ApiError::bad_request("body must be {\"active\": bool}"));
     };
-    if active && !away.is_available() {
-        return Err(ApiError::bad_request(format!(
-            "away mode unavailable: {}",
-            away.unavailable_reason()
-        )));
-    }
-    if active {
-        away.arm(unix_now_ms());
-    } else {
-        away.disarm();
-    }
-    if let Err(e) =
-        db::set_setting(&pool, "away.active", if active { "true" } else { "false" }).await
-    {
-        tracing::warn!(error = %e, "away: persist armed state failed");
-    }
+    let summary = crate::away::set_active(&away, &pool, &event_tx, active, Some(&chat))
+        .await
+        .map_err(ApiError::bad_request)?;
     let since_ms = away.armed_since_ms();
-    let _ = event_tx.send(CameraEvent::AwayState { active, since_ms });
-    tracing::info!(active, "away: mode switched");
-    Ok((
-        StatusCode::OK,
-        Json(json!({"applied": "immediate", "active": active, "since_ms": since_ms})),
-    ))
+    let mut body = json!({"applied": "immediate", "active": active, "since_ms": since_ms});
+    if let Some(s) = summary {
+        body["summary"] = json!(s);
+    }
+    Ok((StatusCode::OK, Json(body)))
 }
 
 /// `GET /api/away/events` — records, newest first (SPEC §3.6).
@@ -222,6 +203,9 @@ mod tests {
             .layer(Extension(pool.clone()))
             .layer(Extension(Arc::clone(&away)))
             .layer(Extension(event_tx))
+            .layer(Extension(Arc::new(
+                streaming::llm::ChatEngine::from_config(&streaming::llm::LlmConfig::default()),
+            )))
             .layer(Extension(AuthenticatedUser("tester".to_string())));
 
         // Status starts disarmed.
@@ -267,6 +251,10 @@ mod tests {
         )
         .unwrap();
         assert!(body["message"].as_str().unwrap().contains("unavailable"));
+
+        // Disarm with no window → no summary key (disarmed already).
+        // Then arm+disarm is impossible via this fixture (AI inactive),
+        // so the summary path is covered by the away.rs unit test.
 
         // Records list + snapshot 404 + clear-all.
         crate::db::insert_away_event(&pool, &rec(1, "answered", Some("s.jpg")))

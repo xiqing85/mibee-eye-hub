@@ -497,6 +497,43 @@ pub async fn clear_away_events(pool: &SqlitePool) -> Result<(usize, Vec<String>)
     ))
 }
 
+/// `(total, person)` events inside one armed window (`started_ms >=
+/// since`) — the disarm summary's counts (SPEC §3.6 `summary`).
+pub async fn away_stats_since(pool: &SqlitePool, since_ms: i64) -> Result<(i64, i64)> {
+    let (total,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM away_events WHERE started_ms >= ?1")
+            .bind(since_ms)
+            .fetch_one(pool)
+            .await
+            .context("away stats since: total")?;
+    let (visitors,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM away_events WHERE started_ms >= ?1 AND kind = 'person'",
+    )
+    .bind(since_ms)
+    .fetch_one(pool)
+    .await
+    .context("away stats since: visitors")?;
+    Ok((total, visitors))
+}
+
+/// Events inside one armed window, newest first (summary prompt input).
+pub async fn list_away_events_since(
+    pool: &SqlitePool,
+    since_ms: i64,
+    limit: i64,
+) -> Result<Vec<AwayEventRecord>> {
+    let limit = limit.clamp(1, 50);
+    let rows: Vec<AwayEventRow> = sqlx::query_as(&format!(
+        "SELECT {AWAY_EVENT_COLUMNS} FROM away_events WHERE started_ms >= ?1          ORDER BY id DESC LIMIT ?2"
+    ))
+    .bind(since_ms)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("away events since: list")?;
+    Ok(rows.into_iter().map(away_row_to_record).collect())
+}
+
 /// `(total events, person events)` for the status document.
 pub async fn away_stats(pool: &SqlitePool) -> Result<(i64, i64)> {
     let (total,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM away_events")

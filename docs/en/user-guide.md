@@ -229,6 +229,13 @@ Records view arms the watch for when nobody is home:
 - The armed state survives service restarts; **Clear** removes every
   record together with its snapshot file. Cadence, cooldowns, greetings
   and the listening window are tunable in `[away]`.
+- Six runtime features are live web-configurable (Settings → the away
+  section, `scene.away.*`): **voice arm/disarm** ("我要出门了 / 我回来
+  了" at the device), a **disarm summary** of what happened, **re-ask +
+  deterrence** for silent strangers, **scheduled arm/disarm** (HH:MM
+  boundary times), a **visitor push webhook** (text only; empty keeps
+  the device fully offline), and **sound-alarm linkage** into the away
+  records.
 
 ### Enrolled speakers (voiceprint)
 

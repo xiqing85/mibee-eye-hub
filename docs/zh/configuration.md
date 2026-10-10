@@ -243,6 +243,19 @@ greeting_known = "欢迎回家，{name}。"     # {name} = 已登记人脸名
 greeting_unknown = "你好，这里是主人的智能看家助手。主人现在不在家，请问你是谁？"
 ```
 
+六项运行时能力**可 Web 热配置**（`PUT /api/config` 的 `scene.away.*`，
+即时生效；上方 TOML 仅播种启动默认值）：
+
+| 键 | 缺省 | 含义 |
+|----|------|------|
+| `scene.away.voice_control` | `true` | "我要出门了/我回来了"语音布防/撤防（内建意图，先于 LLM） |
+| `scene.away.summary_on_disarm` | `true` | 撤防生成摘要（本地 LLM 一句话，回落纯统计文案）；API 响应携带、语音撤防时播报 |
+| `scene.away.deterrence` | `false` | 陌生人未应答先二次追问（`reask_text`、半窗），再播 `deterrence_text` |
+| `scene.away.reask_text` / `deterrence_text` | 见 TOML | 两条升级话术 |
+| `scene.away.schedule_arm` / `schedule_disarm` | `""` | `HH:MM` 本地时间边界沿，空=该沿关闭；`schedule_weekdays_only`（缺省 `false`）仅工作日 |
+| `scene.away.push_url` | `""` | 访客推送 webhook：每访客事件一次 JSON POST（纯文本、永不含图像），5s 超时 fail-open。**空值保持完全离线**——配置 URL 即知情选择外发文本 |
+| `scene.away.audio_link` | `true` | 布防期间投票声音上升沿也落离家活动记录（labels `🔊 类别 置信度`，按活动冷却） |
+
 ### [desktop] - 托盘图标与桌面通知（规范 附录 A #42）
 
 带桌面会话主机的本机存在感。全部 fail-open：无会话总线（`DBUS_SESSION_BUS_ADDRESS` 或 `$XDG_RUNTIME_DIR/bus`）整体跳过、仅记一行日志——headless 服务器零影响。托盘显示相机图标，左键（或菜单项）经 `xdg-open` 打开 Web 界面（优先 `web.http_port`，否则 TLS 端口）。每次告警上升沿（视觉/声音/区域）发桌面通知；首次发送失败（无通知守护）即在本轮运行内停用。

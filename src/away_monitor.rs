@@ -155,6 +155,25 @@ fn broadcast(event_tx: &Arc<EventBus>, rec: AwayEventRecord) {
     let _ = event_tx.send(CameraEvent::AwayEvent { event: rec });
 }
 
+/// Speak one utterance with the playback self-mute held for its whole
+/// duration (greeting / re-ask / deterrence share this leg).
+async fn speak_text(
+    tts: &Arc<TtsEngine>,
+    voice: &Arc<VoiceEngine>,
+    text: &str,
+) -> anyhow::Result<()> {
+    voice.begin_playback_mute();
+    let tts = Arc::clone(tts);
+    let text = text.to_string();
+    let result = tokio::task::spawn_blocking(move || tts.speak(&text)).await;
+    voice.end_playback_mute();
+    match result {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(anyhow::anyhow!("{e}")),
+    }
+}
+
 /// The greeting for a visitor: enrolled faces by name (no question),
 /// unknown faces get the identity question (SPEC §3.6).
 #[must_use]
@@ -307,6 +326,25 @@ async fn visitor_flow(
     );
     desktop.notify_away_visitor(face_name.as_deref());
 
+    // Opt-in visitor push (scene.away.push_url): one JSON POST per
+    // visitor event, text only (never the snapshot). Empty URL = the
+    // device stays fully air-gapped.
+    {
+        let settings = away.settings_snapshot();
+        if !settings.push_url.is_empty() {
+            let url = settings.push_url;
+            let id = stored.id;
+            let title = "MiBee Eye · 离家模式访客".to_string();
+            let body = match &face_name {
+                Some(name) => format!("识别到已登记成员：{name}"),
+                None => "发现陌生访客，已问候并询问身份".to_string(),
+            };
+            tokio::spawn(async move {
+                web::away::push_visitor_event(&url, id, &title, &body).await;
+            });
+        }
+    }
+
     // VLM description — async, single-flight, patches the same row.
     if vlm.is_active()
         && let Some(j) = jpeg.as_ref()
@@ -337,7 +375,10 @@ async fn visitor_flow(
 
     // Voice legs: greet (self-muted), then ask + listen if unknown. Runs
     // on its own task — playback takes seconds and the watch loop must
-    // keep consuming detections meanwhile.
+    // keep consuming detections meanwhile. With `deterrence` on
+    // (scene.away.deterrence), an unanswered stranger is re-asked once
+    // (state `reask`, half window) and a still-silent one gets the
+    // deterrence message (SPEC appendix A #44 amendment).
     if away.voice_capable() && tts.is_active() {
         let away = Arc::clone(away);
         let voice = Arc::clone(voice);
@@ -363,9 +404,11 @@ async fn visitor_flow(
                         {
                             broadcast(&event_tx, rec);
                         }
-                        // Reap the window: an unanswered visitor flips to
-                        // silent after the deadline (+ worker extensions).
+                        // Reap the window: an unanswered visitor escalates
+                        // (re-ask + deterrence) or flips straight to silent.
                         let away = Arc::clone(&away);
+                        let voice = Arc::clone(&voice);
+                        let tts = Arc::clone(&tts);
                         let pool = pool.clone();
                         let event_tx = Arc::clone(&event_tx);
                         tokio::spawn(async move {
@@ -373,12 +416,60 @@ async fn visitor_flow(
                                 listen_ms + LISTEN_GRACE_MS + 3_000,
                             ))
                             .await;
-                            if let Some(id) = away.expire_listen(unix_now_ms())
-                                && let Ok(Some(rec)) =
+                            let Some(id) = away.expire_listen(unix_now_ms()) else {
+                                return; // answered in time
+                            };
+                            let settings = away.settings_snapshot();
+                            if !settings.deterrence {
+                                if let Ok(Some(rec)) =
                                     web::db::update_away_state(&pool, id, "silent").await
+                                {
+                                    broadcast(&event_tx, rec);
+                                }
+                                return;
+                            }
+                            // Escalation 1: re-ask once on a half window.
+                            if let Ok(Some(rec)) =
+                                web::db::update_away_state(&pool, id, "reask").await
                             {
                                 broadcast(&event_tx, rec);
                             }
+                            let reask_ms = (listen_ms / 2).max(4_000);
+                            if speak_text(&tts, &voice, &settings.reask_text)
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!("away: re-ask playback failed");
+                            }
+                            let deadline = unix_now_ms() + reask_ms + LISTEN_GRACE_MS;
+                            if !voice.arm_listen(reask_ms) || !away.open_listen(id, deadline) {
+                                if let Ok(Some(rec)) =
+                                    web::db::update_away_state(&pool, id, "silent").await
+                                {
+                                    broadcast(&event_tx, rec);
+                                }
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(
+                                reask_ms + LISTEN_GRACE_MS + 3_000,
+                            ))
+                            .await;
+                            if let Some(id) = away.expire_listen(unix_now_ms()) {
+                                // Escalation 2: deterrence message.
+                                if let Ok(Some(rec)) =
+                                    web::db::update_away_state(&pool, id, "silent").await
+                                {
+                                    broadcast(&event_tx, rec);
+                                }
+                                if speak_text(&tts, &voice, &settings.deterrence_text)
+                                    .await
+                                    .is_err()
+                                {
+                                    tracing::warn!("away: deterrence playback failed");
+                                }
+                            }
+                            // Answered during the re-ask window: the watch
+                            // loop's attribution already flipped `answered`.
                         });
                     } else {
                         tracing::warn!("away: listen window unavailable (no VAD or slot busy)");
@@ -430,6 +521,37 @@ async fn activity_flow(
             description: None,
             visitor_reply: None,
             snapshot,
+            state: "recorded".into(),
+        },
+    )
+    .await;
+}
+
+/// Sound-alarm record (SPEC appendix A #44 audio link): called by the
+/// sound bridge on a voted rising edge while armed. `labels` comes from
+/// [`AwayEngine::observe_audio`] (it already applied the audio_link
+/// gate and the activity cooldown). No snapshot — there is no frame.
+pub async fn record_audio_event(
+    away: &Arc<AwayEngine>,
+    pool: &SqlitePool,
+    event_tx: &Arc<EventBus>,
+    labels: &str,
+) {
+    let now = unix_now_ms();
+    insert_and_broadcast(
+        away,
+        pool,
+        event_tx,
+        AwayEventRecord {
+            id: 0,
+            camera_id: "0".to_string(),
+            kind: "activity".into(),
+            started_ms: now as i64,
+            labels: labels.to_string(),
+            face_name: None,
+            description: None,
+            visitor_reply: None,
+            snapshot: None,
             state: "recorded".into(),
         },
     )

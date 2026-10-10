@@ -289,6 +289,18 @@ listen_secs = 10
 snapshot_dir = "away-snapshots"
 greeting_known = "欢迎回家，{name}。"
 greeting_unknown = "你好，这里是主人的智能看家助手。主人现在不在家，请问你是谁？"
+# Runtime knobs below are web-configurable live via PUT /api/config
+# (scene.away.*) — TOML here only seeds the boot defaults.
+voice_control = true
+summary_on_disarm = true
+deterrence = false
+deterrence_text = "请注意：您的影像和声音已被记录，主人将收到通知。"
+reask_text = "请问你是谁？请说明来意。"
+schedule_arm = ""            # "HH:MM" local; empty = off
+schedule_disarm = ""         # "HH:MM" local; empty = off
+schedule_weekdays_only = false
+push_url = ""                # visitor push webhook; empty = zero egress
+audio_link = true
 
 [agent]`, SPEC §3.5 / appendix A #43): the
 # dialogue assistant's tool-calling loop. Built-in tools (time.now /

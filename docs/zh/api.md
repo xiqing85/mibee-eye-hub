@@ -178,12 +178,15 @@ Cookie 会话 + CSRF 双提交：
 
 事件对象：
 `{"id","camera_id","kind":"person"|"activity","started_ms","labels","face_name"?,"description"?,"visitor_reply"?,"snapshot"?,"state"}`。
-人员事件状态：`greeting → listening → answered|silent`，旁路终态
-`known` / `no_voice`；活动类为 `recorded`。创建与每次状态迁移经 SSE
+人员事件状态：`greeting → listening → answered|silent`（威慑开启时
+`listening → reask → silent`），旁路终态 `known` / `no_voice`；活动类为
+`recorded`。撤防响应带加法字段 `summary`（有事件且摘要开关开启时）。创建与每次状态迁移经 SSE
 `away_event` 推送（按 `id` 就地更新）；布防/撤防广播 `away_state`。
 布防状态服务重启后保持。记录 SQLite 持久、FIFO 封顶 1000 条；修剪与
-清空同步删除快照文件。配置见 `[away]`（节拍/间隔/冷却/问候语/听窗，
-`docs/zh/configuration.md`）。
+清空同步删除快照文件。配置见 `[away]`（节拍/间隔/冷却/问候语/听窗）；
+六项运行时能力（语音布防/撤防、撤防摘要、威慑二问、定时布防、访客
+推送、声音联动）经 `PUT /api/config` 的 `scene.away.*` 热配置——见
+`docs/zh/configuration.md`。
 
 ### 主机设备（规范 §4.8）
 

@@ -264,6 +264,19 @@ greeting_known = "欢迎回家，{name}。"     # {name} = enrolled face name
 greeting_unknown = "你好，这里是主人的智能看家助手。主人现在不在家，请问你是谁？"
 ```
 
+The six runtime features are **web-configurable live** (`PUT /api/config`
+`scene.away.*`, no restart; the TOML above only seeds boot defaults):
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `scene.away.voice_control` | `true` | "我要出门了/我回来了" utterances arm/disarm the watch ahead of the LLM |
+| `scene.away.summary_on_disarm` | `true` | Disarm produces a summary (local LLM one-liner, plain-count fallback); returned by the API and spoken on voice disarm |
+| `scene.away.deterrence` | `false` | Unanswered strangers are re-asked once (`reask_text`, half window), then played `deterrence_text` |
+| `scene.away.reask_text` / `deterrence_text` | see TOML | The two escalation messages |
+| `scene.away.schedule_arm` / `schedule_disarm` | `""` | `HH:MM` local-time boundary edges; empty disables that edge. `schedule_weekdays_only` (default `false`) restricts to Mon–Fri |
+| `scene.away.push_url` | `""` | Visitor push webhook: one JSON POST per visitor event (text only, never images), 5 s timeout, fail-open. **Empty keeps the device fully air-gapped** — configuring a URL is the informed opt-in to outbound text |
+| `scene.away.audio_link` | `true` | While armed, voted sound-alarm rising edges also land as away activity records (labels `🔊 class score`, one per activity cooldown) |
+
 ### [desktop] - Tray icon & desktop notifications (SPEC appendix A #42)
 
 Desktop-session presence for hosts with a GUI. All fail-open: without a

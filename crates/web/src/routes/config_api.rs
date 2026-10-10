@@ -51,6 +51,9 @@ pub struct SceneHandles {
     pub follow_up_window_ms: Arc<AtomicU64>,
     /// Weather tool config — read per dialogue turn.
     pub tools: SharedTools,
+    /// Away-mode feature knobs (SPEC appendix A #44) — shared with the
+    /// away engine; `scene.away.*` writes land here hot.
+    pub away: crate::away::SharedAwaySettings,
 }
 
 /// Validate a `scene` section and return the dotted key/value rows to
@@ -85,6 +88,53 @@ fn validate_scene(scene: &Value) -> Result<Vec<(String, String)>, String> {
                     rows.push(("scene.voice.follow_up_window_secs".into(), format_number(n)));
                 }
                 other => return Err(format!("unknown scene.voice key: {other}")),
+            }
+        }
+    }
+    let away = scene.get("away");
+    if let Some(a) = away {
+        let obj = a.as_object().ok_or("scene.away must be an object")?;
+        for (k, val) in obj {
+            match k.as_str() {
+                "voice_control"
+                | "summary_on_disarm"
+                | "deterrence"
+                | "schedule_weekdays_only"
+                | "audio_link" => {
+                    let b = val
+                        .as_bool()
+                        .ok_or_else(|| format!("scene.away.{k} must be a boolean"))?;
+                    rows.push((format!("scene.away.{k}"), b.to_string()));
+                }
+                "deterrence_text" | "reask_text" => {
+                    let s = val
+                        .as_str()
+                        .ok_or_else(|| format!("scene.away.{k} must be a string"))?;
+                    if s.chars().count() > 80 {
+                        return Err(format!("scene.away.{k} too long (max 80 chars)"));
+                    }
+                    rows.push((format!("scene.away.{k}"), s.to_string()));
+                }
+                "schedule_arm" | "schedule_disarm" => {
+                    let s = val
+                        .as_str()
+                        .ok_or_else(|| format!("scene.away.{k} must be a string"))?;
+                    if !crate::away::valid_schedule_time(s) {
+                        return Err(format!("scene.away.{k} must be HH:MM or empty"));
+                    }
+                    rows.push((format!("scene.away.{k}"), s.to_string()));
+                }
+                "push_url" => {
+                    let s = val.as_str().ok_or("scene.away.push_url must be a string")?;
+                    if !s.is_empty() && !(s.starts_with("http://") || s.starts_with("https://")) {
+                        return Err("scene.away.push_url must be an http(s) URL or empty".into());
+                    }
+                    if s.len() > 256 {
+                        return Err("scene.away.push_url too long (max 256 chars)".into());
+                    }
+                    rows.push(("scene.away.push_url".into(), s.to_string()));
+                }
+                other => return Err(format!("unknown scene.away key: {other}")),
             }
         }
     }
@@ -143,12 +193,14 @@ fn format_number(n: f64) -> String {
 fn scene_document(scene: &SceneHandles, wake_word: Option<String>) -> Value {
     let window_ms = scene.follow_up_window_ms.load(Ordering::SeqCst);
     let tools = tools_snapshot(&scene.tools);
+    let away = serde_json::to_value(&*scene.away.read()).unwrap_or_default();
     json!({
         "voice": {
             "follow_up_window_secs": window_ms as f64 / 1000.0,
             "wake_word": wake_word.unwrap_or_else(|| streaming::voice::DEFAULT_WAKE_WORD.into()),
         },
         "tools": tools,
+        "away": away,
     })
 }
 
@@ -448,6 +500,25 @@ pub async fn put_config(
                         .expect("tools config lock poisoned")
                         .timeout_secs = secs as u64;
                 }
+                k if k.starts_with("scene.away.") => {
+                    // Every away key maps 1:1 onto an AwaySettings field —
+                    // validated above, hot-applied under the write lock.
+                    let mut s = scene.away.write();
+                    let field = &k["scene.away.".len()..];
+                    match field {
+                        "voice_control" => s.voice_control = value == "true",
+                        "summary_on_disarm" => s.summary_on_disarm = value == "true",
+                        "deterrence" => s.deterrence = value == "true",
+                        "schedule_weekdays_only" => s.schedule_weekdays_only = value == "true",
+                        "audio_link" => s.audio_link = value == "true",
+                        "deterrence_text" => s.deterrence_text = value.clone(),
+                        "reask_text" => s.reask_text = value.clone(),
+                        "schedule_arm" => s.schedule_arm = value.clone(),
+                        "schedule_disarm" => s.schedule_disarm = value.clone(),
+                        "push_url" => s.push_url = value.clone(),
+                        _ => unreachable!("validated scene.away keys"),
+                    }
+                }
                 other => tracing::warn!(key = other, "scene key persisted but not hot-applied"),
             }
         }
@@ -684,6 +755,68 @@ mod tests {
             "scene.* rows must not surface under settings: {}",
             body["data"]["settings"]
         );
+
+        // Away feature knobs (SPEC appendix A #44 amendment): defaults →
+        // PUT → hot GET.
+        assert_eq!(body["data"]["scene"]["away"]["voice_control"], true);
+        assert_eq!(body["data"]["scene"]["away"]["deterrence"], false);
+        assert_eq!(body["data"]["scene"]["away"]["schedule_arm"], "");
+        let res = app
+            .clone()
+            .oneshot(config_req(
+                "PUT",
+                &token,
+                Some(json!({
+                    "scene": {
+                        "away": {
+                            "deterrence": true,
+                            "schedule_arm": "09:00",
+                            "schedule_disarm": "18:00",
+                            "schedule_weekdays_only": true,
+                            "push_url": "https://example.local/hook",
+                            "deterrence_text": "影像已记录。"
+                        }
+                    }
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = app
+            .clone()
+            .oneshot(config_req("GET", &token, None))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let away = &body["data"]["scene"]["away"];
+        assert_eq!(away["deterrence"], true);
+        assert_eq!(away["schedule_arm"], "09:00");
+        assert_eq!(away["schedule_disarm"], "18:00");
+        assert_eq!(away["schedule_weekdays_only"], true);
+        assert_eq!(away["push_url"], "https://example.local/hook");
+        assert_eq!(away["deterrence_text"], "影像已记录。");
+        assert_eq!(away["voice_control"], true, "untouched key keeps value");
+
+        // Bad values reject the whole update (strict scene contract).
+        for bad in [
+            json!({"away": {"schedule_arm": "9:00"}}),
+            json!({"away": {"schedule_arm": "24:00"}}),
+            json!({"away": {"push_url": "ftp://x"}}),
+            json!({"away": {"voice_control": "yes"}}),
+            json!({"away": {"nonsense": true}}),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(config_req("PUT", &token, Some(json!({"scene": bad}))))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "reject {bad}");
+        }
 
         // Persisted as dotted scene.* rows (boot overlay source)
         let rows = db::list_settings(&pool).await.unwrap();

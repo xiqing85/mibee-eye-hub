@@ -267,6 +267,7 @@ pub fn build_app_with_state(state: AppRouterState) -> Router {
     let scene = crate::routes::config_api::SceneHandles {
         follow_up_window_ms: state.voice.follow_up_window_share(),
         tools: tools.clone(),
+        away: state.away.settings_share(),
     };
     let llm_tier = state.llm_tier.clone();
     let resource = state.resource.clone();
