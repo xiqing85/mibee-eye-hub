@@ -1121,6 +1121,47 @@ mod tests {
         assert!(e.observe_audio("Glass", 0.9, 200_000).is_none());
     }
 
+    /// Wire contract for the opt-in visitor push (#44): one POST with
+    /// the documented JSON shape — pinned against a local listener so a
+    /// field rename cannot slip out silently.
+    #[tokio::test]
+    async fn push_visitor_event_posts_the_documented_shape() {
+        use std::io::Read;
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+            let resp = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok";
+            sock.write_all(resp.as_bytes()).unwrap();
+            body
+        });
+        let url = format!("http://{addr}/hook");
+        push_visitor_event(&url, 42, "title-x", "body-y").await;
+        let body = handle.join().unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+        assert_eq!(json["device"], "mibee-eye");
+        assert_eq!(json["event_id"], 42);
+        assert_eq!(json["title"], "title-x");
+        assert_eq!(json["body"], "body-y");
+        assert!(json["timestamp_ms"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_visitor_event_fails_open_on_dead_webhook() {
+        // Bind then drop the listener — the port is closed; the call must
+        // simply return (fail-open) instead of panicking or hanging.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{addr}/hook");
+        let () = push_visitor_event(&url, 1, "t", "b").await;
+    }
+
     #[test]
     fn summarize_labels_ignores_person_and_unknown() {
         let labels: Vec<String> = ["cat", "dog"].iter().map(|s| s.to_string()).collect();
