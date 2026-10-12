@@ -1900,6 +1900,19 @@ async fn main() -> anyhow::Result<()> {
                                         .await
                                     }
                                 };
+                                // Finish the generation span/elapsed BEFORE
+                                // awaiting the speaker — the LLM thinking
+                                // entry must not absorb playback time (the
+                                // pipeline overlaps the two by design).
+                                let gen_elapsed_ms = leg_start.elapsed().as_millis() as u64;
+                                match &gen_result {
+                                    Ok(Ok((_, p, c))) => {
+                                        span.tokens(Some(*p), Some(*c)).finish_ok();
+                                    }
+                                    _ => {
+                                        span.finish_err();
+                                    }
+                                }
                                 let mut spoken = 0_usize;
                                 let mut speak_ms = 0_u64;
                                 if let Some(sp) = speaker {
@@ -1918,16 +1931,13 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 match gen_result {
                                     Ok(Ok((reply, prompt_tokens, completion_tokens))) => {
-                                        let dur = leg_start.elapsed().as_millis() as u64;
-                                        span.tokens(Some(prompt_tokens), Some(completion_tokens))
-                                            .finish_ok();
                                         draft = draft.think(
                                             "llm",
                                             &variant,
                                             format!(
                                                 "本地应答 · prompt {prompt_tokens}↑ / completion {completion_tokens}↓ tok"
                                             ),
-                                            dur,
+                                            gen_elapsed_ms,
                                         );
                                         if spoken > 0 {
                                             draft = draft.think(
@@ -1940,24 +1950,20 @@ async fn main() -> anyhow::Result<()> {
                                         Ok((draft, reply, "local", spoken > 0))
                                     }
                                     Ok(Err(e)) => {
-                                        let dur = leg_start.elapsed().as_millis() as u64;
-                                        span.finish_err();
                                         draft = draft.think(
                                             "llm",
                                             &variant,
                                             format!("本地应答失败：{e}"),
-                                            dur,
+                                            gen_elapsed_ms,
                                         );
                                         Err(draft)
                                     }
                                     Err(e) => {
-                                        let dur = leg_start.elapsed().as_millis() as u64;
-                                        span.finish_err();
                                         draft = draft.think(
                                             "llm",
                                             &variant,
                                             format!("本地应答任务失败：{e}"),
-                                            dur,
+                                            gen_elapsed_ms,
                                         );
                                         Err(draft)
                                     }
