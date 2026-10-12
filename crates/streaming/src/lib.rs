@@ -37,6 +37,7 @@ pub mod models;
 pub mod ocr;
 pub mod output;
 pub mod resource;
+pub mod sentence;
 pub mod source;
 /// TTS playback via the sherpa-onnx CLI subprocess (GPL isolation).
 pub mod tools;

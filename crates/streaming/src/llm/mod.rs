@@ -164,13 +164,29 @@ impl ChatEngine {
     /// prompt and generated counts feed per-model metrics and the
     /// conversation call-chain spans (SPEC §3.3).
     pub fn complete_with_usage(&self, turns: &[ChatTurn]) -> anyhow::Result<(String, u64, u64)> {
+        self.complete_streaming_with_usage(turns, None)
+    }
+
+    /// [`ChatEngine::complete_with_usage`] with a per-token delta
+    /// callback (sentence-streaming voice pipeline, 2026-10-12 P0). The
+    /// callback receives each generated piece as it is produced;
+    /// returning `false` stops generation at the next token boundary and
+    /// the partial reply is returned — the caller keeps whatever it
+    /// already consumed. Pieces are valid UTF-8 but may split sentences
+    /// or `<think>` markers arbitrarily — feed a
+    /// [`crate::sentence::ThinkFilter`], not a TTS engine.
+    pub fn complete_streaming_with_usage(
+        &self,
+        turns: &[ChatTurn],
+        on_delta: Option<&mut dyn FnMut(&str) -> bool>,
+    ) -> anyhow::Result<(String, u64, u64)> {
         #[cfg(feature = "llm")]
         {
             let Some(model) = &self.model else {
                 anyhow::bail!("llm inactive: {}", self.inactive_reason);
             };
             let call = observability::model_call("llm", &self.model_variant());
-            match self.run_completion(model, turns) {
+            match self.run_completion(model, turns, on_delta) {
                 Ok((reply, prompt_tokens, completion_tokens)) => {
                     call.finish_ok(Some(prompt_tokens), Some(completion_tokens));
                     Ok((reply, prompt_tokens, completion_tokens))
@@ -183,7 +199,7 @@ impl ChatEngine {
         }
         #[cfg(not(feature = "llm"))]
         {
-            let _ = turns;
+            let _ = (turns, on_delta);
             anyhow::bail!("llm inactive: {}", self.inactive_reason)
         }
     }
@@ -205,6 +221,7 @@ impl ChatEngine {
         &self,
         model: &llama_cpp_2::model::LlamaModel,
         turns: &[ChatTurn],
+        mut on_delta: Option<&mut dyn FnMut(&str) -> bool>,
     ) -> anyhow::Result<(String, u64, u64)> {
         use llama_cpp_2::context::params::LlamaContextParams;
         use llama_cpp_2::llama_batch::LlamaBatch;
@@ -270,6 +287,13 @@ impl ChatEngine {
                 && let Ok(piece) = String::from_utf8(bytes)
             {
                 reply.push_str(&piece);
+                if let Some(cb) = on_delta.as_deref_mut()
+                    && !cb(&piece)
+                {
+                    // Consumer is done (queue closed / cancelled): stop
+                    // burning tokens; the partial reply is returned.
+                    break;
+                }
             }
             tokens.clear();
             tokens.push(token);

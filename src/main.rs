@@ -1553,6 +1553,12 @@ async fn main() -> anyhow::Result<()> {
                             let agent_tx = bridge_tx.clone();
                             let tx = bridge_tx.clone();
                             let tts_for_reply = tts_engine.clone();
+                            // Sentence-streaming pipeline (2026-10-12 P0):
+                            // the answer block itself drives TTS for the
+                            // local leg — clones captured by the answer
+                            // future below (the wrapper keeps its own).
+                            let tts_for_pipeline = tts_engine.clone();
+                            let voice_for_pipeline = Arc::clone(&voice_engine_for_arming);
                             let grounded = grounded.clone();
                             let conversation_for_reply = Arc::clone(&conversation);
                             let voice_engine_for_reply = Arc::clone(&voice_engine_for_arming);
@@ -1717,7 +1723,7 @@ async fn main() -> anyhow::Result<()> {
                                                 )
                                             };
                                             draft = draft.think(think_source, &model_id, note, dur);
-                                            return Ok((draft, out.reply, engine_label));
+                                            return Ok((draft, out.reply, engine_label, false));
                                         }
                                         Err(e) => {
                                             tracing::warn!(error = %e, "voice: agent loop failed — falling back to legacy legs");
@@ -1748,7 +1754,7 @@ async fn main() -> anyhow::Result<()> {
                                                 None => "云端应答".to_string(),
                                             };
                                             draft = draft.think("cloud.chat", &model_id, note, dur);
-                                            return Ok((draft, reply, "cloud"));
+                                            return Ok((draft, reply, "cloud", false));
                                         }
                                         Err(e) => {
                                             let dur = leg_start.elapsed().as_millis() as u64;
@@ -1778,12 +1784,139 @@ async fn main() -> anyhow::Result<()> {
                                 let engine = engine.clone();
                                 let turns = turns.clone();
                                 let leg_start = std::time::Instant::now();
-                                match span
-                                    .run(tokio::task::spawn_blocking(move || {
-                                        engine.complete_with_usage(&turns)
-                                    }))
-                                    .await
-                                {
+                                // Sentence-streaming pipeline (2026-10-12
+                                // P0): with TTS live, the local leg
+                                // streams generation deltas into a speaker
+                                // task that synthesizes/plays per sentence
+                                // and keeps ONE synthesis ahead of
+                                // playback — first audio lands after the
+                                // FIRST sentence instead of after the
+                                // whole reply, and the playback self-mute
+                                // latches only around actual playback
+                                // (synthesis is silent), roughly halving
+                                // the deaf window. `spoken` tells the
+                                // wrapper this leg already spoke.
+                                let tts_stream = tts_for_pipeline.is_active();
+                                let mut generator = None;
+                                let mut speaker: Option<
+                                    tokio::task::JoinHandle<(usize, std::time::Duration)>,
+                                > = None;
+                                if tts_stream {
+                                    let (tx_s, mut rx_s) = tokio::sync::mpsc::channel::<String>(8);
+                                    generator = Some(tokio::task::spawn_blocking({
+                                        let engine = engine.clone();
+                                        let turns = turns.clone();
+                                        let tx_s = tx_s.clone();
+                                        move || {
+                                            engine.complete_streaming_with_usage(
+                                                &turns,
+                                                Some(&mut |delta: &str| {
+                                                    tx_s.blocking_send(delta.to_string()).is_ok()
+                                                }),
+                                            )
+                                        }
+                                    }));
+                                    speaker = Some(tokio::spawn({
+                                        let tts = Arc::clone(&tts_for_pipeline);
+                                        let voice = Arc::clone(&voice_for_pipeline);
+                                        let conv = conv_for_answer.clone();
+                                        async move {
+                                            let mut filter =
+                                                streaming::sentence::ThinkFilter::new();
+                                            let mut splitter =
+                                                streaming::sentence::SentenceSplitter::new();
+                                            let speak_span = conv.span(
+                                                "tts",
+                                                "vits",
+                                                "语音播报（流水线）",
+                                                vec![],
+                                            );
+                                            let started = std::time::Instant::now();
+                                            let mut first = true;
+                                            let mut sentences = 0_usize;
+                                            let mut synth_ahead = None;
+                                            while let Some(delta) = rx_s.recv().await {
+                                                let visible = filter.push(&delta);
+                                                for sentence in splitter.push(&visible) {
+                                                    let t = Arc::clone(&tts);
+                                                    let next =
+                                                        tokio::task::spawn_blocking(move || {
+                                                            t.synthesize(&sentence)
+                                                        });
+                                                    speak_pending_sentence(
+                                                        &tts,
+                                                        &voice,
+                                                        synth_ahead.take(),
+                                                        &mut first,
+                                                        &mut sentences,
+                                                    )
+                                                    .await;
+                                                    synth_ahead = Some(next);
+                                                }
+                                            }
+                                            if let Some(tail) = splitter.flush() {
+                                                let t = Arc::clone(&tts);
+                                                let next = tokio::task::spawn_blocking(move || {
+                                                    t.synthesize(&tail)
+                                                });
+                                                speak_pending_sentence(
+                                                    &tts,
+                                                    &voice,
+                                                    synth_ahead.take(),
+                                                    &mut first,
+                                                    &mut sentences,
+                                                )
+                                                .await;
+                                                synth_ahead = Some(next);
+                                            }
+                                            speak_pending_sentence(
+                                                &tts,
+                                                &voice,
+                                                synth_ahead.take(),
+                                                &mut first,
+                                                &mut sentences,
+                                            )
+                                            .await;
+                                            if !first {
+                                                voice.end_playback_mute();
+                                            }
+                                            if sentences > 0 {
+                                                speak_span.finish_ok();
+                                            } else {
+                                                speak_span.finish_err();
+                                            }
+                                            (sentences, started.elapsed())
+                                        }
+                                    }));
+                                }
+                                let gen_result = match generator {
+                                    Some(g) => span.run(g).await,
+                                    None => {
+                                        let e = engine.clone();
+                                        let t = turns.clone();
+                                        span.run(tokio::task::spawn_blocking(move || {
+                                            e.complete_with_usage(&t)
+                                        }))
+                                        .await
+                                    }
+                                };
+                                let mut spoken = 0_usize;
+                                let mut speak_ms = 0_u64;
+                                if let Some(sp) = speaker {
+                                    match sp.await {
+                                        Ok((n, dur)) => {
+                                            spoken = n;
+                                            speak_ms = dur.as_millis() as u64;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "voice: tts speaker task failed"
+                                            );
+                                        }
+                                    }
+                                }
+                                match gen_result {
                                     Ok(Ok((reply, prompt_tokens, completion_tokens))) => {
                                         let dur = leg_start.elapsed().as_millis() as u64;
                                         span.tokens(Some(prompt_tokens), Some(completion_tokens))
@@ -1796,7 +1929,15 @@ async fn main() -> anyhow::Result<()> {
                                             ),
                                             dur,
                                         );
-                                        Ok((draft, reply, "local"))
+                                        if spoken > 0 {
+                                            draft = draft.think(
+                                                "tts",
+                                                "vits",
+                                                format!("已播报 · {spoken} 句（流水线）"),
+                                                speak_ms,
+                                            );
+                                        }
+                                        Ok((draft, reply, "local", spoken > 0))
                                     }
                                     Ok(Err(e)) => {
                                         let dur = leg_start.elapsed().as_millis() as u64;
@@ -1824,7 +1965,7 @@ async fn main() -> anyhow::Result<()> {
                             };
                             tokio::spawn(async move {
                                 match answer.await {
-                                    Ok((mut draft, reply, engine_label)) => {
+                                    Ok((mut draft, reply, engine_label, spoken)) => {
                                         // Extend the conversation session with
                                         // this Q/A pair (trimmed to the last 4
                                         // pairs = 8 turns).
@@ -1863,7 +2004,11 @@ async fn main() -> anyhow::Result<()> {
                                         // worker stays deaf — a spoken 小蜜蜂
                                         // in the reply would re-wake the
                                         // device into a self-talk loop.
-                                        if tts_for_reply.is_active() {
+                                        // The sentence-streaming local leg
+                                        // already spoke (and managed the
+                                        // mute itself); this one-shot path
+                                        // covers the cloud/agent legs.
+                                        if tts_for_reply.is_active() && !spoken {
                                             let tts_model = match streaming::lang::detect(&reply) {
                                                 streaming::lang::SpokenLang::Cantonese => "tts.yue",
                                                 streaming::lang::SpokenLang::English => "tts.en",
@@ -2351,6 +2496,32 @@ fn unix_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Voice pipeline P0 (2026-10-12): finish one in-flight sentence
+/// synthesis — wait for its WAV, latch the playback self-mute on the
+/// FIRST actual playback (synthesis is silent and stays audible-to-KWS),
+/// then play it to completion. The next sentence's synthesis runs
+/// concurrently (the caller started it before awaiting this).
+async fn speak_pending_sentence(
+    tts: &Arc<streaming::tts::TtsEngine>,
+    voice: &Arc<streaming::voice::VoiceEngine>,
+    pending: Option<tokio::task::JoinHandle<anyhow::Result<std::path::PathBuf>>>,
+    first: &mut bool,
+    sentences: &mut usize,
+) {
+    let Some(prev) = pending else { return };
+    let Ok(Ok(wav)) = prev.await else {
+        return;
+    };
+    if *first {
+        voice.begin_playback_mute();
+        *first = false;
+    }
+    let player = Arc::clone(tts);
+    if let Ok(Ok(())) = tokio::task::spawn_blocking(move || player.play(&wav)).await {
+        *sentences += 1;
+    }
 }
 
 /// Run one self-test subcommand, print the JSON report. Exit code 0 on a
