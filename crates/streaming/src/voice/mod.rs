@@ -885,8 +885,14 @@ impl VoiceEngine {
                                         while let Some(seg) = vad.front() {
                                             let waveform = seg.samples().to_vec();
                                             vad.pop();
-                                            if waveform.len() < 16_000 {
-                                                // < 1 s — noise, keep listening.
+                                            if waveform.len() < 8_000 {
+                                                // < 0.5 s — noise, keep listening.
+                                                // (Was 1 s; a real spoken stop
+                                                // word — 别说了 — lands at
+                                                // 0.6-0.9 s and would have been
+                                                // dropped, deafening the whole
+                                                // #45 interrupt path. Matches
+                                                // the capture branch's floor.)
                                                 continue;
                                             }
                                             let recognizer = Arc::clone(&internals.recognizer);
