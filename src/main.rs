@@ -1455,6 +1455,13 @@ async fn main() -> anyhow::Result<()> {
                                         transcript = %ev.transcript,
                                         "voice: mid-round utterance ignored (backchannel)"
                                     );
+                                    // The VAD segment machinery re-arms the
+                                    // follow-up window to now+2s on every
+                                    // segment — restore the round-long
+                                    // thinking window so one backchannel
+                                    // blip does not end wake-free
+                                    // listening for the rest of the round.
+                                    voice_engine_for_arming.arm_listen(180_000);
                                     convlog_for_voice
                                         .finish(draft.think(
                                             "interrupt",
@@ -2214,9 +2221,13 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             };
                             tokio::spawn(async move {
+                                let outcome = answer.await;
                                 // Release the #45 active-round slot when this
                                 // round still owns it (a superseding round
-                                // already took it otherwise).
+                                // already took it otherwise) — only AFTER the
+                                // round finished: clearing earlier would
+                                // empty the slot mid-round and deafen the
+                                // interrupt gate.
                                 {
                                     let mut slot =
                                         active_round_for_reply.lock().expect("active round lock");
@@ -2227,7 +2238,7 @@ async fn main() -> anyhow::Result<()> {
                                         slot.take();
                                     }
                                 }
-                                match answer.await {
+                                match outcome {
                                     Ok((mut draft, reply, engine_label, spoken, cancelled)) => {
                                         // Extend the conversation session with
                                         // this Q/A pair (trimmed to the last 4
