@@ -183,6 +183,22 @@ impl TtsEngine {
     ///
     /// Inactive engine or subprocess failure.
     pub fn speak(&self, text: &str) -> anyhow::Result<PathBuf> {
+        let out = self.synthesize(text)?;
+        if let Err(e) = self.play(&out) {
+            tracing::warn!(error = %e, "tts: playback failed (file kept at {})", out.display());
+        }
+        Ok(out)
+    }
+
+    /// Synthesize one utterance to a WAV file without playing it — the
+    /// sentence-streaming pipeline (2026-10-12 P0) synthesizes the next
+    /// sentence while the previous one is still on the speaker. Blocking
+    /// like [`Self::speak`]; belongs on `spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Inactive engine, empty text, or synth subprocess failure.
+    pub fn synthesize(&self, text: &str) -> anyhow::Result<PathBuf> {
         if !self.active {
             anyhow::bail!("tts inactive: {}", self.inactive_reason);
         }
@@ -191,8 +207,9 @@ impl TtsEngine {
         }
         let lang = crate::lang::detect(text);
         let profile = self.profile_for(lang);
-        // Per-model metric span (SPEC appendix A #39): covers synthesis
-        // and playback; the label names the spoken language's vits voice.
+        // Per-model metric span (SPEC appendix A #39): the synthesis
+        // stage (the pipeline measures playback separately); the label
+        // names the spoken language's vits voice.
         let model_id = match lang {
             crate::lang::SpokenLang::Cantonese => "tts.yue",
             crate::lang::SpokenLang::English => "tts.en",
@@ -214,7 +231,15 @@ impl TtsEngine {
             .arg(format!("--num-threads={}", self.config.num_threads.max(1)))
             .arg(format!("--output-filename={}", out.display()))
             .arg(text);
-        let result = self.speak_tail(&mut cmd, out);
+        let result = (|| {
+            let status = cmd
+                .status()
+                .map_err(|e| anyhow::anyhow!("spawn tts: {e}"))?;
+            if !status.success() {
+                anyhow::bail!("tts subprocess failed: {status}");
+            }
+            Ok(out)
+        })();
         match &result {
             Ok(_) => call.finish_ok(None, None),
             Err(_) => call.finish_err(),
@@ -222,31 +247,31 @@ impl TtsEngine {
         result
     }
 
-    fn speak_tail(
-        &self,
-        cmd: &mut std::process::Command,
-        out: std::path::PathBuf,
-    ) -> anyhow::Result<PathBuf> {
-        let status = cmd
+    /// Play a synthesized WAV through the configured player, blocking
+    /// until it finishes. Split from synthesis so the pipeline can
+    /// interleave the two; a playback failure never fails the round —
+    /// callers log and keep going.
+    ///
+    /// # Errors
+    ///
+    /// Player subprocess spawn or non-zero exit.
+    pub fn play(&self, wav: &std::path::Path) -> anyhow::Result<()> {
+        if self.config.player.trim().is_empty() {
+            return Ok(());
+        }
+        let mut parts = self.config.player.split_whitespace();
+        let Some(prog) = parts.next() else {
+            return Ok(());
+        };
+        let status = std::process::Command::new(prog)
+            .args(parts)
+            .arg(wav)
             .status()
-            .map_err(|e| anyhow::anyhow!("spawn tts: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("tts play: {e}"))?;
         if !status.success() {
-            anyhow::bail!("tts subprocess failed: {status}");
+            anyhow::bail!("tts playback failed: {status}");
         }
-        if !self.config.player.is_empty() && !self.config.player.trim().is_empty() {
-            let mut parts = self.config.player.split_whitespace();
-            let Some(prog) = parts.next() else {
-                return Ok(out);
-            };
-            let play = std::process::Command::new(prog)
-                .args(parts)
-                .arg(&out)
-                .status();
-            if let Err(e) = play {
-                tracing::warn!(error = %e, "tts: playback failed (file kept at {})", out.display());
-            }
-        }
-        Ok(out)
+        Ok(())
     }
 }
 
