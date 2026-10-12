@@ -273,6 +273,31 @@ impl TtsEngine {
         }
         Ok(())
     }
+
+    /// [`Self::play`] without waiting — the interruptible pipeline
+    /// (SPEC appendix A #45) polls the child and kills it when the user
+    /// interrupts mid-sentence. `None` when no player is configured.
+    ///
+    /// # Errors
+    ///
+    /// Player subprocess spawn failure.
+    pub fn spawn_play(&self, wav: &std::path::Path) -> anyhow::Result<Option<std::process::Child>> {
+        if self.config.player.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut parts = self.config.player.split_whitespace();
+        let Some(prog) = parts.next() else {
+            return Ok(None);
+        };
+        std::process::Command::new(prog)
+            .args(parts)
+            .arg(wav)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("tts play spawn: {e}"))
+    }
 }
 
 /// Deterministic offline self-test (`--selftest-tts`): synthesize one

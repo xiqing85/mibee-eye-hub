@@ -584,6 +584,61 @@ pub fn triage_skips_reply(label: &str, transcript: &str) -> bool {
     label == "ignore" && crate::lang::detect(transcript) != crate::lang::SpokenLang::Cantonese
 }
 
+/// What to do with an utterance that arrives while an answer round is
+/// still running (SPEC appendix A #45, conservative direction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptAction {
+    /// A stop word ("停/别说了/闭嘴/算了…") — cancel the round, answer
+    /// nothing. Rule-matched, zero model latency.
+    Stop,
+    /// A new question — cancel the old round and answer this instead.
+    Supersede,
+    /// Backchannel ("嗯/好/哦") or anything unclassified — ignore, the
+    /// old round keeps going. The fail-open direction: rather miss an
+    /// interruption than falsely kill a good answer.
+    Backchannel,
+}
+
+/// Rule-level stop-word match (the ① tier of the #45 policy — no model
+/// involved). Only short utterances match: a stop word buried in a
+/// longer sentence is content, not a command.
+#[must_use]
+pub fn stop_words_match(text: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "停",
+        "别说了",
+        "闭嘴",
+        "不用说了",
+        "不要说了",
+        "算了",
+        "收声",
+        "唔使讲",
+        "不用讲",
+        "stop",
+        "quiet",
+        "shh",
+    ];
+    let t = text.trim();
+    if t.chars().count() > 6 {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    NEEDLES.iter().any(|n| lower.contains(n))
+}
+
+/// Map a #45 classifier verdict onto an action. Anything below the
+/// confidence threshold fails open to [`InterruptAction::Backchannel`].
+#[must_use]
+pub fn interrupt_policy(label: &str, confidence: f32, threshold: f32) -> InterruptAction {
+    if confidence < threshold {
+        return InterruptAction::Backchannel;
+    }
+    match label {
+        "supersede" => InterruptAction::Supersede,
+        _ => InterruptAction::Backchannel,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +651,45 @@ mod tests {
         // (0.90/0.70) — the spoken reply was silently dropped.
         assert!(!triage_skips_reply("ignore", "而家广州天气变嘛"));
         assert!(!triage_skips_reply("ignore", "而家天气广州天气点嘛"));
+    }
+
+    #[test]
+    fn stop_words_match_short_commands_in_three_languages() {
+        assert!(stop_words_match("停"));
+        assert!(stop_words_match("别说了"));
+        assert!(stop_words_match(" 闭嘴 "));
+        assert!(stop_words_match("算了"));
+        assert!(stop_words_match("收声啦"));
+        assert!(stop_words_match("唔使讲"));
+        assert!(stop_words_match("stop"));
+        // Content, not commands: long sentences never match even when
+        // they contain a stop word.
+        assert!(!stop_words_match("请问停车场在哪里"));
+        assert!(!stop_words_match("别说了这么多，再讲讲你刚才提到的算法"));
+        assert!(!stop_words_match("现在几点了"));
+        assert!(!stop_words_match(""));
+    }
+
+    #[test]
+    fn interrupt_policy_fails_open_below_threshold() {
+        assert_eq!(
+            interrupt_policy("supersede", 0.9, 0.6),
+            InterruptAction::Supersede
+        );
+        assert_eq!(
+            interrupt_policy("supersede", 0.5, 0.6),
+            InterruptAction::Backchannel,
+            "low confidence fails open"
+        );
+        assert_eq!(
+            interrupt_policy("backchannel", 0.99, 0.6),
+            InterruptAction::Backchannel
+        );
+        assert_eq!(
+            interrupt_policy("anything-else", 0.99, 0.6),
+            InterruptAction::Backchannel,
+            "unknown label is never an interrupt"
+        );
     }
 
     #[test]

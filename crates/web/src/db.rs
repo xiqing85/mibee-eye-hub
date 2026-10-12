@@ -182,8 +182,8 @@ pub async fn insert_conversation_turn_with_cap(
     let thinking_json = serde_json::to_string(&turn.thinking).unwrap_or_else(|_| "[]".to_string());
     let mut tx = pool.begin().await.context("conversation turn: begin")?;
     sqlx::query(
-        "INSERT INTO conversation_turns (conversation_id, origin, started_ms, user_text, thinking_json, reply_text, engine) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO conversation_turns (conversation_id, origin, started_ms, user_text, thinking_json, reply_text, engine, interrupted) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )
     .bind(&turn.conversation_id)
     .bind(&turn.origin)
@@ -192,6 +192,7 @@ pub async fn insert_conversation_turn_with_cap(
     .bind(&thinking_json)
     .bind(&turn.reply_text)
     .bind(&turn.engine)
+    .bind(turn.interrupted)
     .execute(&mut *tx)
     .await
     .context("conversation turn: insert")?;
@@ -228,6 +229,7 @@ type ConversationTurnRow = (
     String,
     Option<String>,
     Option<String>,
+    bool,
 );
 
 /// List conversation turns, newest first (SPEC §3.4: `limit` default 50,
@@ -238,7 +240,7 @@ pub async fn list_conversation_turns(
 ) -> Result<Vec<ConversationTurn>> {
     let limit = limit.clamp(1, 200);
     let rows: Vec<ConversationTurnRow> = sqlx::query_as(
-        "SELECT id, conversation_id, origin, started_ms, user_text, thinking_json, reply_text, engine \
+        "SELECT id, conversation_id, origin, started_ms, user_text, thinking_json, reply_text, engine, interrupted \
          FROM conversation_turns ORDER BY id DESC LIMIT ?1",
     )
     .bind(limit)
@@ -257,6 +259,7 @@ pub async fn list_conversation_turns(
                 thinking_json,
                 reply_text,
                 engine,
+                interrupted,
             )| {
                 ConversationTurn {
                     id,
@@ -267,6 +270,7 @@ pub async fn list_conversation_turns(
                     thinking: serde_json::from_str(&thinking_json).unwrap_or_default(),
                     reply_text,
                     engine,
+                    interrupted,
                 }
             },
         )
