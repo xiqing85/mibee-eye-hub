@@ -155,6 +155,14 @@ pub struct VoiceConfig {
     /// Minimum Laya confidence for an interrupt classification to act
     /// (below it the verdict fails open to backchannel/ignore).
     pub interrupt_confidence: f32,
+    /// Playback-phase barge-in (SPEC appendix A #45 amendment): `"off"`
+    /// (default — full deaf while the reply plays) or `"aec"` — the
+    /// playback self-mute deafens only the wake word while VAD stays
+    /// live, letting the user interrupt the speaking reply. Requires
+    /// the host to capture from an echo-cancelled source; without AEC
+    /// this would feed our own TTS straight into ASR.
+    #[serde(default)]
+    pub barge_in: String,
 }
 
 impl Default for VoiceConfig {
@@ -182,6 +190,7 @@ impl Default for VoiceConfig {
             capture_endpointing: true,
             interrupt_enable: true,
             interrupt_confidence: 0.6,
+            barge_in: "off".into(),
         }
     }
 }
@@ -799,6 +808,9 @@ impl VoiceEngine {
         #[cfg(feature = "voice")]
         {
             let capture_secs = self.config.capture_secs;
+            // #45 playback-phase barge-in: with a host echo-cancelled
+            // capture source the playback mute deafens only KWS.
+            let aec_barge_in = self.config.barge_in == "aec";
             let verify = self.config.speaker_verify;
             let threshold = self.config.speaker_threshold;
             let ring_cap = ((self.config.verify_window_secs.max(1.0)
@@ -838,6 +850,7 @@ impl VoiceEngine {
                 // the armed-but-nobody-enrolled fail-open logs once.
                 let mut ring = SampleRing::new(ring_cap);
                 let mut warned_no_profiles = false;
+                let mut was_muted = false;
                 loop {
                     match rx.recv().await {
                         Ok(chunk) => {
@@ -850,7 +863,13 @@ impl VoiceEngine {
                             // output otherwise re-wakes the device (the
                             // 2026-10-02 self-talk loop). The expired-cap
                             // case re-opens the mic instead of trusting a
-                            // stale deadline.
+                            // stale deadline. With `barge_in = "aec"` (host
+                            // runs an echo-cancelled capture source) the
+                            // mute deafens ONLY the wake word: VAD stays
+                            // live so the user can interrupt the speaking
+                            // reply (#45 playback phase) — the loop cannot
+                            // restart because KWS itself stays muted.
+                            let mut kws_muted = false;
                             let mute_until =
                                 playback_mute_until_ms.load(std::sync::atomic::Ordering::SeqCst);
                             if mute_until > 0 {
@@ -858,9 +877,32 @@ impl VoiceEngine {
                                     playback_mute_until_ms
                                         .store(0, std::sync::atomic::Ordering::SeqCst);
                                     info!("voice: playback self-mute expired, mic re-opened");
+                                } else if aec_barge_in {
+                                    kws_muted = true;
+                                    was_muted = true;
                                 } else {
+                                    was_muted = true;
                                     continue;
                                 }
+                            } else if was_muted {
+                                // Mute just lifted (release or expiry): the
+                                // VAD state still holds the tail of our own
+                                // playback as an in-flight segment — flush
+                                // it or the completed segment transcribes
+                                // the reply's last words right into the
+                                // freshly-armed follow-up window (observed
+                                // live: a 52-char echo transcript started a
+                                // self-answer round).
+                                was_muted = false;
+                                if let Some(vad) = internals.vad.as_ref() {
+                                    vad.clear();
+                                    vad.reset();
+                                }
+                                if let Some(cvad) = capture_vad.as_ref() {
+                                    cvad.clear();
+                                    cvad.reset();
+                                }
+                                info!("voice: playback self-mute lifted — VAD state flushed");
                             }
                             // Follow-up window (#30-B): VAD endpointing
                             // replaces the wake word until the window
@@ -995,101 +1037,109 @@ impl VoiceEngine {
                                 }
                                 continue;
                             }
-                            kws_stream.accept_waveform(16_000, &samples);
-                            while internals.kws.is_ready(&kws_stream) {
-                                internals.kws.decode(&kws_stream);
-                            }
-                            if let Some(hit) = internals.kws.get_result(&kws_stream)
-                                && !hit.keyword.is_empty()
-                            {
-                                info!(keyword = %hit.keyword, "voice: wake word detected");
-                                internals.kws.reset(&kws_stream);
-                                captured.clear();
-
-                                // Enrollment has priority: the wake-word
-                                // utterance becomes a voiceprint sample
-                                // instead of an interaction. Once the session
-                                // is full, extra wake words are ignored until
-                                // the host commits or cancels.
-                                let enrolling = speakers
-                                    .lock()
-                                    .expect("speaker registry lock")
-                                    .enrollment
-                                    .as_ref()
-                                    .is_some_and(enrollment_accepts);
-                                if enrolling {
-                                    if let Some(embed) = &internals.embed {
-                                        let snapshot = ring.snapshot();
-                                        let embed = Arc::clone(embed);
-                                        let speakers = Arc::clone(&speakers);
-                                        let collected = tokio::task::spawn_blocking(
-                                            move || -> Option<usize> {
-                                                let emb = compute_embedding(&embed, &snapshot)?;
-                                                let mut reg =
-                                                    speakers.lock().expect("speaker registry lock");
-                                                let session = reg.enrollment.as_mut()?;
-                                                session.embeddings.push(emb);
-                                                Some(session.embeddings.len())
-                                            },
-                                        )
-                                        .await
-                                        .ok()
-                                        .flatten();
-                                        if let Some(n) = collected {
-                                            info!(
-                                                samples = n,
-                                                "voice: enrollment sample collected"
-                                            );
-                                        }
-                                    }
-                                    continue;
+                            // KWS runs unless playback-mute deafened it
+                            // (aec barge-in keeps VAD alive but never the
+                            // wake word — self-talk cannot restart).
+                            if !kws_muted {
+                                kws_stream.accept_waveform(16_000, &samples);
+                                while internals.kws.is_ready(&kws_stream) {
+                                    internals.kws.decode(&kws_stream);
                                 }
+                                if let Some(hit) = internals.kws.get_result(&kws_stream)
+                                    && !hit.keyword.is_empty()
+                                {
+                                    info!(keyword = %hit.keyword, "voice: wake word detected");
+                                    internals.kws.reset(&kws_stream);
+                                    captured.clear();
 
-                                // Verification gate: with profiles enrolled,
-                                // only a known speaker opens the capture.
-                                if verify {
-                                    let profiles = speakers
+                                    // Enrollment has priority: the wake-word
+                                    // utterance becomes a voiceprint sample
+                                    // instead of an interaction. Once the session
+                                    // is full, extra wake words are ignored until
+                                    // the host commits or cancels.
+                                    let enrolling = speakers
                                         .lock()
                                         .expect("speaker registry lock")
-                                        .manager
+                                        .enrollment
                                         .as_ref()
-                                        .map_or(0, |m| m.num_speakers());
-                                    if profiles == 0 {
-                                        if !warned_no_profiles {
-                                            warned_no_profiles = true;
-                                            warn!(
-                                                "voice: speaker_verify armed but no profiles \
-                                                 enrolled — allowing wake (fail-open)"
-                                            );
+                                        .is_some_and(enrollment_accepts);
+                                    if enrolling {
+                                        if let Some(embed) = &internals.embed {
+                                            let snapshot = ring.snapshot();
+                                            let embed = Arc::clone(embed);
+                                            let speakers = Arc::clone(&speakers);
+                                            let collected = tokio::task::spawn_blocking(
+                                                move || -> Option<usize> {
+                                                    let emb = compute_embedding(&embed, &snapshot)?;
+                                                    let mut reg = speakers
+                                                        .lock()
+                                                        .expect("speaker registry lock");
+                                                    let session = reg.enrollment.as_mut()?;
+                                                    session.embeddings.push(emb);
+                                                    Some(session.embeddings.len())
+                                                },
+                                            )
+                                            .await
+                                            .ok()
+                                            .flatten();
+                                            if let Some(n) = collected {
+                                                info!(
+                                                    samples = n,
+                                                    "voice: enrollment sample collected"
+                                                );
+                                            }
                                         }
-                                    } else if let Some(embed) = &internals.embed {
-                                        let snapshot = ring.snapshot();
-                                        let embed = Arc::clone(embed);
-                                        let speakers = Arc::clone(&speakers);
-                                        let matched = tokio::task::spawn_blocking(
-                                            move || -> Option<String> {
-                                                let emb = compute_embedding(&embed, &snapshot)?;
-                                                speakers
-                                                    .lock()
-                                                    .expect("speaker registry lock")
-                                                    .manager
-                                                    .as_ref()
-                                                    .and_then(|m| m.search(&emb, threshold))
-                                            },
-                                        )
-                                        .await
-                                        .ok()
-                                        .flatten();
-                                        if !wake_gate_allows(true, matched.as_deref()) {
-                                            info!("voice: wake word rejected (unknown speaker)");
-                                            continue;
+                                        continue;
+                                    }
+
+                                    // Verification gate: with profiles enrolled,
+                                    // only a known speaker opens the capture.
+                                    if verify {
+                                        let profiles = speakers
+                                            .lock()
+                                            .expect("speaker registry lock")
+                                            .manager
+                                            .as_ref()
+                                            .map_or(0, |m| m.num_speakers());
+                                        if profiles == 0 {
+                                            if !warned_no_profiles {
+                                                warned_no_profiles = true;
+                                                warn!(
+                                                    "voice: speaker_verify armed but no profiles \
+                                                 enrolled — allowing wake (fail-open)"
+                                                );
+                                            }
+                                        } else if let Some(embed) = &internals.embed {
+                                            let snapshot = ring.snapshot();
+                                            let embed = Arc::clone(embed);
+                                            let speakers = Arc::clone(&speakers);
+                                            let matched = tokio::task::spawn_blocking(
+                                                move || -> Option<String> {
+                                                    let emb = compute_embedding(&embed, &snapshot)?;
+                                                    speakers
+                                                        .lock()
+                                                        .expect("speaker registry lock")
+                                                        .manager
+                                                        .as_ref()
+                                                        .and_then(|m| m.search(&emb, threshold))
+                                                },
+                                            )
+                                            .await
+                                            .ok()
+                                            .flatten();
+                                            if !wake_gate_allows(true, matched.as_deref()) {
+                                                info!(
+                                                    "voice: wake word rejected (unknown speaker)"
+                                                );
+                                                continue;
+                                            }
                                         }
                                     }
-                                }
 
-                                keyword_pending = Some(hit.keyword);
-                                capture_deadline = tokio::time::Instant::now()
-                                    + Duration::from_secs(u64::from(capture_secs.max(1)));
+                                    keyword_pending = Some(hit.keyword);
+                                    capture_deadline = tokio::time::Instant::now()
+                                        + Duration::from_secs(u64::from(capture_secs.max(1)));
+                                }
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1419,6 +1469,12 @@ mod tests {
         assert!((c.speaker_threshold - 0.55).abs() < f32::EPSILON);
         assert!((c.verify_window_secs - 2.0).abs() < f32::EPSILON);
         assert!(c.speaker_embedding_model.contains("speaker"));
+        // #45: interruption on by default, playback barge-in opt-in.
+        assert!(c.interrupt_enable);
+        assert!((c.interrupt_confidence - 0.6).abs() < f32::EPSILON);
+        assert_eq!(c.barge_in, "off", "aec barge-in needs the host AEC source");
+        let cfg: VoiceConfig = toml::from_str("barge_in = \"aec\"").unwrap();
+        assert_eq!(cfg.barge_in, "aec");
     }
 
     #[test]

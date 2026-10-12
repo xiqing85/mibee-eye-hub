@@ -512,6 +512,11 @@ vad_model = "models/voice/vad/silero_vad.onnx"
 # 收到约 0.6 秒尾静音即结束——先说唤醒词停顿再提问不再被固定窗口截断。
 # 依赖 vad_model，缺文件回落固定窗口（fail-open）。
 capture_endpointing = true
+# 打断（#45）
+interrupt_enable = true
+interrupt_confidence = 0.6
+# 播报期打断（需主机 AEC 采集源） / playback-phase (host AEC source required)
+barge_in = "off"
 ```
 
 **字段参考：**
@@ -530,6 +535,9 @@ capture_endpointing = true
 | `speaker_verify` | bool | `false` | 声纹验证门控：开启后唤醒词须匹配已注册说话人才开采集窗（无注册档案时 fail-open 放行并 WARN 一次）。 |
 | `speaker_threshold` | f32 | `0.55` | 声纹余弦相似度阈值（CAM++ 典型 0.5–0.6，建议按麦克风实测标定）。 |
 | `verify_window_secs` | f32 | `2.0` | 唤醒词验证取样的环形缓冲秒数（须覆盖唤醒词发音时长）。 |
+| `interrupt_enable` | bool | `true` | 打断（#45）：思考期免唤醒监听 + 停词/Laya 打断策略。 |
+| `interrupt_confidence` | f32 | `0.6` | 打断判定的最低 Laya 置信度，低于则按附和忽略（保守 fail-open）。 |
+| `barge_in` | String | `"off"` | 播报期打断：`"off"` 全哑（默认）；`"aec"` 播报期间只哑唤醒词、VAD 保持监听（可对正在播报的回答说"停"或新问题打断）。**需主机回声消除采集源**（pipewire `module-echo-cancel`，webrtc，增益 ≤100%），否则自身 TTS 会直灌 ASR。 |
 
 **注意事项：**
 
