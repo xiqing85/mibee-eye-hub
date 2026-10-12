@@ -17,12 +17,51 @@ pub struct LevelMeter {
     /// Samples accumulated since the last emit window.
     pending: usize,
     pending_sq: f64,
+    /// Samples at/near full scale accumulated in the pending window.
+    pending_clips: usize,
+    /// Sustained-clipping episode state (see [`ClipDetector`]).
+    clips: ClipDetector,
     /// Last emitted smoothed level (attack fast, release slow).
     level: f32,
     /// Monotonic ms at last emit; `None` until the first emit (the very
     /// first full window is never throttled). Caller-supplied clock keeps
     /// the throttle deterministic in tests.
     last_emit_ms: Option<u64>,
+}
+
+/// Sustained-input-clip detector (2026-10-12 incident guard). OS-side mic
+/// gain above 100% on SOF laptop mics corrupts the capture into
+/// near-full-scale garbage: the KWS hit rate collapses with zero log
+/// output while this meter happily reads "loud". A window where ≥1/10 of
+/// samples sit within 0.5% of full scale counts as clipped; 5 consecutive
+/// clipped windows (~0.5 s) fire one warn per episode, re-armed by the
+/// first clean window.
+#[derive(Debug, Default)]
+struct ClipDetector {
+    streak: u32,
+    warned: bool,
+}
+
+impl ClipDetector {
+    const CLIP_SAMPLE: i16 = 32_600; // ≥ 99.5% of full scale
+    const RATIO: usize = 10; // ≥1/10 samples clipped → clipped window
+    const WARN_STREAK: u32 = 5; // ~0.5 s of continuous clipping
+
+    /// Feed one completed window; returns `true` exactly once per episode
+    /// (on the call that crosses the warn streak) so the caller can log.
+    fn feed(&mut self, clipped_samples: usize, window_samples: usize) -> bool {
+        if window_samples > 0 && clipped_samples * Self::RATIO >= window_samples {
+            self.streak = self.streak.saturating_add(1);
+            if self.streak >= Self::WARN_STREAK && !self.warned {
+                self.warned = true;
+                return true;
+            }
+        } else {
+            self.streak = 0;
+            self.warned = false;
+        }
+        false
+    }
 }
 
 const WINDOW_SAMPLES: usize = 1600; // 100 ms @ 16 kHz
@@ -57,6 +96,8 @@ impl LevelMeter {
         Self {
             pending: 0,
             pending_sq: 0.0,
+            pending_clips: 0,
+            clips: ClipDetector::default(),
             level: 0.0,
             last_emit_ms: None,
         }
@@ -68,6 +109,9 @@ impl LevelMeter {
         for s in samples {
             let f = f64::from(*s) / 32768.0;
             self.pending_sq += f * f;
+            if s.unsigned_abs() >= ClipDetector::CLIP_SAMPLE.unsigned_abs() {
+                self.pending_clips += 1;
+            }
         }
         self.pending += samples.len();
         if self.pending < WINDOW_SAMPLES {
@@ -82,8 +126,15 @@ impl LevelMeter {
             return None;
         }
         let rms = (self.pending_sq / self.pending as f64).sqrt() as f32;
+        if self.clips.feed(self.pending_clips, self.pending) {
+            tracing::warn!(
+                "audio: mic input clipping sustained — check the OS source gain \
+                 (SOF laptop mics corrupt above 100%); KWS degrades silently"
+            );
+        }
         self.pending = 0;
         self.pending_sq = 0.0;
+        self.pending_clips = 0;
         self.last_emit_ms = Some(now_ms);
         let target = scale_level(rms);
         // Speech bursts must light up instantly; decay can lag — a
@@ -180,5 +231,51 @@ mod tests {
     fn silent_start_emits_zero_not_noise() {
         let mut m = LevelMeter::new();
         assert_eq!(m.update(&silence(3200), 0), Some(0.0));
+    }
+
+    #[test]
+    fn clip_detector_fires_once_per_episode_and_rearms() {
+        let mut d = ClipDetector::default();
+        for _ in 0..4 {
+            assert!(!d.feed(1600, 1600), "below the warn streak");
+        }
+        assert!(d.feed(1600, 1600), "5th fully-clipped window fires");
+        assert!(!d.feed(1600, 1600), "no re-warn inside one episode");
+        assert!(!d.feed(0, 1600), "clean window resets the streak");
+        for _ in 0..4 {
+            assert!(!d.feed(1600, 1600));
+        }
+        assert!(d.feed(1600, 1600), "warn re-arms after a clean window");
+    }
+
+    #[test]
+    fn clip_detector_ignores_sparse_peaks_and_empty_windows() {
+        let mut d = ClipDetector::default();
+        // 6% of samples clipped (isolated pops) never trips the ratio.
+        for _ in 0..100 {
+            assert!(!d.feed(100, 1600));
+        }
+        // Degenerate windows are never clipped.
+        assert!(!d.feed(1600, 0));
+        assert!(!d.feed(0, 0));
+    }
+
+    #[test]
+    fn full_scale_windows_drive_the_detector() {
+        // The 2026-10-12 incident shape: OS mic gain >100% turned the whole
+        // capture into near-full-scale garbage while every other subsystem
+        // looked healthy. The meter must flag it.
+        let mut m = LevelMeter::new();
+        let clipped: Vec<i16> = vec![32_700; 1600];
+        let mut fired = false;
+        for i in 0..6 {
+            m.update(&clipped, i * 150);
+            fired |= m.clips.warned;
+        }
+        assert!(fired, "sustained full-scale input sets the clip flag");
+        // A normal-speech window clears the episode.
+        m.update(&sine(1600, 2400.0), 6 * 150);
+        assert_eq!(m.clips.streak, 0, "clean window resets the streak");
+        assert!(!m.clips.warned, "warn re-arms");
     }
 }
