@@ -558,6 +558,11 @@ vad_model = "models/voice/vad/silero_vad.onnx"
 # it — questions spoken after a pause are no longer clipped by the
 # fixed window. Needs vad_model; missing → fixed window (fail-open).
 capture_endpointing = true
+# Interruption (#45)
+interrupt_enable = true
+interrupt_confidence = 0.6
+# 播报期打断（需主机 AEC 采集源） / playback-phase (host AEC source required)
+barge_in = "off"
 ```
 
 **Field Reference:**
@@ -576,6 +581,9 @@ capture_endpointing = true
 | `speaker_verify` | bool | `false` | Voiceprint gate: wake words must match an enrolled speaker before the capture window opens (fail-open with a one-time WARN when no profiles exist). |
 | `speaker_threshold` | f32 | `0.55` | Cosine-similarity threshold (CAM++ typical 0.5–0.6; calibrate on the target mic). |
 | `verify_window_secs` | f32 | `2.0` | Ring-buffer seconds of pre-wake audio the gate embeds (must cover the wake-word utterance). |
+| `interrupt_enable` | bool | `true` | interruption (#45): wake-free listening while a round thinks + stop-word/Laya policy. |
+| `interrupt_confidence` | f32 | `0.6` | Minimum Laya confidence to act on an interrupt verdict; below it the utterance is treated as backchannel (conservative fail-open). |
+| `barge_in` | String | `"off"` | Playback-phase barge-in: `"off"` fully deaf while replying (default); `"aec"` deafens only the wake word and keeps VAD live (say "stop" or a new question during playback to interrupt). **Requires a host echo-cancelled capture source** (pipewire `module-echo-cancel`, webrtc, source gain ≤100%) or our own TTS feeds straight into ASR. |
 
 **Notes:**
 
