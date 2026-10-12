@@ -39,6 +39,7 @@ nvenc = []
 turbojpeg = ["dep:turbojpeg"]
 
 [dependencies]
+libc = "0.2"
 pinyin = { version = "0.10", features = ["with_tone"] }
 capture = { path = "../capture" }
 tokio.workspace = true

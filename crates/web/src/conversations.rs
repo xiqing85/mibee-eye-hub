@@ -51,6 +51,12 @@ pub struct ConversationTurn {
     pub reply_text: Option<String>,
     /// `"cloud"` | `"local"` | `"vlm"` | `None` (no reply).
     pub engine: Option<String>,
+    /// SPEC §3.4 (2026-10-12): `true` only on turns cut short by user
+    /// interruption — `reply_text` then holds the actually-spoken prefix
+    /// (possibly `None`). Serialized only when true (old frontends ignore
+    /// unknown fields either way).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
 }
 
 /// Where a turn came from. `Voice` turns share the §3.3 120 s session
@@ -101,6 +107,7 @@ pub struct TurnDraft {
     thinking: Vec<ThinkingEntry>,
     reply_text: Option<String>,
     engine: Option<String>,
+    interrupted: bool,
 }
 
 impl TurnDraft {
@@ -113,6 +120,7 @@ impl TurnDraft {
             thinking: Vec::new(),
             reply_text: None,
             engine: None,
+            interrupted: false,
         }
     }
 
@@ -146,6 +154,14 @@ impl TurnDraft {
         self
     }
 
+    /// Mark the turn as cut short by user interruption (SPEC §3.4
+    /// `interrupted`). Call after [`Self::reply`] (prefix) or on a
+    /// nothing-spoken cancel.
+    pub fn interrupted(mut self) -> Self {
+        self.interrupted = true;
+        self
+    }
+
     pub(crate) fn into_turn(self, id: i64) -> ConversationTurn {
         ConversationTurn {
             id,
@@ -156,6 +172,7 @@ impl TurnDraft {
             thinking: self.thinking,
             reply_text: self.reply_text,
             engine: self.engine,
+            interrupted: self.interrupted,
         }
     }
 }
@@ -281,16 +298,41 @@ mod tests {
         assert_eq!(listed[0].origin, "http");
         assert_eq!(listed[0].thinking.len(), 1);
         assert_eq!(listed[0].reply_text.as_deref(), Some("你好呀！"));
+        assert!(!listed[0].interrupted);
+
+        // Interrupted turn (SPEC §3.4, #45): spoken prefix + marker; the
+        // flag serializes only when true (old frontends never see it).
+        log.finish(
+            TurnDraft::new(TurnOrigin::Voice, "c1")
+                .user_text("介绍你自己")
+                .think("llm", "qwen3", "回答被打断", 10)
+                .reply("你好，我是小蜜蜂。", "local")
+                .interrupted(),
+        )
+        .await;
+        let listed = crate::db::list_conversation_turns(&pool, 10).await.unwrap();
+        let interrupted = listed.iter().find(|t| t.interrupted).unwrap();
+        assert_eq!(
+            interrupted.reply_text.as_deref(),
+            Some("你好，我是小蜜蜂。")
+        );
+        let json = serde_json::to_value(interrupted).unwrap();
+        assert_eq!(json["interrupted"], serde_json::json!(true));
+        let plain = serde_json::to_value(&listed[1]).unwrap();
+        assert!(
+            plain.get("interrupted").is_none(),
+            "flag omitted when false"
+        );
 
         match rx.try_recv().expect("SSE event broadcast") {
             CameraEvent::ConversationRecord { turn } => {
-                assert_eq!(turn.id, listed[0].id);
+                assert_eq!(turn.id, listed[1].id);
                 assert_eq!(turn.engine.as_deref(), Some("local"));
             }
             other => panic!("unexpected event: {other:?}"),
         }
 
-        // Disabled log records nothing.
+        // Disabled log records nothing (still the two turns above).
         let off = ConversationLog::new(pool.clone(), event_tx, false);
         off.finish(TurnDraft::new(TurnOrigin::Http, "c2").user_text("x"))
             .await;
@@ -299,7 +341,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            1
+            2
         );
     }
 

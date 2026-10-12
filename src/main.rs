@@ -1268,6 +1268,23 @@ async fn main() -> anyhow::Result<()> {
         let conversation: ConversationSlot = Arc::new(std::sync::Mutex::new(None));
         let records_pool = pool.clone();
         let grounding_voice = Arc::clone(&grounding_state);
+        // Active answer round (SPEC appendix A #45): at most one at a
+        // time — this slot is what turns a transcript arriving mid-round
+        // into an interruption decision instead of a racing second round.
+        // `cancel` stops the streaming generation at the next token and
+        // kills playback; `spoken_prefix` accumulates the sentences that
+        // actually finished playing (the interrupted turn's honest
+        // reply); `round_id` lets a finished round clear the slot only
+        // when it still owns it.
+        struct ActiveRound {
+            cancel: Arc<std::sync::atomic::AtomicBool>,
+            round_id: u64,
+        }
+        let active_round: Arc<std::sync::Mutex<Option<ActiveRound>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let round_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let interrupt_enabled = config.voice.interrupt_enable;
+        let interrupt_confidence = config.voice.interrupt_confidence;
         tokio::spawn(async move {
             loop {
                 match voice_events.recv().await {
@@ -1353,8 +1370,128 @@ async fn main() -> anyhow::Result<()> {
                             conv.id(),
                         )
                         .user_text(ev.transcript.clone());
+                        // Interruption gate (SPEC appendix A #45): a
+                        // transcript while a round is running is an
+                        // interruption candidate, not a second racing
+                        // round. Stop words are rule-matched (0ms);
+                        // everything else goes to the decision engine as
+                        // supersede/backchannel with a conservative
+                        // fail-open (ignore).
+                        if interrupt_enabled
+                            && active_round.lock().expect("active round lock").is_some()
+                        {
+                            if ev.transcript.trim().is_empty() {
+                                // VAD noise blip mid-round — not worth a
+                                // record; the round keeps thinking.
+                                conv.close();
+                                continue;
+                            }
+                            let interrupt_started = std::time::Instant::now();
+                            let action = if streaming::decision::stop_words_match(&ev.transcript) {
+                                streaming::decision::InterruptAction::Stop
+                            } else {
+                                let mut action = streaming::decision::InterruptAction::Backchannel;
+                                if decision_for_voice.is_active() {
+                                    let state_text = format!(
+                                        "语音助手正在回答上一个问题时，用户又说：「{}」",
+                                        ev.transcript
+                                    );
+                                    let engine = decision_for_voice.clone();
+                                    if let Ok(d) = tokio::task::spawn_blocking(move || {
+                                        engine.decide_choice(
+                                            &state_text,
+                                            "这句话是新的问题还是附和？",
+                                            &[
+                                                (
+                                                    "supersede".into(),
+                                                    "用户提出了新的问题或改变了话题，需要重新回答"
+                                                        .into(),
+                                                ),
+                                                (
+                                                    "backchannel".into(),
+                                                    "附和、确认或无意义的声音（嗯、好、哦）".into(),
+                                                ),
+                                            ],
+                                        )
+                                    })
+                                    .await
+                                        && let Some(d) = d
+                                    {
+                                        action = streaming::decision::interrupt_policy(
+                                            &d.label,
+                                            d.confidence,
+                                            interrupt_confidence,
+                                        );
+                                    }
+                                }
+                                action
+                            };
+                            match action {
+                                streaming::decision::InterruptAction::Stop => {
+                                    if let Some(active) =
+                                        active_round.lock().expect("active round lock").take()
+                                    {
+                                        active
+                                            .cancel
+                                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    tracing::info!(
+                                        transcript = %ev.transcript,
+                                        "voice: round interrupted (stop word)"
+                                    );
+                                    convlog_for_voice
+                                        .finish(draft.think(
+                                            "interrupt",
+                                            "rule",
+                                            "停词 — 已取消当前回答",
+                                            interrupt_started.elapsed().as_millis() as u64,
+                                        ))
+                                        .await;
+                                    conv.close();
+                                    continue;
+                                }
+                                streaming::decision::InterruptAction::Backchannel => {
+                                    tracing::info!(
+                                        transcript = %ev.transcript,
+                                        "voice: mid-round utterance ignored (backchannel)"
+                                    );
+                                    convlog_for_voice
+                                        .finish(draft.think(
+                                            "interrupt",
+                                            "laya",
+                                            "附和或低置信 — 忽略，当前回答继续",
+                                            interrupt_started.elapsed().as_millis() as u64,
+                                        ))
+                                        .await;
+                                    conv.close();
+                                    continue;
+                                }
+                                streaming::decision::InterruptAction::Supersede => {
+                                    if let Some(active) =
+                                        active_round.lock().expect("active round lock").take()
+                                    {
+                                        active
+                                            .cancel
+                                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    tracing::info!(
+                                        transcript = %ev.transcript,
+                                        "voice: round superseded by a new question"
+                                    );
+                                    // Fall through: this utterance becomes
+                                    // the new round below (the dying round
+                                    // records itself as interrupted).
+                                    draft = draft.think(
+                                        "interrupt",
+                                        "laya",
+                                        "新问题 — 已取消上一轮回答",
+                                        interrupt_started.elapsed().as_millis() as u64,
+                                    );
+                                }
+                            }
+                        }
                         // Away voice control (#44 amendment): "我要出门了"
-                        // / "我回来了" arm/disarm the watch directly — a
+                        // "我回来了" arm/disarm the watch directly — a
                         // built-in intent, answered without the LLM.
                         let away_cmd_started = std::time::Instant::now();
                         if let Some(want_active) = web::away::match_voice_command(&ev.transcript)
@@ -1567,6 +1704,31 @@ async fn main() -> anyhow::Result<()> {
                             let conv_for_reply = conv.clone();
                             let convlog_for_reply = Arc::clone(&convlog_for_voice);
                             let desktop_for_conversation = Arc::clone(&desktop_for_voice);
+                            // Active-round slot (#45): this round owns the
+                            // mic's thinking-phase wake-free window and the
+                            // interrupt cancel flag; the wrapper clears the
+                            // slot when it still holds round_id.
+                            let round_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let spoken_prefix = Arc::new(std::sync::Mutex::new(String::new()));
+                            let round_id =
+                                round_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            {
+                                let mut slot = active_round.lock().expect("active round lock");
+                                *slot = Some(ActiveRound {
+                                    cancel: Arc::clone(&round_cancel),
+                                    round_id,
+                                });
+                            }
+                            if interrupt_enabled {
+                                // Wake-free listening for the whole round
+                                // (thinking + speaking): VAD segments land
+                                // in the #45 gate above. Replaced by the
+                                // normal 12 s follow-up window when the
+                                // wrapper finishes the round.
+                                voice_engine_for_arming.arm_listen(180_000);
+                            }
+                            let active_round_for_reply = Arc::clone(&active_round);
+                            let round_id_for_reply = round_id;
                             // Answer path (SPEC §4.10): the cloud answers
                             // first when configured — same persona/grounding
                             // system turn — and the local model is the
@@ -1723,7 +1885,13 @@ async fn main() -> anyhow::Result<()> {
                                                 )
                                             };
                                             draft = draft.think(think_source, &model_id, note, dur);
-                                            return Ok((draft, out.reply, engine_label, false));
+                                            return Ok((
+                                                draft,
+                                                Some(out.reply),
+                                                engine_label,
+                                                false,
+                                                false,
+                                            ));
                                         }
                                         Err(e) => {
                                             tracing::warn!(error = %e, "voice: agent loop failed — falling back to legacy legs");
@@ -1754,7 +1922,7 @@ async fn main() -> anyhow::Result<()> {
                                                 None => "云端应答".to_string(),
                                             };
                                             draft = draft.think("cloud.chat", &model_id, note, dur);
-                                            return Ok((draft, reply, "cloud", false));
+                                            return Ok((draft, Some(reply), "cloud", false, false));
                                         }
                                         Err(e) => {
                                             let dur = leg_start.elapsed().as_millis() as u64;
@@ -1803,6 +1971,7 @@ async fn main() -> anyhow::Result<()> {
                                 > = None;
                                 if tts_stream {
                                     let (tx_s, mut rx_s) = tokio::sync::mpsc::channel::<String>(8);
+                                    let cancel_gen = Arc::clone(&round_cancel);
                                     generator = Some(tokio::task::spawn_blocking({
                                         let engine = engine.clone();
                                         let turns = turns.clone();
@@ -1811,11 +1980,22 @@ async fn main() -> anyhow::Result<()> {
                                             engine.complete_streaming_with_usage(
                                                 &turns,
                                                 Some(&mut |delta: &str| {
+                                                    // #45: a set cancel flag
+                                                    // stops generation at the
+                                                    // next token; the partial
+                                                    // reply is kept.
+                                                    if cancel_gen
+                                                        .load(std::sync::atomic::Ordering::SeqCst)
+                                                    {
+                                                        return false;
+                                                    }
                                                     tx_s.blocking_send(delta.to_string()).is_ok()
                                                 }),
                                             )
                                         }
                                     }));
+                                    let cancel_speak = Arc::clone(&round_cancel);
+                                    let prefix_cell = Arc::clone(&spoken_prefix);
                                     speaker = Some(tokio::spawn({
                                         let tts = Arc::clone(&tts_for_pipeline);
                                         let voice = Arc::clone(&voice_for_pipeline);
@@ -1834,49 +2014,85 @@ async fn main() -> anyhow::Result<()> {
                                             let started = std::time::Instant::now();
                                             let mut first = true;
                                             let mut sentences = 0_usize;
-                                            let mut synth_ahead = None;
+                                            let mut synth_ahead: Option<(
+                                                String,
+                                                tokio::task::JoinHandle<
+                                                    anyhow::Result<std::path::PathBuf>,
+                                                >,
+                                            )> = None;
                                             while let Some(delta) = rx_s.recv().await {
+                                                if cancel_speak
+                                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                                {
+                                                    break;
+                                                }
                                                 let visible = filter.push(&delta);
                                                 for sentence in splitter.push(&visible) {
                                                     let t = Arc::clone(&tts);
+                                                    let synth_text = sentence.clone();
                                                     let next =
                                                         tokio::task::spawn_blocking(move || {
-                                                            t.synthesize(&sentence)
+                                                            t.synthesize(&synth_text)
                                                         });
+                                                    if let Some((played, handle)) =
+                                                        synth_ahead.take()
+                                                    {
+                                                        speak_pending_sentence(
+                                                            &tts,
+                                                            &voice,
+                                                            handle,
+                                                            &played,
+                                                            &mut first,
+                                                            &mut sentences,
+                                                            &cancel_speak,
+                                                            &prefix_cell,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    synth_ahead = Some((sentence, next));
+                                                }
+                                            }
+                                            if !cancel_speak
+                                                .load(std::sync::atomic::Ordering::SeqCst)
+                                            {
+                                                if let Some(tail) = splitter.flush() {
+                                                    let t = Arc::clone(&tts);
+                                                    let synth_text = tail.clone();
+                                                    let next =
+                                                        tokio::task::spawn_blocking(move || {
+                                                            t.synthesize(&synth_text)
+                                                        });
+                                                    if let Some((played, handle)) =
+                                                        synth_ahead.take()
+                                                    {
+                                                        speak_pending_sentence(
+                                                            &tts,
+                                                            &voice,
+                                                            handle,
+                                                            &played,
+                                                            &mut first,
+                                                            &mut sentences,
+                                                            &cancel_speak,
+                                                            &prefix_cell,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    synth_ahead = Some((tail, next));
+                                                }
+                                                if let Some((played, handle)) = synth_ahead.take() {
                                                     speak_pending_sentence(
                                                         &tts,
                                                         &voice,
-                                                        synth_ahead.take(),
+                                                        handle,
+                                                        &played,
                                                         &mut first,
                                                         &mut sentences,
+                                                        &cancel_speak,
+                                                        &prefix_cell,
                                                     )
                                                     .await;
-                                                    synth_ahead = Some(next);
                                                 }
                                             }
-                                            if let Some(tail) = splitter.flush() {
-                                                let t = Arc::clone(&tts);
-                                                let next = tokio::task::spawn_blocking(move || {
-                                                    t.synthesize(&tail)
-                                                });
-                                                speak_pending_sentence(
-                                                    &tts,
-                                                    &voice,
-                                                    synth_ahead.take(),
-                                                    &mut first,
-                                                    &mut sentences,
-                                                )
-                                                .await;
-                                                synth_ahead = Some(next);
-                                            }
-                                            speak_pending_sentence(
-                                                &tts,
-                                                &voice,
-                                                synth_ahead.take(),
-                                                &mut first,
-                                                &mut sentences,
-                                            )
-                                            .await;
                                             if !first {
                                                 voice.end_playback_mute();
                                             }
@@ -1947,7 +2163,35 @@ async fn main() -> anyhow::Result<()> {
                                                 speak_ms,
                                             );
                                         }
-                                        Ok((draft, reply, "local", spoken > 0))
+                                        // #45: a cancelled round reports
+                                        // the actually-spoken prefix (None
+                                        // when nothing got out) plus the
+                                        // interrupted marker.
+                                        let cancelled =
+                                            round_cancel.load(std::sync::atomic::Ordering::SeqCst);
+                                        let final_reply = if cancelled {
+                                            let prefix = spoken_prefix
+                                                .lock()
+                                                .expect("spoken prefix lock")
+                                                .trim()
+                                                .to_string();
+                                            if prefix.is_empty() {
+                                                None
+                                            } else {
+                                                Some(prefix)
+                                            }
+                                        } else {
+                                            Some(reply)
+                                        };
+                                        if cancelled {
+                                            draft = draft.think(
+                                                "interrupt",
+                                                "rule",
+                                                "回答被打断 — 仅保留已播报部分",
+                                                0,
+                                            );
+                                        }
+                                        Ok((draft, final_reply, "local", spoken > 0, cancelled))
                                     }
                                     Ok(Err(e)) => {
                                         draft = draft.think(
@@ -1970,11 +2214,28 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             };
                             tokio::spawn(async move {
+                                // Release the #45 active-round slot when this
+                                // round still owns it (a superseding round
+                                // already took it otherwise).
+                                {
+                                    let mut slot =
+                                        active_round_for_reply.lock().expect("active round lock");
+                                    if slot
+                                        .as_ref()
+                                        .is_some_and(|r| r.round_id == round_id_for_reply)
+                                    {
+                                        slot.take();
+                                    }
+                                }
                                 match answer.await {
-                                    Ok((mut draft, reply, engine_label, spoken)) => {
+                                    Ok((mut draft, reply, engine_label, spoken, cancelled)) => {
                                         // Extend the conversation session with
                                         // this Q/A pair (trimmed to the last 4
-                                        // pairs = 8 turns).
+                                        // pairs = 8 turns). An interrupted
+                                        // round contributes its SPOKEN prefix
+                                        // — the model's unspoken tail never
+                                        // happened as far as the dialogue is
+                                        // concerned.
                                         {
                                             let mut slot = conversation_for_reply
                                                 .lock()
@@ -1991,20 +2252,25 @@ async fn main() -> anyhow::Result<()> {
                                                 role: "user".into(),
                                                 content: user_turn,
                                             });
-                                            entry.1.push(streaming::llm::ChatTurn {
-                                                role: "assistant".into(),
-                                                content: reply.clone(),
-                                            });
+                                            if let Some(reply) = &reply {
+                                                entry.1.push(streaming::llm::ChatTurn {
+                                                    role: "assistant".into(),
+                                                    content: reply.clone(),
+                                                });
+                                            }
                                             let keep = entry.1.len().saturating_sub(8);
                                             entry.1.drain(..keep);
                                         }
-                                        let _ =
-                                            tx.send(web::routes::events::CameraEvent::ChatReply {
-                                                source: "voice".into(),
-                                                reply: reply.clone(),
-                                                grounded,
-                                                timestamp_ms: unix_now_ms(),
-                                            });
+                                        if let Some(reply) = &reply {
+                                            let _ = tx.send(
+                                                web::routes::events::CameraEvent::ChatReply {
+                                                    source: "voice".into(),
+                                                    reply: reply.clone(),
+                                                    grounded,
+                                                    timestamp_ms: unix_now_ms(),
+                                                },
+                                            );
+                                        }
                                         // Playback self-mute: while this reply
                                         // is on the speaker the wake-word
                                         // worker stays deaf — a spoken 小蜜蜂
@@ -2014,7 +2280,12 @@ async fn main() -> anyhow::Result<()> {
                                         // already spoke (and managed the
                                         // mute itself); this one-shot path
                                         // covers the cloud/agent legs.
-                                        if tts_for_reply.is_active() && !spoken {
+                                        if tts_for_reply.is_active() && !spoken && !cancelled {
+                                            // One-shot path (cloud/agent legs);
+                                            // `reply` is Some here — the local
+                                            // pipeline leg set spoken=true or
+                                            // was cancelled into None.
+                                            let reply = reply.clone().unwrap_or_default();
                                             let tts_model = match streaming::lang::detect(&reply) {
                                                 streaming::lang::SpokenLang::Cantonese => "tts.yue",
                                                 streaming::lang::SpokenLang::English => "tts.en",
@@ -2057,16 +2328,28 @@ async fn main() -> anyhow::Result<()> {
                                         // Continuous dialogue (#30-B): arm the
                                         // VAD follow-up window only after the
                                         // reply finished playing — earlier would
-                                        // let the mic capture our own TTS.
+                                        // let the mic capture our own TTS. Also
+                                        // replaces the round-long #45 listening
+                                        // window with the normal 12 s one.
                                         voice_engine_for_reply.arm_follow_up();
                                         // Desktop notification for the finished
                                         // reply (opt-in, SPEC appendix A #42).
-                                        desktop_for_conversation.notify_conversation(&reply);
+                                        if let Some(reply) = &reply {
+                                            desktop_for_conversation.notify_conversation(reply);
+                                        }
                                         // Record the completed turn (SPEC §3.4)
                                         // — persist + SSE `conversation`.
-                                        convlog_for_reply
-                                            .finish(draft.reply(reply.clone(), engine_label))
-                                            .await;
+                                        // Interrupted turns carry the spoken
+                                        // prefix (or no reply at all) plus the
+                                        // interrupted marker (#45).
+                                        let mut draft = match &reply {
+                                            Some(r) => draft.reply(r.clone(), engine_label),
+                                            None => draft,
+                                        };
+                                        if cancelled {
+                                            draft = draft.interrupted();
+                                        }
+                                        convlog_for_reply.finish(draft).await;
                                     }
                                     Err(draft) => {
                                         tracing::warn!("voice auto-reply failed");
@@ -2509,24 +2792,55 @@ fn unix_now_ms() -> u64 {
 /// FIRST actual playback (synthesis is silent and stays audible-to-KWS),
 /// then play it to completion. The next sentence's synthesis runs
 /// concurrently (the caller started it before awaiting this).
+#[allow(clippy::too_many_arguments)]
 async fn speak_pending_sentence(
     tts: &Arc<streaming::tts::TtsEngine>,
     voice: &Arc<streaming::voice::VoiceEngine>,
-    pending: Option<tokio::task::JoinHandle<anyhow::Result<std::path::PathBuf>>>,
+    pending: tokio::task::JoinHandle<anyhow::Result<std::path::PathBuf>>,
+    sentence: &str,
     first: &mut bool,
     sentences: &mut usize,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    spoken_prefix: &Arc<std::sync::Mutex<String>>,
 ) {
-    let Some(prev) = pending else { return };
-    let Ok(Ok(wav)) = prev.await else {
+    let Ok(Ok(wav)) = pending.await else {
         return;
     };
+    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     if *first {
         voice.begin_playback_mute();
         *first = false;
     }
-    let player = Arc::clone(tts);
-    if let Ok(Ok(())) = tokio::task::spawn_blocking(move || player.play(&wav)).await {
+    // #45: poll the player so an interruption kills it mid-sentence.
+    let played = match tts.spawn_play(&wav) {
+        Ok(Some(mut child)) => loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) => {
+                    if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(_) => break false,
+            }
+        },
+        // No player configured: "played" by definition (selftest mode).
+        Ok(None) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "tts: play spawn failed");
+            false
+        }
+    };
+    if played {
         *sentences += 1;
+        let mut prefix = spoken_prefix.lock().expect("spoken prefix lock");
+        prefix.push_str(sentence);
+        prefix.push(' ');
     }
 }
 

@@ -197,6 +197,15 @@ impl VlmEngine {
             let Some(inner) = &self.inner else {
                 anyhow::bail!("vlm inactive: {}", self.inactive_reason);
             };
+            // Background inference is nice-demoted for the duration:
+            // a VLM description used to saturate the cores and starve the
+            // real-time voice pipeline (observed 2026-10-12: five wake
+            // attempts, zero KWS hits while a description ran). The
+            // context (and its llama worker threads) is created inside
+            // this demoted scope, so they inherit the lower priority;
+            // the guard restores the thread's nice for the pooled
+            // blocking thread's later users.
+            let _nice = NiceGuard::demote(5);
             // Serialize against every other VLM call (see `inner`).
             // Recover from a poisoned lock rather than bricking the
             // engine forever — the mutex guards buffers, not invariants.
@@ -434,9 +443,49 @@ pub fn selftest_vlm(path: &str) -> anyhow::Result<serde_json::Value> {
     }))
 }
 
+/// Demote the calling thread's scheduling priority for a scope — VLM
+/// inference is background work that must never starve the real-time
+/// voice pipeline. Applies to the current thread (and to llama worker
+/// threads spawned inside the scope, which inherit the nice value);
+/// restores on drop so the pooled blocking thread keeps its original
+/// priority for later users. Raising nice needs no privileges.
+#[cfg(feature = "vlm")]
+struct NiceGuard(i32);
+
+#[cfg(feature = "vlm")]
+impl NiceGuard {
+    fn demote(to: i32) -> Self {
+        // glibc's getpriority returns the nice value directly.
+        let cur = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, to) };
+        NiceGuard(cur)
+    }
+}
+
+#[cfg(feature = "vlm")]
+impl Drop for NiceGuard {
+    fn drop(&mut self) {
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, self.0) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "vlm")]
+    fn nice_guard_demotes_and_restores() {
+        // Linux-only product; getpriority returns the nice value.
+        let before = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        {
+            let _g = NiceGuard::demote(5);
+            let during = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+            assert!(during >= 5, "demoted while in scope: {during}");
+        }
+        let after = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        assert_eq!(after, before, "nice restored on drop");
+    }
 
     #[test]
     fn config_defaults_off() {

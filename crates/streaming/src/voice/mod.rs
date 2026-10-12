@@ -146,6 +146,15 @@ pub struct VoiceConfig {
     /// after a pause no longer gets clipped by the fixed window. Needs
     /// `vad_model`; missing model → fixed-window behaviour (fail-open).
     pub capture_endpointing: bool,
+    /// Thinking-phase wake-free listening + interruption (SPEC appendix
+    /// A #45). While an answer round runs the mic stays in the follow-up
+    /// (VAD) mode so the user can just speak; transcripts arriving then
+    /// are stop-word/interrupt-classified. `false` restores the P0
+    /// semantics: a started round always runs to completion.
+    pub interrupt_enable: bool,
+    /// Minimum Laya confidence for an interrupt classification to act
+    /// (below it the verdict fails open to backchannel/ignore).
+    pub interrupt_confidence: f32,
 }
 
 impl Default for VoiceConfig {
@@ -171,6 +180,8 @@ impl Default for VoiceConfig {
             follow_up_window_secs: 0.0,
             vad_model: "models/voice/vad/silero_vad.onnx".into(),
             capture_endpointing: true,
+            interrupt_enable: true,
+            interrupt_confidence: 0.6,
         }
     }
 }
