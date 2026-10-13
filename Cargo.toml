@@ -17,18 +17,15 @@ license = "Apache-2.0"
 rust-version = "1.88"
 
 [workspace.dependencies]
-# ONVIF Device stack — v0.8.0 capability batch (git pin until the next
-# library release; merge ≠ release): complete Media service via the shared
-# register_media_actions store (encoder family + SetSynchronizationPoint
-# keyframe hook, the PR#46 multi-profile work folded in), ver20 Media2
-# service, Imaging service, DeviceHooks/with_users host seams, wsnt
-# Subscribe push, HTTP Digest + IP filter + AccessPolicy security, and
-# the PR#66 cross-library interop fixes (GetServices direct Service
-# children, GetScopes tt:Scope entries).
-onvif-device-rs = { git = "https://github.com/mickeyzzc/onvif-rs.git", rev = "02228fd" }
-# GB/T 28181 device stack — v0.12.0: the 2022 device-side closure
-# package; contains everything the git pin tracked.
-gb28181-rs = { version = "0.12.0", features = ["gb35114"] }
+# ONVIF Device stack — 0.9.0: server half unchanged; the release also
+# carries the new client half (unused here). Same content as the old
+# 02228fd git pin plus the client packages.
+onvif-device-rs = "0.9.0"
+# GB/T 28181 device stack — 0.13.0: the transport-parity package
+# (pagination, negotiated expiry, silence handling, stream transports,
+# passive TCP media, five-query seam, multicast) on top of the v0.12.0
+# closure package.
+gb28181-rs = { version = "0.13.0", features = ["gb35114"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
