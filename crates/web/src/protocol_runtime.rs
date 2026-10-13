@@ -1081,6 +1081,10 @@ impl ProtocolRuntime {
             // X-GB-Ver negotiation stays opt-in (None = header omitted);
             // matches the mibee-eye-rs/go product defaults.
             protocol_version: None,
+            // 0.13.0 transport-parity keys (extra_channels, multicast_ttl,
+            // tls_*, max_sip_message_size, video-param knobs) stay at
+            // their defaults — this runtime rides plain UDP.
+            ..Default::default()
         };
 
         // GB35114 A-level (fail closed: enabled-but-unloadable identities

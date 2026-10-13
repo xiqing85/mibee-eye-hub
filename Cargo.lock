@@ -1921,9 +1921,9 @@ dependencies = [
 
 [[package]]
 name = "gb28181-rs"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e91d5038d1671cf0a60b8a244abc9dca2273604bc39a02374a8909660be88e4"
+checksum = "660c24bfa55111566234fb9195f3b4b76f5ba8271b51f7298948c6975af0b1e9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3562,8 +3562,9 @@ dependencies = [
 
 [[package]]
 name = "onvif-device-rs"
-version = "0.8.0"
-source = "git+https://github.com/mickeyzzc/onvif-rs.git?rev=02228fd#02228fd0f207b5f8c90bcbf74da5a4e2829b97f9"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38877468c070f6550a419ba1894852f9c85e3d8493a65b374b8411bf15648c92"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5427,6 +5428,7 @@ dependencies = [
  "http",
  "jpeg-decoder",
  "jpeg-encoder",
+ "libc",
  "llama-cpp-2",
  "muxide",
  "observability",
