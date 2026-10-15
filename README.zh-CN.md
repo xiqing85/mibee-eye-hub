@@ -1,7 +1,7 @@
 # mibee-eye-notebook
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Rust: 1.85+](https://img.shields.io/badge/Rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust: 1.88+](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platform: Linux Tier 1](https://img.shields.io/badge/Platform-Linux%20Tier%201-green.svg)](../docs/POSITIONING.md)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](docs/zh/contributing.md)
 
@@ -121,7 +121,7 @@ mibee-eye/
 | **GB28181 MobilePosition** | 订阅周期上报静态坐标 | gb28181-rs `with_position_source`（配置为空则不上报） | ✅ 已实现并连接 |
 | **H.264** | NAL 单元解析器、SPS/PPS、关键帧检测 | 手写（`H264Parser`） | ✅ 用于所有视频输出 |
 | **H.265 解码** | 浏览器回退到 H.264 | — | ⚠️ 浏览器不支持通用；v1 仅 H.264 |
-| **浏览器实时预览** | 通过 `<img>` 的 MJPEG 多部分流 | `/api/cameras/{id}/live` 路由（ffmpeg 转码） | ✅ 已实现并连接 |
+| **浏览器实时预览** | 通过 `<img>` 的 MJPEG 多部分流 | `/api/cameras/{id}/live` 路由（进程内 OpenH264，无 ffmpeg 子进程） | ✅ 已实现并连接 |
 | **本地录制** | 带自动清理的 MP4 分段归档 | 根据录制配置自动连接每摄像头的 `FileOutput` | ✅ 已实现并连接 |
 | **国际化（zh-CN / en-US）** | 翻译层 | `app.js` 中的 `t()` 字典，语言切换持久化到用户设置 | ✅ 已实现并连接 |
 | **日/夜间主题** | 主题切换 | 系统偏好自动检测，手动覆盖持久化 | ✅ 已实现并连接 |

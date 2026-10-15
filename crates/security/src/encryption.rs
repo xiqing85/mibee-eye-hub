@@ -110,6 +110,13 @@ pub fn hex_decode(hex: &str) -> Result<Vec<u8>> {
     if !hex.len().is_multiple_of(2) {
         anyhow::bail!("hex string has odd length: {}", hex.len());
     }
+    // The slice indices below are byte offsets, so a multi-byte character
+    // would land mid-codepoint and panic on the `&str` boundary check —
+    // e.g. `"aée"` (4 bytes) fails at `&hex[2..4]`. Reject non-ASCII up front
+    // so the documented "returns an error" contract actually holds.
+    if !hex.is_ascii() {
+        anyhow::bail!("hex string contains non-ASCII characters");
+    }
     (0..hex.len())
         .step_by(2)
         .map(|i| {
@@ -134,12 +141,54 @@ mod tests {
         key.copy_from_slice(&hash);
         key
     }
-    fn setup_env_var(key: &str) {
-        let () = unsafe { std::env::set_var(ENV_KEY_NAME, key) };
+
+    /// Serialises every test in this module.
+    ///
+    /// The process environment is global and `std::env::set_var` /
+    /// `remove_var` are unsynchronised. Left to run in parallel, one test's
+    /// `remove_env_var()` lands in the middle of another's
+    /// `get_encryption_key()` — which is exactly what the `no-ai` CI leg
+    /// caught: `test_different_env_var_produces_different_key` unwrapped
+    /// `None` because a concurrent test had removed the variable out from
+    /// under it. `get_encryption_key` returns `Option` precisely because the
+    /// variable may be absent, so the failure surfaced as a bare `unwrap` on
+    /// `None` with no hint at the real cause.
+    ///
+    /// The guard is always cleaned up, including on panic, so a failing test
+    /// cannot leave the variable set for the next one.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the module lock, set the variable, and return a guard that
+    /// restores the previous value on drop.
+    fn setup_env_var(key: &str) -> EnvGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var(ENV_KEY_NAME).ok();
+        // SAFETY: single-threaded within this test binary thanks to ENV_LOCK,
+        // and no other thread reads the environment through this path.
+        unsafe { std::env::set_var(ENV_KEY_NAME, key) };
+        EnvGuard {
+            _lock: lock,
+            previous,
+        }
     }
 
-    fn remove_env_var() {
-        let () = unsafe { std::env::remove_var(ENV_KEY_NAME) };
+    /// Restores the environment on drop, panic or not.
+    struct EnvGuard {
+        /// Held for the lifetime of the guard: serialises the module.
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<String>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the lock is still held here (fields drop after `drop`).
+            unsafe {
+                match &self.previous {
+                    Some(v) => std::env::set_var(ENV_KEY_NAME, v),
+                    None => std::env::remove_var(ENV_KEY_NAME),
+                }
+            }
+        }
     }
     // ------------------------------------------------------------------
     // Key derivation
@@ -147,45 +196,56 @@ mod tests {
 
     #[test]
     fn test_get_encryption_key_returns_none_when_unset() {
-        remove_env_var();
+        // Take the module lock and make sure the variable is genuinely absent,
+        // rather than relying on whatever a concurrently-running test left
+        // behind.
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: ENV_LOCK is held, and it is the only writer of this
+        // variable in this test binary.
+        unsafe { std::env::remove_var(ENV_KEY_NAME) };
         assert!(get_encryption_key().is_none());
+        drop(lock);
     }
 
     #[test]
     fn test_get_encryption_key_returns_32_bytes_when_set() {
-        setup_env_var("test-encryption-key-12345");
+        let _env = setup_env_var("test-encryption-key-12345");
         let key = get_encryption_key();
         assert!(key.is_some());
         assert_eq!(key.unwrap().len(), 32);
-        remove_env_var();
+        drop(_env);
     }
 
     #[test]
     fn test_same_env_var_produces_same_key() {
-        setup_env_var("my-secret-key");
+        let _env = setup_env_var("my-secret-key");
         let k1 = get_encryption_key().unwrap();
         let k2 = get_encryption_key().unwrap();
         assert_eq!(k1, k2);
-        remove_env_var();
+        drop(_env);
     }
 
     #[test]
     fn test_different_env_var_produces_different_key() {
-        setup_env_var("key-one");
+        let _env = setup_env_var("key-one");
         let k1 = get_encryption_key().unwrap();
-        setup_env_var("key-two");
+        // Change the value in place rather than taking a second guard: the
+        // guard holds the module lock, and shadowing it would drop the first
+        // one mid-test and reopen the window the lock exists to close.
+        // SAFETY: `_env` holds the module lock for this whole scope.
+        unsafe { std::env::set_var(ENV_KEY_NAME, "key-two") };
         let k2 = get_encryption_key().unwrap();
         assert_ne!(k1, k2);
-        remove_env_var();
+        drop(_env);
     }
 
     #[test]
     fn test_empty_env_var_still_produces_key() {
-        setup_env_var("");
+        let _env = setup_env_var("");
         let key = get_encryption_key();
         assert!(key.is_some());
         assert_eq!(key.unwrap().len(), 32);
-        remove_env_var();
+        drop(_env);
     }
 
     // ------------------------------------------------------------------
@@ -350,7 +410,7 @@ mod tests {
 
     #[test]
     fn test_full_pipeline_env_var_to_hex_storage() {
-        setup_env_var("super-secret-nvr-key-2024");
+        let _env = setup_env_var("super-secret-nvr-key-2024");
         let key = get_encryption_key().unwrap();
 
         let plaintext = "api_key_12345_abcdef";
@@ -362,12 +422,12 @@ mod tests {
         let decrypted = decrypt_field(&encrypted_again, &key).unwrap();
 
         assert_eq!(decrypted, plaintext);
-        remove_env_var();
+        drop(_env);
     }
 
     #[test]
     fn test_full_pipeline_multiple_fields() {
-        setup_env_var("nvr-master-key-42");
+        let _env = setup_env_var("nvr-master-key-42");
         let key = get_encryption_key().unwrap();
 
         let fields = [
@@ -383,7 +443,6 @@ mod tests {
             let decrypted = decrypt_field(&encrypted_back, &key).unwrap();
             assert_eq!(decrypted, *value, "field '{name}' round-trip failed");
         }
-
-        remove_env_var();
+        drop(_env);
     }
 }

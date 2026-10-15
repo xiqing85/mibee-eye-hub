@@ -361,6 +361,37 @@ impl AiEngine {
         })?(path)
     }
 
+    /// Async wrapper around [`Self::load_for`] that keeps the ONNX session
+    /// construction off the runtime's worker threads.
+    ///
+    /// Building an `InferenceSession` reads a multi-megabyte model file and
+    /// initialises the runtime's graph — hundreds of milliseconds to seconds.
+    /// Both the activate route and the upload-validation route call
+    /// `load_for` directly from inside an `async fn`, so during a model swap
+    /// the executor worker handling that request is blocked for the whole
+    /// load and every other request it happens to be running stalls with it.
+    /// On a single-core deployment that is a visible hang, not just latency.
+    ///
+    /// `spawn_blocking` moves the wait to tokio's blocking pool, which exists
+    /// precisely for this. The factory is an `Arc<dyn Fn + Send + Sync>`, so
+    /// the path is cloneable into the closure.
+    pub async fn load_for_blocking(
+        &self,
+        path: &str,
+    ) -> Result<(Arc<dyn AiDetector>, u32), registry::ActivateError> {
+        let Some(factory) = self.factory.clone() else {
+            return Err(registry::ActivateError::LoadFailed(
+                "detector factory unavailable in this build".to_string(),
+            ));
+        };
+        let path = path.to_string();
+        tokio::task::spawn_blocking(move || factory(&path))
+            .await
+            .map_err(|e| {
+                registry::ActivateError::LoadFailed(format!("model load task failed: {e}"))
+            })?
+    }
+
     /// Whether a real detector is loaded and workers may run.
     #[must_use]
     pub fn is_active(&self) -> bool {

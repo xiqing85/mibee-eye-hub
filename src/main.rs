@@ -2826,17 +2826,19 @@ async fn speak_pending_sentence(
     }
     // #45: poll the player so an interruption kills it mid-sentence.
     let played = match tts.spawn_play(&wav) {
-        Ok(Some(mut child)) => loop {
-            match child.try_wait() {
+        Ok(Some(mut player)) => loop {
+            match player.try_wait() {
                 Ok(Some(_)) => break true,
                 Ok(None) => {
                     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        player.kill();
                         break false;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
+                // `PlayerProcess` kills on drop, so an error here (or a
+                // cancellation of this future mid-sleep) cannot leave the
+                // speaker talking after the self-mute lifts.
                 Err(_) => break false,
             }
         },

@@ -608,7 +608,10 @@ model_path = "models/llm/qwen3-0.6b-q8_0.gguf"
 # empty values fall back to model_path.
 model_path_mid = ""
 model_path_lite = ""
-n_ctx = 1024
+n_ctx = 2048
+# Default is half the logical cores, clamped to 2..4 — measured on a 4C/8T
+# host, more threads than physical cores regressed generation. Shown here as
+# the value a 4-thread host resolves to.
 n_threads = 2
 max_tokens = 200
 no_think = true
@@ -620,8 +623,8 @@ no_think = true
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Master switch (requires the `llm` build feature + AVX2). |
 | `model_path` | String | `"models/llm/qwen3-0.6b-q8_0.gguf"` | GGUF model path (Qwen3-0.6B Q8_0 by default). |
-| `n_ctx` | u32 | `1024` | Dialogue context window. |
-| `n_threads` | u32 | `2` | CPU threads. |
+| `n_ctx` | u32 | `2048` | Dialogue context window. Must exceed the tool prompt (SPEC §3.5 runs ~500-1700 tokens) plus the conversation; the previous default of 1024 overflowed and silently degraded the first agent turns. |
+| `n_threads` | u32 | logical cores / 2, clamped to `2..=4` | CPU threads. Leave unset to let the device size this from the host. |
 | `max_tokens` | u32 | `200` | Generation cap per reply. |
 | `no_think` | bool | `true` | Append `/no_think` to user turns (Qwen3 thinking mode off — faster, conversational). |
 

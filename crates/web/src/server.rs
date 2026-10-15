@@ -496,38 +496,59 @@ pub fn build_app_with_state(state: AppRouterState) -> Router {
         // Setup-required middleware — blocks non-allowed routes during first run
         .route_layer(middleware::from_fn(security::middleware::require_setup))
         // Extensions — must be OUTER layer so middleware can access db
-        .layer(Extension(stream_manager))
-        .layer(Extension(rtsp_server))
-        .layer(Extension(auth_db))
-        .layer(Extension(active))
-        .layer(Extension(db))
-        .layer(Extension(protocol_configs))
-        .layer(Extension(protocol_runtime))
+        .layer(Extension(stream_manager.clone()))
+        .layer(Extension(rtsp_server.clone()))
+        .layer(Extension(auth_db.clone()))
+        .layer(Extension(active.clone()))
+        .layer(Extension(db.clone()))
+        .layer(Extension(protocol_configs.clone()))
+        .layer(Extension(protocol_runtime.clone()))
         .layer(Extension(state.event_tx.clone()))
-        .layer(Extension(advertised_host))
-        .layer(Extension(ai))
-        .layer(Extension(audio_ai))
-        .layer(Extension(zones))
-        .layer(Extension(ocr))
-        .layer(Extension(voice))
+        .layer(Extension(advertised_host.clone()))
+        .layer(Extension(ai.clone()))
+        .layer(Extension(audio_ai.clone()))
+        .layer(Extension(zones.clone()))
+        .layer(Extension(ocr.clone()))
+        .layer(Extension(voice.clone()))
         .layer(Extension(state.face.clone()))
-        .layer(Extension(chat))
-        .layer(Extension(vlm))
-        .layer(Extension(decision))
-        .layer(Extension(grounding))
-        .layer(Extension(tools))
-        .layer(Extension(scene))
-        .layer(Extension(llm_tier))
-        .layer(Extension(resource))
+        .layer(Extension(chat.clone()))
+        .layer(Extension(vlm.clone()))
+        .layer(Extension(decision.clone()))
+        .layer(Extension(grounding.clone()))
+        .layer(Extension(tools.clone()))
+        .layer(Extension(scene.clone()))
+        .layer(Extension(llm_tier.clone()))
+        .layer(Extension(resource.clone()))
         .layer(Extension(state.wake_word.clone()))
         .layer(Extension(state.restart_tx.clone()))
         .layer(Extension(state.models.clone()))
         .layer(Extension(state.cloud.clone()))
-        .layer(Extension(conversations))
-        .layer(Extension(meeting))
-        .layer(Extension(agent))
-        .layer(Extension(agent_config))
-        .layer(Extension(away))
+        .layer(Extension(conversations.clone()))
+        .layer(Extension(meeting.clone()))
+        .layer(Extension(agent.clone()))
+        .layer(Extension(agent_config.clone()))
+        .layer(Extension(away.clone()))
+        // Bundle for `GET /api/capabilities` — one Extension instead of 16
+        // engine extractors, so the handler stays under axum's extractor
+        // ceiling and the next engine has somewhere to go.
+        .layer(Extension(routes::capabilities::CapHandles {
+            ai: ai.clone(),
+            audio_ai: audio_ai.clone(),
+            ocr: ocr.clone(),
+            voice: voice.clone(),
+            chat: chat.clone(),
+            llm_tier: llm_tier.clone(),
+            resource: resource.clone(),
+            decision: decision.clone(),
+            meeting: meeting.clone(),
+            vlm: vlm.clone(),
+            face: state.face.clone(),
+            stream_manager: stream_manager.clone(),
+            convlog: conversations.clone(),
+            agent: agent.clone(),
+            agent_config: agent_config.clone(),
+            away: away.clone(),
+        }))
         // CSP — strict Content-Security-Policy
         .layer(middleware::from_fn(csp_middleware))
         // HSTS

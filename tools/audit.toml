@@ -1,0 +1,26 @@
+# cargo-audit ignore list.
+#
+# IMPORTANT: cargo-audit reads this file from the GLOBAL config location
+# (`$CARGO_HOME/audit.toml` or `~/.cargo/audit.toml`), NOT from the repository
+# root. The `audit` CI job in `.github/workflows/hygiene.yml` copies this file
+# there before running `cargo audit`. A repo-local copy alone does nothing,
+# which is how the 2026-10-15 "audit clean" claim stayed stale for so long.
+
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
+
+# RUSTSEC-2023-0071 — `rsa`, Marvin Attack (timing side-channel key recovery).
+#
+# This crate is reachable only through sqlx 0.8's facade, whose Cargo.toml
+# lists every backend unconditionally (sqlx-mysql -> rsa) regardless of which
+# features the application actually uses. It is not compiled into any target
+# in this workspace, and the attack surface it exposes is MySQL RSA
+# authentication — this application is SQLite-only and never performs it.
+#
+# There is no patched version: upstream states `patched = []` is intentional
+# (RustCrypto/RSA#626).
+#
+# This waiver is CONDITIONAL, not permanent. `tools/check-audit-waiver.sh`
+# re-derives the justification on every CI run and fails the job if `rsa`
+# becomes reachable for a real target, or if a patched version ships. If that
+# script fails, fix the dependency rather than editing this file.

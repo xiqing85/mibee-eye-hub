@@ -11,3 +11,41 @@ jobs:
       - uses: actions/checkout@v4
       - name: Repo hygiene gate (junk/secret files must not be tracked)
         run: tools/check-repo-hygiene.sh
+
+  # Dependency vulnerability gate. Added 2026-10-15 after four rustls
+  # advisories (RUSTSEC-2026-0346/0347/0348/0349, issued 2026-10-14)
+  # shipped unnoticed: nothing in CI ever ran an audit, so "audit clean"
+  # in the workspace log was a manual claim that silently went stale.
+  #
+  # RUSTSEC-2023-0071 (`rsa`, Marvin Attack) is waived, and the waiver is
+  # *conditional* — `tools/check-audit-waiver.sh` re-derives the
+  # justification on every run and fails the job if it no longer holds:
+  # `rsa` is reachable only through sqlx 0.8's facade, which lists every
+  # backend unconditionally (sqlx-mysql -> rsa). It is not compiled into
+  # any target here, and the attack surface it exposes is MySQL RSA
+  # authentication, which a SQLite-only application never reaches. There is
+  # no patched version (upstream tracking issue #626).
+  #
+  # `rustsec/audit-check@v2` cannot express this: cargo-audit reads its
+  # ignore list from the *global* `~/.cargo/audit.toml`, not a repo-local
+  # file, and the action additionally tries to create a check-run, which
+  # fails on a read-only GITHUB_TOKEN. So the waiver is written to the
+  # global config in a step here and `cargo audit` is invoked directly.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify the audit waiver's premise still holds
+        run: ./tools/check-audit-waiver.sh
+      - name: Write the global audit config cargo-audit actually reads
+        run: |
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          cp tools/audit.toml "${CARGO_HOME:-$HOME/.cargo}/audit.toml"
+          echo "--- effective config ---"
+          cat "${CARGO_HOME:-$HOME/.cargo}/audit.toml"
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit --file ./Cargo.lock

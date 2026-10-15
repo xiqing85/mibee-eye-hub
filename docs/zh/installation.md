@@ -12,7 +12,7 @@
 
 ### 软件要求
 
-- **Rust 1.85+** - Rust 2024 版本的 MSRV
+- **Rust 1.88+** - Rust 2024 版本的 MSRV
 - **RAM**：运行时目标 <200MB 内存
 - **CPU**：目标 <5% CPU 空闲占用
 - **磁盘**：二进制文件 + 依赖项约 50MB
@@ -86,10 +86,10 @@ choco install visualstudio2022buildtools visualstudio2022-workload-vctools
 
 ### 前置条件
 
-确保安装了 Rust 1.85+：
+确保安装了 Rust 1.88+：
 
 ```bash
-rustc --version  # 应该 >= 1.85
+rustc --version  # 应该 >= 1.88
 ```
 
 ### 构建命令

@@ -44,29 +44,47 @@ fn extract_session_token(req: &Request) -> Option<String> {
         })
 }
 
+/// The client key used for per-IP rate limiting.
+///
+/// **Forwarding headers are only honoured when the direct socket peer is
+/// loopback.** The previous version trusted `X-Forwarded-For` / `X-Real-Ip`
+/// unconditionally, which made the rate limiter trivially bypassable — the
+/// limiter keys on this string, so a client only had to vary a header to get
+/// a fresh bucket per request — and let unauthenticated traffic grow the
+/// tracked-key table with attacker-chosen strings.
+///
+/// Restricting to loopback peers keeps the useful case working (a reverse
+/// proxy on the same host sets these headers on our behalf, nginx's
+/// `set_real_ip_from` convention) while making the headers unforgeable from
+/// anywhere else. Deployments that terminate TLS elsewhere and forward from
+/// a distinct address should move the proxy in front of the loopback
+/// interface rather than re-enabling blind trust here.
 fn client_ip(req: &Request) -> String {
-    // Prefer X-Forwarded-For, then X-Real-Ip, then socket address, fallback to "unknown".
-    if let Some(val) = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        && let Some(ip) = val.split(',').next().map(|s| s.trim())
-        && !ip.is_empty()
-    {
-        return ip.to_owned();
-    }
-    if let Some(val) = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok())
-        && !val.is_empty()
-    {
-        return val.to_owned();
-    }
-    if let Some(addr) = req
+    let socket_ip = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-    {
-        return addr.0.ip().to_string();
+        .map(|addr| addr.0.ip());
+
+    if socket_ip.is_some_and(|ip| ip.is_loopback()) {
+        if let Some(val) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            && let Some(ip) = val.split(',').next().map(str::trim)
+            && !ip.is_empty()
+        {
+            return ip.to_owned();
+        }
+        if let Some(val) = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok())
+            && !val.is_empty()
+        {
+            return val.to_owned();
+        }
     }
-    "unknown".to_owned()
+
+    socket_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +246,84 @@ mod tests {
         Arc::new(Mutex::new(conn))
     }
 
+    // ---------------------------------------------------------------------
+    // `client_ip` is the rate-limiter key, so its behaviour *is* the
+    // brute-force defence. The pre-2026-10-15 implementation had no test at
+    // all (the rate-limit tests call `check_rate_limit` with literal IPs and
+    // bypass this function), which is how "trust X-Forwarded-For from anyone"
+    // shipped unnoticed.
+    // ---------------------------------------------------------------------
+
+    /// Build a request whose socket peer is `peer`, with optional spoofed
+    /// forwarding headers.
+    fn request_from(peer: &str, xff: Option<&str>, xreal: Option<&str>) -> axum::extract::Request {
+        let literal = if peer.contains(':') {
+            format!("[{peer}]:44321")
+        } else {
+            format!("{peer}:44321")
+        };
+        let socket: std::net::SocketAddr = literal.parse().unwrap();
+        let mut builder = axum::http::Request::builder().uri("/api/auth/login");
+        if let Some(v) = xff {
+            builder = builder.header("x-forwarded-for", v);
+        }
+        if let Some(v) = xreal {
+            builder = builder.header("x-real-ip", v);
+        }
+        let mut req = builder.body(axum::body::Body::empty()).unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(socket));
+        req
+    }
+
+    #[test]
+    fn client_ip_uses_socket_peer_by_default() {
+        let req = request_from("10.0.0.7", None, None);
+        assert_eq!(client_ip(&req), "10.0.0.7");
+    }
+
+    #[test]
+    fn client_ip_ignores_forwarded_headers_from_a_remote_peer() {
+        // The regression: a remote client used to be able to pick its own
+        // rate-limit bucket by varying one header.
+        let req = request_from("10.0.0.7", Some("1.2.3.4"), Some("5.6.7.8"));
+        assert_eq!(
+            client_ip(&req),
+            "10.0.0.7",
+            "X-Forwarded-For / X-Real-Ip must be ignored unless the peer is loopback"
+        );
+    }
+
+    #[test]
+    fn client_ip_honours_forwarded_headers_from_a_local_proxy() {
+        let req = request_from("127.0.0.1", Some("203.0.113.9, 10.0.0.1"), None);
+        assert_eq!(client_ip(&req), "203.0.113.9", "first hop wins");
+        let req = request_from("::1", None, Some("203.0.113.10"));
+        assert_eq!(client_ip(&req), "203.0.113.10");
+    }
+
+    #[test]
+    fn client_ip_falls_back_when_forwarded_headers_are_empty() {
+        let req = request_from("127.0.0.1", Some("  "), None);
+        assert_eq!(client_ip(&req), "127.0.0.1");
+        let req = request_from("127.0.0.1", Some(""), None);
+        assert_eq!(client_ip(&req), "127.0.0.1");
+    }
+
+    #[test]
+    fn client_ip_without_connect_info_is_unknown() {
+        let req = axum::http::Request::builder()
+            .uri("/api/auth/login")
+            .header("x-forwarded-for", "1.2.3.4")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            client_ip(&req),
+            "unknown",
+            "no socket peer means no trust — headers must not fill the gap"
+        );
+    }
+
     #[tokio::test]
     async fn test_require_auth_rejects_missing_cookie() {
         let db = test_db_arc();
@@ -321,51 +417,118 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn test_rate_limit_allows_first_request() {
-        rate_limit::reset_all();
+    /// A current-thread runtime driven to completion inside a sync test.
+    ///
+    /// These rate-limit tests must hold the crate-wide serialisation guard for
+    /// their whole body, and a `parking_lot::MutexGuard` is not `Send` — in an
+    /// `async fn` that means holding it across `.await`, which blocks the
+    /// executor thread. Blocking the only runtime thread is precisely the
+    /// anti-pattern the audit flagged, so the awaits are driven from a sync
+    /// test instead.
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(f)
+    }
+
+    #[test]
+    fn test_rate_limit_allows_first_request() {
+        let _serialised = rate_limit::serialise();
 
         let app = Router::new()
             .route("/test", get(|| async { "ok" }))
             .route_layer(axum::middleware::from_fn(rate_limit));
 
-        let req = HttpRequest::builder()
+        let socket: std::net::SocketAddr = "192.168.1.1:44321".parse().unwrap();
+        let mut req = HttpRequest::builder()
             .uri("/test")
-            .header("x-forwarded-for", "192.168.1.1")
             .body(Body::empty())
             .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(socket));
 
-        let res = app.oneshot(req).await.unwrap();
+        let res = block_on(app.oneshot(req)).unwrap();
         assert_eq!(res.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn test_rate_limit_rejects_over_limit() {
-        rate_limit::reset_all();
+    /// A build request carrying a real socket peer, so `client_ip` resolves
+    /// to that address. Without `ConnectInfo` every such request collapses to
+    /// the `"unknown"` key and the test stops exercising per-client limiting
+    /// at all.
+    fn build_limited_request() -> axum::extract::Request {
+        let socket: std::net::SocketAddr = "10.0.0.99:44321".parse().unwrap();
+        let mut req = HttpRequest::builder()
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(socket));
+        req
+    }
+
+    #[test]
+    fn test_rate_limit_rejects_over_limit() {
+        // Serialise against every other test in the crate that touches the
+        // shared rate-limit table.
+        let _serialised = rate_limit::serialise();
 
         let app = Router::new()
             .route("/test", get(|| async { "ok" }))
             .route_layer(axum::middleware::from_fn(rate_limit));
 
-        // Default limit is 20 per 60 seconds. Use unique test IP.
+        // Default limit is 20 per 60 seconds.
         for _ in 0..20 {
-            let req = HttpRequest::builder()
-                .uri("/test")
-                .header("x-forwarded-for", "10.0.0.99")
-                .body(Body::empty())
-                .unwrap();
-            let res = app.clone().oneshot(req).await.unwrap();
+            let res = block_on(app.clone().oneshot(build_limited_request())).unwrap();
             assert_eq!(res.status(), StatusCode::OK);
         }
 
-        // 21st request should be rate limited
-        let req = HttpRequest::builder()
+        // 21st request from the same peer should be rate limited.
+        let res = block_on(app.oneshot(build_limited_request())).unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// A different peer must get its own bucket — the whole point of keying
+    /// the limiter on the resolved client address.
+    #[test]
+    fn test_rate_limit_is_per_client_address() {
+        let _serialised = rate_limit::serialise();
+
+        let app = Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .route_layer(axum::middleware::from_fn(rate_limit));
+
+        for _ in 0..20 {
+            let socket: std::net::SocketAddr = "10.0.0.99:44321".parse().unwrap();
+            let mut req = HttpRequest::builder()
+                .uri("/test")
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(socket));
+            let res = block_on(app.clone().oneshot(req)).unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        // A different peer, and a spoofed X-Forwarded-For naming the first
+        // one, must both still be served: forwarding headers are only
+        // honoured from a loopback peer.
+        let socket: std::net::SocketAddr = "10.0.0.98:44321".parse().unwrap();
+        let mut req = HttpRequest::builder()
             .uri("/test")
             .header("x-forwarded-for", "10.0.0.99")
             .body(Body::empty())
             .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(socket));
+        let res = block_on(app.oneshot(req)).unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "a different client, or one spoofing X-Forwarded-For from a \
+             non-loopback peer, must not land in the first client's bucket"
+        );
     }
 }
 

@@ -80,6 +80,20 @@ jobs:
         run: cargo check --all-targets ${{ matrix.flags }}
         env:
           SHERPA_ONNX_LIB_DIR: ${{ github.workspace }}/tmp/sherpa-libs/sherpa-onnx-v1.13.8-linux-x64-static-lib/lib
+      - name: cargo test
+        # Until 2026-10-15 this job only ran `cargo check`. Every
+        # feature-gated module — the whole voice bridge (wake word → ASR →
+        # decision → LLM → TTS pipeline), the tool/MCP agent loop, the model
+        # download manager and the VLM description layer — therefore compiled
+        # in CI and was never executed once. A test that only passes on the
+        # default feature set was a lie the matrix was supposed to catch.
+        #
+        # `--lib` per package keeps it honest about the feature flags the
+        # matrix sets: the workspace-level default `test` job already covers
+        # the default surface, this covers the combinations.
+        run: cargo test --workspace --lib ${{ matrix.flags }} --no-fail-fast
+        env:
+          SHERPA_ONNX_LIB_DIR: ${{ github.workspace }}/tmp/sherpa-libs/sherpa-onnx-v1.13.8-linux-x64-static-lib/lib
 
   hygiene:
     runs-on: ubuntu-latest

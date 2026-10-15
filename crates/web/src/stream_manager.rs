@@ -150,6 +150,16 @@ struct StreamHandle {
     sub_sps_pps_cache: Option<SpsPpsCache>,
     /// Substream geometry (w, h, fps, bitrate) for the ONVIF sub profile.
     sub_settings: Option<streaming::capture_source::SubstreamSettings>,
+    /// RTSP mounts this stream registered, each paired with a handle to the
+    /// server it lives on.
+    ///
+    /// `RtspServer::live_streams` is insert-only from the server's point of
+    /// view — without an explicit unregister, a stopped camera's mount stayed
+    /// DESCRIBE-able and an NVR could PLAY it and then hang waiting for frames
+    /// that will never come (and, before the registry entry was fixed to own
+    /// its parked receiver, every stop leaked a 300-slot broadcast ring).
+    /// `stop_stream` drains this and unregisters each mount.
+    rtsp_mounts: Vec<(RtspServer, String)>,
     /// Current status.
     status: StreamStatus,
 }
@@ -477,9 +487,19 @@ impl StreamManager {
         let (stop_tx, stop_rx) = watch::channel(false);
         let rtsp_base = format!("rtsp://{}:{}", self.advertised_host, RTSP_PORT);
 
-        let (run_handle, rtsp_url, rtmp_url, hub_handle, sps_pps_cache, sub_sps_pps_cache) = {
+        let (
+            run_handle,
+            rtsp_url,
+            rtmp_url,
+            hub_handle,
+            sps_pps_cache,
+            sub_sps_pps_cache,
+            rtsp_mounts,
+        ) = {
             let mut hub = StreamHub::new(source, self.resource_controller.clone());
             let stream_url: Option<String>;
+            // RTSP mounts registered below, released by `stop_stream`.
+            let mut rtsp_mounts: Vec<(RtspServer, String)> = Vec::new();
 
             // Register with RTSP server if provided.
             if let Some(server) = rtsp_server {
@@ -510,6 +530,7 @@ impl StreamManager {
                 output.set_sps_pps_tx(sps_pps_tx);
 
                 hub.add_output(Box::new(output)).await;
+                rtsp_mounts.push((server.clone(), stream_path.clone()));
                 stream_url = Some(format!("{}/{}", rtsp_base, stream_path));
                 info!(%camera_id, rtsp_url = %stream_url.as_ref().unwrap(), "RTSP output registered");
             } else {
@@ -573,6 +594,8 @@ impl StreamManager {
                         }
                     }
                 });
+
+                rtsp_mounts.push((server.clone(), sub_path.clone()));
             }
 
             // ── 4b. Optional RTMP push output ───────────────────────────
@@ -792,6 +815,7 @@ impl StreamManager {
                 Some(hub_handle),
                 Some(sps_pps_cache),
                 sub_sps_pps_cache,
+                rtsp_mounts,
             )
         };
 
@@ -808,6 +832,7 @@ impl StreamManager {
             sub_frames: sub_frames.clone(),
             sub_sps_pps_cache,
             sub_settings,
+            rtsp_mounts,
             status: StreamStatus::Running,
         };
 
@@ -896,6 +921,16 @@ impl StreamManager {
             .lock()
             .expect("segment slot registry")
             .remove(camera_id);
+
+        // Release the RTSP mounts. Without this the server keeps advertising
+        // `live/{id}` (and `live/{id}/sub`) as DESCRIBE-able after the encoder
+        // is gone — an NVR pulling a stopped camera hangs instead of getting a
+        // clean 404/454.
+        for (server, path) in handle.rtsp_mounts.drain(..) {
+            if server.unregister_live_stream(&path) {
+                info!(%camera_id, mount = %path, "RTSP mount unregistered");
+            }
+        }
 
         // Signal stop.
         if let Some(tx) = handle.stop_tx.take() {
@@ -1362,6 +1397,7 @@ mod tests {
                 sub_frames: None,
                 sub_sps_pps_cache: None,
                 sub_settings: None,
+                rtsp_mounts: Vec::new(),
                 status: StreamStatus::Running,
             };
             manager.streams.write().await.insert("cam-1".into(), handle);
@@ -1400,6 +1436,7 @@ mod tests {
                 sub_frames: None,
                 sub_sps_pps_cache: None,
                 sub_settings: None,
+                rtsp_mounts: Vec::new(),
                 status: StreamStatus::Running,
             };
             manager
@@ -1439,6 +1476,7 @@ mod tests {
                 sub_frames: None,
                 sub_sps_pps_cache: None,
                 sub_settings: None,
+                rtsp_mounts: Vec::new(),
                 status: StreamStatus::Running,
             };
             manager
@@ -1455,6 +1493,60 @@ mod tests {
 
         // Should no longer be in the tracked set.
         assert!(!manager.has_stream("stop-me").await);
+    }
+
+    /// Regression: `RtspServer`'s live-stream registry was insert-only, so a
+    /// stopped camera stayed DESCRIBE-able and an NVR could PLAY a mount that
+    /// produces nothing and hang. `stop_stream` must unregister every mount the
+    /// stream registered (main + substream).
+    #[tokio::test]
+    async fn test_stop_stream_unregisters_its_rtsp_mounts() {
+        let manager = StreamManager::new();
+        let server = RtspServer::new(protocols::rtsp_server::RtspServerConfig {
+            port: 0,
+            auth_required: false,
+            ..Default::default()
+        });
+
+        server.register_live_stream("live/stop-me".to_string(), "s=L".to_string(), 1);
+        server.register_live_stream("live/stop-me/sub".to_string(), "s=S".to_string(), 2);
+
+        let (stop_tx, _stop_rx) = watch::channel(false);
+        let handle = StreamHandle {
+            join_handle: None,
+            stop_tx: Some(stop_tx),
+            rtsp_url: Some("rtsp://localhost:8554/live/stop-me".into()),
+            rtmp_url: None,
+            hub_handle: None,
+            latest_jpeg: None,
+            jpeg_tx: None,
+            sps_pps_cache: None,
+            sub_frames: None,
+            sub_sps_pps_cache: None,
+            sub_settings: None,
+            rtsp_mounts: vec![
+                (server.clone(), "live/stop-me".to_string()),
+                (server.clone(), "live/stop-me/sub".to_string()),
+            ],
+            status: StreamStatus::Running,
+        };
+        manager
+            .streams
+            .write()
+            .await
+            .insert("stop-me".into(), handle);
+
+        manager.stop_stream("stop-me").await.unwrap();
+
+        // Both mounts must be gone: DESCRIBE now 404s instead of hanging.
+        assert!(
+            !server.unregister_live_stream("live/stop-me"),
+            "main mount survived stop_stream"
+        );
+        assert!(
+            !server.unregister_live_stream("live/stop-me/sub"),
+            "substream mount survived stop_stream"
+        );
     }
 
     #[tokio::test]
@@ -1476,6 +1568,7 @@ mod tests {
                 sub_frames: None,
                 sub_sps_pps_cache: None,
                 sub_settings: None,
+                rtsp_mounts: Vec::new(),
                 status: StreamStatus::Running,
             };
             manager.streams.write().await.insert("a".into(), handle);
@@ -1496,6 +1589,7 @@ mod tests {
                 sub_frames: None,
                 sub_sps_pps_cache: None,
                 sub_settings: None,
+                rtsp_mounts: Vec::new(),
                 status: StreamStatus::Running,
             };
             manager.streams.write().await.insert("b".into(), handle);

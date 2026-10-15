@@ -281,7 +281,7 @@ impl TtsEngine {
     /// # Errors
     ///
     /// Player subprocess spawn failure.
-    pub fn spawn_play(&self, wav: &std::path::Path) -> anyhow::Result<Option<std::process::Child>> {
+    pub fn spawn_play(&self, wav: &std::path::Path) -> anyhow::Result<Option<PlayerProcess>> {
         if self.config.player.trim().is_empty() {
             return Ok(None);
         }
@@ -295,8 +295,75 @@ impl TtsEngine {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map(Some)
+            .map(|child| Some(PlayerProcess::new(child)))
             .map_err(|e| anyhow::anyhow!("tts play spawn: {e}"))
+    }
+}
+
+/// A spawned audio player that is killed when it goes out of scope.
+///
+/// `std::process::Child` deliberately does *not* kill on drop, which is the
+/// right default for a CLI and the wrong one here. The TTS player keeps
+/// talking to the physical speakers after the future that spawned it is
+/// cancelled — a SIGTERM during a reply, an aborted round, a timeout — and by
+/// then `end_playback_mute()` has already lifted the self-mute, so the wake
+/// word hears the tail of our own sentence. That is the self-talk loop that
+/// SPEC appendix A #45 exists to prevent, re-entering through the one path the
+/// explicit `cancel` flag cannot cover.
+///
+/// Callers poll with [`Self::try_wait`] and either let the process exit
+/// normally (disarmed on drop) or call [`Self::kill`] for an explicit
+/// barge-in, which is disarmed too.
+#[derive(Debug)]
+pub struct PlayerProcess {
+    child: Option<std::process::Child>,
+}
+
+impl PlayerProcess {
+    /// Wrap a freshly spawned player process.
+    #[must_use]
+    pub fn new(child: std::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Non-blocking status check. `Ok(None)` while still running.
+    ///
+    /// A `Some(_)` status disarms the drop guard: the process finished on its
+    /// own, so there is nothing to clean up.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let Some(status) = self.child.as_mut().map(std::process::Child::try_wait) else {
+            return Ok(None);
+        };
+        let status = status?;
+        if status.is_some() {
+            self.child = None;
+        }
+        Ok(status)
+    }
+
+    /// Kill the player immediately (barge-in). Disarms the drop guard because
+    /// the kill plus the reap is the whole teardown.
+    pub fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// True once the process exited and no kill is pending.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.child.is_none()
+    }
+}
+
+impl Drop for PlayerProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            // Best-effort: the point is that a cancelled reply stops talking.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -427,5 +494,118 @@ mod profile_tests {
         ] {
             assert_eq!(e.profile_for(lang).model, "models/voice/melo/model.onnx");
         }
+    }
+}
+
+#[cfg(test)]
+mod player_process_tests {
+    use super::PlayerProcess;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    /// The regression: `std::process::Child` does not kill on drop, so a
+    /// cancelled playback future left the device speaking to the speakers
+    /// after `end_playback_mute()` had already lifted the self-mute — the
+    /// wake word then heard our own sentence and re-entered the self-talk
+    /// loop SPEC appendix A #45 exists to prevent.
+    ///
+    /// The PID comes from `Child::id()` rather than from a file the child
+    /// writes for itself. An earlier version had the spawned shell record its
+    /// own pid, which races twice over: the file exists from the moment the
+    /// redirection opens it, so it can be read while still empty, and the
+    /// value read is the shell's pid while the process that actually holds the
+    /// 30-second sleep may be a separate `sleep` child. Either way the
+    /// assertion intermittently watched a process the drop never touched.
+    #[test]
+    fn dropping_the_wrapper_stops_the_player() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test player");
+        let pid = child.id() as i32;
+        assert!(pid > 0);
+
+        // Confirm it is really running before the drop, so a green result
+        // cannot come from the process never having started.
+        assert!(
+            process_alive(pid),
+            "test player {pid} was not running before the drop"
+        );
+
+        drop(PlayerProcess::new(child));
+
+        // The process must not survive the drop. `Drop` kills and then reaps,
+        // so the pid must become fully unobservable (ESRCH), not merely a
+        // zombie — a zombie still answers `kill(pid, 0)`.
+        let mut gone = false;
+        for _ in 0..500 {
+            if !process_alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(gone, "player pid {pid} survived the PlayerProcess drop");
+    }
+
+    /// Whether a pid is still observable to `kill(pid, 0)`.
+    fn process_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 performs the permission and existence checks
+        // without delivering anything.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// An explicit barge-in kill must be just as effective, and must not
+    /// double-kill (which would surface as a spurious error to the caller).
+    #[test]
+    fn explicit_kill_is_idempotent() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test player");
+        let mut player = PlayerProcess::new(child);
+        assert!(!player.is_finished());
+        player.kill();
+        assert!(player.is_finished());
+        // Second kill is a no-op rather than a panic.
+        player.kill();
+    }
+
+    /// A player that exited on its own is disarmed, so the drop guard does
+    /// not report a spurious failure or try to reap twice.
+    #[test]
+    fn a_finished_player_reports_finished() {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test player");
+        let mut player = PlayerProcess::new(child);
+        let mut saw_exit = false;
+        for _ in 0..200 {
+            match player.try_wait() {
+                Ok(Some(_)) => {
+                    saw_exit = true;
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+        assert!(saw_exit, "a trivial process should have exited");
+        assert!(player.is_finished());
+    }
+
+    // Keep the unused-import lint honest for writers of future tests.
+    #[allow(dead_code)]
+    fn _assert_write_is_used(mut w: impl Write) {
+        let _ = w.write_all(b"");
     }
 }

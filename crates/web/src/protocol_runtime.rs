@@ -753,6 +753,11 @@ pub struct ProtocolRuntime {
     /// SIP-Date drift observer (§9.10.2): polls the platform clock from
     /// REGISTER responses and WARNs on drift. Aborted before shutdown.
     gb_date_observer: Option<JoinHandle<()>>,
+    /// The GB28181 frame-source seam for this server generation. Held so
+    /// `stop_gb28181` can release live bridge tasks — the library does not
+    /// unsubscribe on its `abort()` path, and without this every timed-out
+    /// hot-toggle orphaned a task per live subscription.
+    gb28181_frame_source: Option<Arc<StreamManagerFrameSource>>,
     /// Talkback playback stream; held for the server's lifetime so the
     /// local audio output stays open, dropped on stop.
     gb28181_talkback_stream: Option<cpal::Stream>,
@@ -824,6 +829,7 @@ impl ProtocolRuntime {
             discovery_handle: None,
             gb28181_server: None,
             gb_date_observer: None,
+            gb28181_frame_source: None,
             gb28181_talkback_stream: None,
             gb28181_upstream_stream: None,
             notifier_slot,
@@ -1092,6 +1098,10 @@ impl ProtocolRuntime {
         let authenticator = build_gb35114_authenticator(&config.gb35114, &config.device_id)?;
 
         let source = Arc::new(StreamManagerFrameSource::new(stream_manager));
+        // Keep our own handle so `stop_gb28181` can tear down live bridges
+        // without depending on the library unsubscribing (it does not, on the
+        // `abort()` path). Reassigned on every start; cleared on stop.
+        self.gb28181_frame_source = Some(source.clone());
         tracing::info!(
             device_id = %config.device_id,
             platform = %format!("{}:{}", config.sip_addr, config.sip_port),
@@ -1228,6 +1238,22 @@ impl ProtocolRuntime {
                 server.abort();
             }
         }
+        // Tear the frame bridges down unconditionally. Neither the graceful
+        // path nor `abort()` guarantees the library unsubscribed, and a
+        // bridge left running would keep resolving the first active camera
+        // and forwarding access units into a channel nobody reads — once per
+        // hot-toggle, for the life of the process.
+        let drained = self
+            .gb28181_frame_source
+            .take()
+            .map(|s| s.drain_subscribers())
+            .unwrap_or(0);
+        if drained > 0 {
+            tracing::info!(
+                drained,
+                "GB28181 bridge: released live frame subscribers on stop"
+            );
+        }
         // Dropping the talkback playback/upstream streams releases the
         // audio output and the microphone.
         self.gb28181_talkback_stream = None;
@@ -1327,8 +1353,29 @@ impl ProtocolRuntime {
 struct StreamManagerFrameSource {
     manager: Arc<StreamManager>,
     next_id: std::sync::atomic::AtomicU64,
-    subscribers:
-        std::sync::Mutex<HashMap<u64, std::sync::mpsc::SyncSender<gb28181_rs::frame::AccessUnit>>>,
+    /// Subscription id → (sender the library reads, bridge task).
+    ///
+    /// The `JoinHandle` is retained deliberately. The bridge task only ever
+    /// exits when its sender's channel disconnects, and the registry holds a
+    /// second sender clone — so dropping the registry entry is what ends the
+    /// task. `gb28181_rs::ServerHandle::abort()` explicitly does *not* clean
+    /// up active media tasks (its own docs say so), so on the abort path
+    /// nothing ever called `unsubscribe` and every timed-out GB28181
+    /// hot-toggle leaked one map entry, one detached task still resolving and
+    /// forwarding frames into a void, and one `SyncSender`. Retaining the
+    /// handle lets both paths tear down deterministically.
+    ///
+    /// `parking_lot::Mutex` rather than `std::sync::Mutex`: this sits on the
+    /// INVITE/media path, and a panic anywhere under a std lock would poison
+    /// it permanently — every subsequent INVITE would panic too.
+    subscribers: parking_lot::Mutex<HashMap<u64, SubscriberEntry>>,
+}
+
+struct SubscriberEntry {
+    /// Kept alive so the library's receiver stays connected.
+    #[allow(dead_code)]
+    sender: std::sync::mpsc::SyncSender<gb28181_rs::frame::AccessUnit>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl StreamManagerFrameSource {
@@ -1336,7 +1383,7 @@ impl StreamManagerFrameSource {
         Self {
             manager,
             next_id: std::sync::atomic::AtomicU64::new(1),
-            subscribers: std::sync::Mutex::new(HashMap::new()),
+            subscribers: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -1347,13 +1394,13 @@ impl gb28181_rs::frame::FrameSource for StreamManagerFrameSource {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Registry entry lets unsubscribe() drop the sender, which ends the
-        // bridge task's forward loop on its next send.
-        self.subscribers.lock().unwrap().insert(id, tx.clone());
 
         let manager = self.manager.clone();
-        let tx = tx;
-        tokio::spawn(async move {
+        // The task owns one sender; the registry entry keeps the other so
+        // dropping the entry both disconnects the library's receiver and
+        // gives `drain_subscribers` a handle to abort a parked task.
+        let bridge_tx = tx.clone();
+        let task = tokio::spawn(async move {
             let mut no_camera_ticks: u32 = 0;
             let mut forwarded: u64 = 0;
             loop {
@@ -1408,7 +1455,7 @@ impl gb28181_rs::frame::FrameSource for StreamManagerFrameSource {
                             // slow-consumer semantics without blocking the
                             // async bridge on a full channel.
                             use std::sync::mpsc::TrySendError;
-                            match tx.try_send(au) {
+                            match bridge_tx.try_send(au) {
                                 Ok(()) => {}
                                 Err(TrySendError::Full(_)) => {}
                                 Err(TrySendError::Disconnected(_)) => {
@@ -1427,11 +1474,39 @@ impl gb28181_rs::frame::FrameSource for StreamManagerFrameSource {
             }
         });
 
+        // Registered after the spawn so the entry owns both halves of the
+        // teardown: dropping it disconnects the library's receiver, and the
+        // retained handle lets unsubscribe abort a bridge that is parked in
+        // its 1s retry sleep rather than waiting for a send to notice.
+        self.subscribers
+            .lock()
+            .insert(id, SubscriberEntry { sender: tx, task });
+
         gb28181_rs::frame::FrameSubscription { id, receiver: rx }
     }
 
     fn unsubscribe(&self, id: u64) {
-        self.subscribers.lock().unwrap().remove(&id);
+        if let Some(entry) = self.subscribers.lock().remove(&id) {
+            entry.task.abort();
+            tracing::debug!(subscription = id, "gb28181 bridge: subscriber released");
+        }
+    }
+}
+
+impl StreamManagerFrameSource {
+    /// Tear down every live bridge task.
+    ///
+    /// Called when the GB28181 server is stopped so the shutdown path does
+    /// not depend on the library unsubscribing for us — `ServerHandle::abort`
+    /// does not, and that is exactly how the leak used to happen.
+    fn drain_subscribers(&self) -> usize {
+        let entries: Vec<SubscriberEntry> =
+            self.subscribers.lock().drain().map(|(_, e)| e).collect();
+        let n = entries.len();
+        for entry in entries {
+            entry.task.abort();
+        }
+        n
     }
 }
 
@@ -2090,9 +2165,9 @@ mod tests {
         let sub = source.subscribe_with_capacity(8);
         assert_eq!(sub.id, 1);
         // registry holds the sender for the live subscription
-        assert_eq!(source.subscribers.lock().unwrap().len(), 1);
+        assert_eq!(source.subscribers.lock().len(), 1);
         source.unsubscribe(sub.id);
-        assert_eq!(source.subscribers.lock().unwrap().len(), 0);
+        assert_eq!(source.subscribers.lock().len(), 0);
     }
 
     // ── ONVIF wiring (onvif-rs 0.8 capability batch) ────────────────────

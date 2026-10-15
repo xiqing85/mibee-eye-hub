@@ -1,7 +1,7 @@
 # mibee-eye-notebook
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Rust: 1.85+](https://img.shields.io/badge/Rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust: 1.88+](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 [![Platform: Linux Tier 1](https://img.shields.io/badge/Platform-Linux%20Tier%201-green.svg)](docs/POSITIONING.md)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](docs/en/contributing.md)
 
@@ -119,7 +119,7 @@ mibee-eye/
 | **GB28181 MobilePosition** | static coordinates on subscription cadence | gb28181-rs `with_position_source` (empty config = no reporting) | ✅ Implemented & wired in |
 | **H.264** | NAL unit parser, SPS/PPS, keyframe detection | Hand-written (`H264Parser`) | ✅ Used by all video outputs |
 | **H.265 decode** | Browser fallback to H.264 | — | ⚠️ Not universal in browsers; H.264 only for v1 |
-| **Browser live preview** | MJPEG multipart stream via `<img>` | `/api/cameras/{id}/live` route (ffmpeg transcode) | ✅ Implemented & wired in |
+| **Browser live preview** | MJPEG multipart stream via `<img>` | `/api/cameras/{id}/live` route (in-process OpenH264, no ffmpeg subprocess) | ✅ Implemented & wired in |
 | **Local recording** | MP4 segment archive with auto-prune | `FileOutput` auto-attached per-camera based on recording config | ✅ Implemented & wired in |
 | **i18n (zh-CN / en-US)** | Translation layer | `t()` dictionary in `app.js`, language toggle persisted to user settings | ✅ Implemented & wired in |
 | **Day/night theme** | Theme toggle | System-preference auto-detect, manual override persisted | ✅ Implemented & wired in |

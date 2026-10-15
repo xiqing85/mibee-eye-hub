@@ -118,6 +118,16 @@ struct LiveStreamEntry {
     cached_sps: Option<Vec<u8>>,
     /// Cached PPS NAL (type 8) for SDP sprop-parameter-sets.
     cached_pps: Option<Vec<u8>>,
+    /// A parked receiver, kept solely so `broadcast::Sender::send` cannot
+    /// fail with `SendError` (and therefore cannot panic the encoder task)
+    /// between "stream registered" and "first RTSP client subscribes".
+    ///
+    /// This replaces a `std::mem::forget(rx)` that nothing ever dropped:
+    /// each register/stop cycle leaked a 300-slot ring plus whatever frames
+    /// it still held. Holding it here ties the channel's lifetime to the
+    /// *entry*, so [`RtspServer::unregister_live_stream`] releases both.
+    #[allow(dead_code)]
+    keepalive_rx: broadcast::Receiver<Vec<u8>>,
 }
 
 /// Internal server state shared across connections.
@@ -208,13 +218,25 @@ impl RtspServer {
             ssrc,
             cached_sps: None,
             cached_pps: None,
+            keepalive_rx: rx,
         };
-        // Leak the receiver to keep the broadcast channel alive.
-        // Without this, senders would get `NoRecipients` errors before any
-        // RTSP client subscribes.
-        std::mem::forget(rx);
+        // Re-registering the same path replaces the previous entry, which
+        // drops that entry's parked receiver together with its ring.
+        //
+        // The old code only ever inserted here — never removed — so a stopped
+        // mount stayed DESCRIBE-able and a client could PLAY a dead stream
+        // and hang instead of getting an error.
         self.inner.live_streams.lock().insert(path, entry);
         tx
+    }
+
+    /// Remove a stream from the registry.
+    ///
+    /// Without this the entry (and its parked broadcast receiver) outlived
+    /// the stream, and clients could still DESCRIBE / PLAY a mount that no
+    /// longer produces frames.
+    pub fn unregister_live_stream(&self, path: &str) -> bool {
+        self.inner.live_streams.lock().remove(path).is_some()
     }
 
     /// Update the SPS/PPS NAL units for a live stream.
@@ -1205,10 +1227,9 @@ mod tests {
                 ssrc: 1,
                 cached_sps: None,
                 cached_pps: None,
+                keepalive_rx: rx,
             },
         );
-        // Leak receiver to keep channel alive
-        std::mem::forget(rx);
         assert!(find_live_stream("/livecam", &live_map).is_some());
         assert!(find_live_stream("rtsp://localhost:8554/livecam", &live_map).is_some());
         assert!(find_live_stream("/other", &live_map).is_none());
@@ -1229,6 +1250,7 @@ mod tests {
                 ssrc: 1,
                 cached_sps: None,
                 cached_pps: None,
+                keepalive_rx: rx_main,
             },
         );
         live_map.insert(
@@ -1239,10 +1261,9 @@ mod tests {
                 ssrc: 2,
                 cached_sps: None,
                 cached_pps: None,
+                keepalive_rx: rx_sub,
             },
         );
-        std::mem::forget(rx_main);
-        std::mem::forget(rx_sub);
 
         let (path, entry) = find_live_stream("/live/cam-1/sub", &live_map).unwrap();
         assert_eq!(path, "live/cam-1/sub");
@@ -1254,6 +1275,59 @@ mod tests {
         let (path, entry) = find_live_stream("/live/cam-1", &live_map).unwrap();
         assert_eq!(path, "live/cam-1");
         assert_eq!(entry.ssrc, 1, "exact main path still resolves to main");
+    }
+
+    /// Regression for the registry leak: `live_streams` was insert-only, so a
+    /// stopped mount stayed DESCRIBE-able and a client could PLAY a stream
+    /// that produces nothing and hang instead of erroring.
+    #[test]
+    fn unregister_removes_the_stream_from_the_registry() {
+        let server = RtspServer::new(RtspServerConfig {
+            port: 0,
+            auth_required: false,
+            ..Default::default()
+        });
+
+        let tx =
+            server.register_live_stream("live/stop-me".to_string(), "s=Live\r\n".to_string(), 7);
+        assert!(
+            server
+                .inner
+                .live_streams
+                .lock()
+                .contains_key("live/stop-me"),
+            "registered stream must be visible to DESCRIBE"
+        );
+        // The parked `keepalive_rx` means the encoder can push frames before
+        // any RTSP client has subscribed — `broadcast::Sender::send` fails
+        // (and the caller may panic on it) with zero receivers.
+        assert!(tx.send(vec![0u8; 4]).is_ok());
+
+        assert!(server.unregister_live_stream("live/stop-me"));
+        assert!(
+            !server
+                .inner
+                .live_streams
+                .lock()
+                .contains_key("live/stop-me"),
+            "an unregistered stream must no longer be DESCRIBE-able"
+        );
+        // Idempotent: a second unregister reports "was not there" rather than
+        // panicking or double-freeing the parked receiver.
+        assert!(!server.unregister_live_stream("live/stop-me"));
+        // With the entry gone, the parked receiver went with it — the sender
+        // correctly reports no recipients instead of silently buffering.
+        assert!(tx.send(vec![0u8; 4]).is_err());
+
+        // Re-registering the same path must work and replace cleanly.
+        let tx2 =
+            server.register_live_stream("live/stop-me".to_string(), "s=Live\r\n".to_string(), 8);
+        assert_eq!(
+            server.inner.live_streams.lock()["live/stop-me"].ssrc,
+            8,
+            "re-registration must replace, not silently keep, the old entry"
+        );
+        assert!(tx2.send(vec![0u8; 4]).is_ok());
     }
 
     #[tokio::test]

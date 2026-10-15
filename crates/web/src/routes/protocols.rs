@@ -264,7 +264,12 @@ pub(crate) fn validate_and_coerce(
 
 async fn handle_get(db: &Db, protocol: &str) -> axum::response::Response {
     match crate::db::get_protocol_config(db, protocol).await {
-        Ok(Some(v)) => (StatusCode::OK, Json(v)).into_response(),
+        // SPEC §5: secret fields read back as `"****"`. `gb28181` carries the
+        // SIP Digest password and `rtmp_push` a `push_url` that conventionally
+        // embeds the stream key and userinfo; this endpoint is behind auth
+        // but "behind auth" is not the same as "safe to hand a session every
+        // credential the device holds".
+        Ok(Some(v)) => (StatusCode::OK, Json(super::config_api::redact_secrets(v))).into_response(),
         Ok(None) => ApiError::not_found(format!("{} config not found", protocol)).into_response(),
         Err(e) => {
             tracing::error!(error = %e, protocol, "failed to read protocol config");
@@ -302,6 +307,12 @@ async fn handle_put_and_get(
             return Err(ApiError::internal("database error").into_response());
         }
     };
+    // SPEC §5: a `"****"` submitted verbatim means "keep the stored secret".
+    // The settings UI GETs the redacted document and PUTs it back after an
+    // edit, so without this the round trip would persist four asterisks as the
+    // GB28181 SIP password.
+    let mut validated = validated;
+    super::config_api::restore_secrets(&mut validated, &current);
     if let Some(obj) = validated.as_object() {
         for (key, value) in obj {
             current[key] = value.clone();
@@ -314,7 +325,9 @@ async fn handle_put_and_get(
     }
 
     tracing::info!(protocol, "protocol config updated via Web UI");
-    Ok(current)
+    // Redact on the way out: this value is returned directly as the response
+    // body of every `PUT /api/protocols/*`.
+    Ok(super::config_api::redact_secrets(current))
 }
 // ---------------------------------------------------------------------------
 // ONVIF config

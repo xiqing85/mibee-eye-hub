@@ -242,9 +242,15 @@ impl RtpAudioPacketizer {
             );
         }
 
-        // Calculate samples per packet (20ms at 8kHz = 160 samples)
-        let samples_per_packet = (sample_rate / 50) as usize; // 20ms = 1/50 second
-        let _frames_per_packet = samples_per_packet / channels as usize;
+        // Calculate samples per packet (20ms = 1/50 second).
+        //
+        // Both divisions below are guarded. Previously `sample_rate / 50`
+        // truncated to 0 for any rate under 50 Hz, which made `end_offset`
+        // equal `sample_offset` on every iteration — an infinite loop that
+        // pushed a new packet per spin and grew the Vec until the allocator
+        // gave up, with `channels == 0` panicking one line earlier.
+        let samples_per_packet = ((sample_rate / 50).max(1)) as usize;
+        debug_assert!(channels > 0, "channel count must be non-zero");
 
         let mut packets = Vec::new();
         let mut sample_offset = 0;
@@ -260,8 +266,11 @@ impl RtpAudioPacketizer {
                 chunk.iter().map(|&s| pcm_to_alaw(s)).collect()
             };
 
-            // Create RTP header
-            let current_timestamp = timestamp + (sample_offset as u32 * 8000 / sample_rate); // Scale to 8kHz clock
+            // Create RTP header. `max(1)` keeps a degenerate 0 Hz rate from
+            // dividing by zero — the timestamp just advances on the caller's
+            // own clock instead of panicking the media task.
+            let current_timestamp =
+                timestamp + (sample_offset as u32).saturating_mul(8000) / sample_rate.max(1); // Scale to 8kHz clock
             let header =
                 RtpHeader::new(payload_type, self.sequence_number, current_timestamp, ssrc);
 

@@ -565,7 +565,9 @@ model_path = "models/llm/qwen3-0.6b-q8_0.gguf"
 # （≥8 GiB full / ≥4 GiB mid / 否则 lite）；空值回落 model_path。
 model_path_mid = ""
 model_path_lite = ""
-n_ctx = 1024
+n_ctx = 2048
+# 缺省取逻辑核数的一半，钳制在 2..=4——在 4C/8T 实机上，线程数超过物理核
+# 反而使生成变慢。此处按 4 线程机器解析出的值展示。
 n_threads = 2
 max_tokens = 200
 no_think = true
@@ -577,8 +579,8 @@ no_think = true
 |------|------|---------|------|
 | `enabled` | bool | `false` | 主开关（需 `llm` 构建特性 + AVX2）。 |
 | `model_path` | String | `"models/llm/qwen3-0.6b-q8_0.gguf"` | GGUF 模型路径（默认 Qwen3-0.6B Q8_0）。 |
-| `n_ctx` | u32 | `1024` | 对话上下文窗口。 |
-| `n_threads` | u32 | `2` | CPU 线程数。 |
+| `n_ctx` | u32 | `2048` | 对话上下文窗口。必须大于工具提示词（SPEC §3.5 约 500-1700 token）加对话本身；此前缺省 1024 会溢出并静默劣化首个 agent 轮次。 |
+| `n_threads` | u32 | 逻辑核数 / 2，钳制 `2..=4` | CPU 线程数。留空则由设备按本机核数自行决定。 |
 | `max_tokens` | u32 | `200` | 每次回复的生成上限。 |
 | `no_think` | bool | `true` | user 轮追加 `/no_think`（关闭 Qwen3 思考模式——更快、对话向）。 |
 

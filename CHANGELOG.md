@@ -64,88 +64,6 @@
   drawers, a live thinking side panel (`agent_step` timeline + latest
   turn's chain) and a tools & skills registry card.
 
-### Fixed
-
-- **Voice reply latency 50-70 s → seconds, and clipped questions (2026-10-10 real-usage test).**
-  Three compounding causes, all fixed:
-  ① the agent tool prompt (Qwen3 `<tools>` section, pretty-printed) ran
-  ~1300-1700 tokens against an `n_ctx` default of 1024 — overflowing the
-  context and paying ~28 ms/token prefill on every turn. The section is
-  now compact (single-line JSON, terse instruction), the `n_ctx` default
-  is 2048, and `n_threads` defaults to half the logical cores (clamped
-  2-4; more threads than physical cores measured slower on 4C/8T).
-  ② `n_threads` was a dead config field — `LlamaContextParams` never
-  received it (same for the VLM context), so every deployment ran
-  llama.cpp's own thread default regardless of config; both contexts
-  now apply `n_threads` (measured: honoring 4 threads on the 4C/8T test
-  host roughly halves decode latency vs the stray default).
-  ③ voice turns carried the tool table even for chit-chat — new
-  `[agent] voice_tool_gate` (default on) includes tools only when the
-  utterance matches a tool-intent heuristic; plain questions take the
-  fast single-shot path (~1.4 s generation vs ~35 s+).
-  ④ TTS synthesis was hardwired to 2 threads (~16 s for a 5 s
-  utterance) — new `[tts] num_threads`, 4 on ≥4-core hosts halves it.
-  ⑤ `[voice] capture_endpointing` (default on): the post-wake capture
-  window is VAD-endpointed (speech slides the deadline up to
-  capture_secs + 6 s, ~0.6 s of trailing silence ends it) — questions
-  spoken after a pause after the wake word are no longer clipped to the
-  first 4 s (the "asked several questions, only 2-3 characters came
-  through" failure). WebUI: the voiceprint waveform applies a perceptual
-  display curve (0.6 gamma) with an always-on midline so quiet speech
-  reads as listening instead of a dead trace.
-
-- **VLM intermittent degenerate replies — two root causes, both fixed.**
-  Live vision answers occasionally returned looped gibberish (`Extra
-  baseUrl…` repeated): ① a data race — llama-cpp-2 blanket-asserts
-  `Sync` for `MtmdContext`, but the clip preprocessing reuses mutable
-  scratch buffers, and the alarm-frame describer could overlap a chat
-  vision answer on the same engine (the ignored concurrent diagnostic
-  now **segfaults** on the unfixed code, proving the race); all VLM
-  inference is now serialized behind an engine mutex. ② greedy decoding
-  itself loops on list items in hard frames even without any race — a
-  llama.cpp-style repetition penalty (`[vlm] repeat_penalty`, default
-  1.1, over the last 64 tokens) breaks the loops. Degenerate replies
-  (if any still occur) are WARN-logged with the reply text via a pure,
-  unit-tested repetition detector. Post-fix diagnostic: four concurrent
-  answers on one engine, all coherent.
-- **Deployed migrations can no longer be silently missing.** Migrations
-  are now embedded in the binary at compile time (`include_dir`), with
-  site-local directories as an optional overlay. Previously a deployed
-  instance relied on `migrations/` next to the working directory —
-  forgetting to copy a new file left the new tables missing while
-  inserts only WARNed (the `conversation_turns` incident).
-- **Audio capture test flake**: a closed capture channel (device
-  contention with another mic holder) now skips like the other
-  no-hardware paths instead of failing the suite.
-
-- **Dialogue dialect & quality fixes**: Cantonese vernacular detection
-  (而家-class questions kept their written-form characters through ASR
-  and mis-routed the reply language), explicit reply-language nudges,
-  per-language TTS models needing their own companion tokens table (the
-  Cantonese model read the Mandarin table's path and exited 255 — the
-  table is now derived from each model's own directory), TTS synthesis
-  on 2 threads (halves spoken-reply latency on 4+-core hosts), a
-  weekday-name off-by-one (Sunday-first array met a Monday-first `%u`),
-  and an `llm_tier` newtype fix (the bare `Arc<String>` Extension
-  collided with the advertised-host slot and reported the LAN IP as the
-  tier).
-
-- **face.recog decoder fixes** (was failing on every detection event,
-  fail-open had hidden it): the zoo 2023 YuNet checkpoint needs its
-  declared fixed input size (config'd 320 was rejected), its output is
-  multi-head cls/obj/bbox (decoded per the model author's reference
-  implementation — score = cls·obj, no sigmoid, stride-anchored boxes),
-  and SFace's graph input/output names are captured at load instead of
-  hardcoded. Verified on a real face photo: score 0.83 with an accurate
-  box, and the production instance went from constant failures to 87
-  inferences with zero errors.
-
-- **GB28181 SIP password no longer logged**: the `start_gb28181`
-  tracing span recorded the whole runtime config — password included —
-  into journald; the config is now skipped (identifying fields were
-  already logged by the INFO line inside).
-
-### Added
 
 - **Conversation records (SPEC v1 §3.4 + appendix A #41).** A persistent,
   human-readable log of every dialogue turn — voice utterances and web
@@ -252,6 +170,192 @@
   state highlights the mic icon).
 
 ### Fixed
+
+- **The shipped `config.toml` was not valid TOML (blocks every fresh
+  install).** Commit `78a7eeb` spliced the `[away]` block into `[agent]`'s
+  comment anchor, leaving a stray `[agent]\` table header at line 305.
+  `AppConfig::load` propagates the parse error, so the file refused to
+  start — and the file is a *distribution artifact*: `scripts/deploy.sh`
+  installs it as the live `config.local.toml` and the release workflow
+  ships it as `config.example.toml`. It went unnoticed because no test ever
+  parsed it. Both headers fixed, and
+  `shipped_example_config_parses_into_app_config` is now the permanent
+  gate: valid TOML, every table header maps to a real `AppConfig` section,
+  the `[away]` keys land in `cfg.away` (the failure mode a missing header
+  produces), and the result passes `validate()`.
+
+- **Four rustls advisories were live on every outbound TLS connection**
+  (RUSTSEC-2026-0346/0347/0348/0349, published 2026-10-14). rustls
+  0.23.45 → 0.23.46, where all four are patched. 0349 is the one that
+  matters here: an unauthenticated ServerHello can strip the post-quantum
+  key share from later ClientHellos, which is exactly the path used for the
+  cloud AI endpoint, the OTLP collector and the weather fetch. This went
+  unnoticed because **no CI job ran an audit at all** — the "audit clean"
+  note in the working log was a manual claim that had silently gone stale.
+  A `cargo audit` job now runs in CI.
+
+- **Credentials left the device in cleartext (SPEC §5 was never
+  implemented).** The spec has mandated since v1 that secret config fields
+  read back as `"****"` and that `"****"` submitted back means "keep the
+  stored secret". Neither half existed — the placeholder appeared nowhere
+  in the codebase. `GET /api/config`, `GET /api/protocols/gb28181` and
+  `GET /api/protocols/rtmp_push` all returned the stored document
+  verbatim, handing every browser session the GB28181 SIP Digest password
+  and an RTMP push URL that conventionally embeds the stream key and
+  userinfo. Both halves now exist: redaction is a depth-recursive match on
+  a leaf-name allowlist (so a new subsection cannot opt out by nesting),
+  and the restore is what makes redacting safe — the settings UI does a
+  read-modify-write of the whole document, so without it, saving an
+  unrelated setting would have persisted four asterisks as the live SIP
+  password and silently broken Digest auth on the next re-register.
+
+- **The auth rate limiter was bypassable and unbounded.** The per-client
+  key came from `X-Forwarded-For`, which any client can vary to obtain a
+  fresh bucket per request; and the tracked-key map only ever shrank on a
+  successful login, so unauthenticated traffic grew a `HashMap<String, _>`
+  without bound for the life of the process. Forwarding headers are now
+  honoured only from a loopback peer (nginx's `set_real_ip_from`
+  convention — unforgeable from the LAN, still works behind a same-host
+  reverse proxy), the table prunes expired entries and caps at 8192 keys.
+
+- **Three listeners leaked one task or one registry entry per cycle.**
+  ① GB28181 frame bridges: the registry held the sender, so the bridge task
+  could only be ended by the library unsubscribing — which it does not do
+  on its `abort()` path. Every timed-out GB28181 hot-toggle orphaned a map
+  entry, a `SyncSender` and a task still forwarding access units into a
+  channel nobody reads. The registry entry now owns the `JoinHandle` and
+  `stop_gb28181` drains it.
+  ② RTSP: `live_streams` was insert-only, so a stopped camera stayed
+  DESCRIBE-able and an NVR could PLAY it and hang waiting for frames that
+  would never come; the registry also held its `broadcast::Receiver` via
+  `std::mem::forget`, leaking a 300-slot ring per cycle. The receiver now
+  lives in the entry that keeps it alive, and `stop_stream` unregisters
+  both the main and the substream mount.
+  ③ TTS: the interruptible playback pipeline (appendix A #45) spawned the
+  audio player and polled it, but `std::process::Child` deliberately does
+  not kill on drop. A future cancelled mid-playback — SIGTERM during a
+  reply, an aborted round, a timeout — left the device speaking after the
+  playback self-mute had already lifted, which is the self-talk loop #45
+  exists to prevent, re-entering through the one path the explicit cancel
+  flag cannot cover. The player is now wrapped in a kill-on-drop guard.
+
+- **`chat_reply` and `voice_decision` were dead on arrival.** Both are
+  emitted by the voice bridge but were absent from
+  `capabilities.events`, and the frontend registers SSE listeners *only*
+  from that list — so the payloads reached the wire with no handler, and
+  the conversations-off fallback toast in `chat.js` could never fire. Both
+  now advertised, under their real gates. A test scrapes
+  `event_to_sse` for every wire name and requires each to be advertised, so
+  the next event arm added without an advertisement fails the build.
+
+- **`capabilities.face` was hardcoded `true`** while `[face]` defaults to
+  off and both models are deployment assets, so a stock install rendered
+  the "Enrolled faces" card and clicking enroll returned 501. It now
+  follows the engine's real state.
+
+- **A model swap froze the web server.** Building an ONNX session reads
+  the model file and initialises the runtime graph — hundreds of ms to
+  seconds — and the activate, upload-validation and model-manager handlers
+  all called it synchronously from inside `async fn`, parking a tokio
+  worker thread for the duration. On a single-core deployment that is a
+  visible hang. Session construction now runs on the blocking pool; the
+  per-frame inference path was already correct.
+
+- **Three latent panics on degenerate input.** `packetize_pcm` divided by
+  `sample_rate / 50` (0 for any rate under 50 Hz, which also made the send
+  loop spin forever growing a `Vec`) and by `channels`; `hex_decode`
+  sliced a `&str` at byte offsets and so panicked on non-ASCII despite
+  documenting "returns an error"; and `PUT /api/config` used `unreachable!()`
+  on a key list hand-kept in sync with its validator — after the row was
+  already persisted, so any drift would turn a valid request into a 500
+  plus a stored-but-unapplied setting.
+
+- **The CI feature matrix only compiled, it never ran anything.** Every
+  feature-gated module — the whole voice bridge, the tool/MCP agent loop,
+  the model download manager, the VLM description layer — was type-checked
+  and never executed once. The matrix now runs
+  `cargo test --workspace --lib`; it immediately caught two stale call
+  sites the default `test` job cannot see.
+
+- **Voice reply latency 50-70 s → seconds, and clipped questions (2026-10-10 real-usage test).**
+  Three compounding causes, all fixed:
+  ① the agent tool prompt (Qwen3 `<tools>` section, pretty-printed) ran
+  ~1300-1700 tokens against an `n_ctx` default of 1024 — overflowing the
+  context and paying ~28 ms/token prefill on every turn. The section is
+  now compact (single-line JSON, terse instruction), the `n_ctx` default
+  is 2048, and `n_threads` defaults to half the logical cores (clamped
+  2-4; more threads than physical cores measured slower on 4C/8T).
+  ② `n_threads` was a dead config field — `LlamaContextParams` never
+  received it (same for the VLM context), so every deployment ran
+  llama.cpp's own thread default regardless of config; both contexts
+  now apply `n_threads` (measured: honoring 4 threads on the 4C/8T test
+  host roughly halves decode latency vs the stray default).
+  ③ voice turns carried the tool table even for chit-chat — new
+  `[agent] voice_tool_gate` (default on) includes tools only when the
+  utterance matches a tool-intent heuristic; plain questions take the
+  fast single-shot path (~1.4 s generation vs ~35 s+).
+  ④ TTS synthesis was hardwired to 2 threads (~16 s for a 5 s
+  utterance) — new `[tts] num_threads`, 4 on ≥4-core hosts halves it.
+  ⑤ `[voice] capture_endpointing` (default on): the post-wake capture
+  window is VAD-endpointed (speech slides the deadline up to
+  capture_secs + 6 s, ~0.6 s of trailing silence ends it) — questions
+  spoken after a pause after the wake word are no longer clipped to the
+  first 4 s (the "asked several questions, only 2-3 characters came
+  through" failure). WebUI: the voiceprint waveform applies a perceptual
+  display curve (0.6 gamma) with an always-on midline so quiet speech
+  reads as listening instead of a dead trace.
+
+- **VLM intermittent degenerate replies — two root causes, both fixed.**
+  Live vision answers occasionally returned looped gibberish (`Extra
+  baseUrl…` repeated): ① a data race — llama-cpp-2 blanket-asserts
+  `Sync` for `MtmdContext`, but the clip preprocessing reuses mutable
+  scratch buffers, and the alarm-frame describer could overlap a chat
+  vision answer on the same engine (the ignored concurrent diagnostic
+  now **segfaults** on the unfixed code, proving the race); all VLM
+  inference is now serialized behind an engine mutex. ② greedy decoding
+  itself loops on list items in hard frames even without any race — a
+  llama.cpp-style repetition penalty (`[vlm] repeat_penalty`, default
+  1.1, over the last 64 tokens) breaks the loops. Degenerate replies
+  (if any still occur) are WARN-logged with the reply text via a pure,
+  unit-tested repetition detector. Post-fix diagnostic: four concurrent
+  answers on one engine, all coherent.
+- **Deployed migrations can no longer be silently missing.** Migrations
+  are now embedded in the binary at compile time (`include_dir`), with
+  site-local directories as an optional overlay. Previously a deployed
+  instance relied on `migrations/` next to the working directory —
+  forgetting to copy a new file left the new tables missing while
+  inserts only WARNed (the `conversation_turns` incident).
+- **Audio capture test flake**: a closed capture channel (device
+  contention with another mic holder) now skips like the other
+  no-hardware paths instead of failing the suite.
+
+- **Dialogue dialect & quality fixes**: Cantonese vernacular detection
+  (而家-class questions kept their written-form characters through ASR
+  and mis-routed the reply language), explicit reply-language nudges,
+  per-language TTS models needing their own companion tokens table (the
+  Cantonese model read the Mandarin table's path and exited 255 — the
+  table is now derived from each model's own directory), TTS synthesis
+  on 2 threads (halves spoken-reply latency on 4+-core hosts), a
+  weekday-name off-by-one (Sunday-first array met a Monday-first `%u`),
+  and an `llm_tier` newtype fix (the bare `Arc<String>` Extension
+  collided with the advertised-host slot and reported the LAN IP as the
+  tier).
+
+- **face.recog decoder fixes** (was failing on every detection event,
+  fail-open had hidden it): the zoo 2023 YuNet checkpoint needs its
+  declared fixed input size (config'd 320 was rejected), its output is
+  multi-head cls/obj/bbox (decoded per the model author's reference
+  implementation — score = cls·obj, no sigmoid, stride-anchored boxes),
+  and SFace's graph input/output names are captured at load instead of
+  hardcoded. Verified on a real face photo: score 0.83 with an accurate
+  box, and the production instance went from constant failures to 87
+  inferences with zero errors.
+
+- **GB28181 SIP password no longer logged**: the `start_gb28181`
+  tracing span recorded the whole runtime config — password included —
+  into journald; the config is now skipped (identifying fields were
+  already logged by the INFO line inside).
+
 
 - SPEC appendix A #11 stale note corrected upstream: this device has
   implemented §3.2 since the 2026-10-04 audit (notebook side of webui #47).
