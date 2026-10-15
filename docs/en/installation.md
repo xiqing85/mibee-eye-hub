@@ -10,7 +10,7 @@ This guide covers installation and deployment for mibee-eye (MiBee Eye), a profe
 - **macOS** - Not in scope
 
 ### Software Requirements
-- **Rust 1.85+** - MSRV for Rust 2024 edition
+- **Rust 1.88+** - MSRV for Rust 2024 edition
 - **RAM**: Target <200MB RAM during operation
 - **CPU**: Target <5% CPU idle usage
 - **Disk**: ~50MB for binary + dependencies
@@ -90,10 +90,10 @@ choco install visualstudio2022buildtools visualstudio2022-workload-vctools
 
 ### Prerequisites
 
-Ensure you have Rust 1.85+ installed:
+Ensure you have Rust 1.88+ installed:
 
 ```bash
-rustc --version  # Should be >= 1.85
+rustc --version  # Should be >= 1.88
 ```
 
 ### Build Commands

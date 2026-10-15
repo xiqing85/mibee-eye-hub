@@ -77,7 +77,7 @@ pub async fn activate_model(
         None => return api_error(StatusCode::NOT_FOUND, &format!("unknown model id: {id}")),
     };
 
-    let built = match ai.load_for(&spec.path) {
+    let built = match ai.load_for_blocking(&spec.path).await {
         Ok(built) => built,
         Err(ActivateError::Unavailable(msg)) => return api_error(StatusCode::CONFLICT, &msg),
         Err(ActivateError::LoadFailed(msg)) => {
@@ -193,7 +193,7 @@ pub async fn upload_model(
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("write: {e}"));
     }
     let tmp_path = tmp.to_string_lossy().into_owned();
-    let validated = match ai.load_for(&tmp_path) {
+    let validated = match ai.load_for_blocking(&tmp_path).await {
         Ok(v) => v,
         Err(ActivateError::Unavailable(msg)) | Err(ActivateError::LoadFailed(msg)) => {
             let _ = std::fs::remove_file(&tmp);
@@ -364,6 +364,87 @@ mod tests {
             format!("multipart/form-data; boundary={boundary}"),
             Body::from(body),
         )
+    }
+
+    /// The model-load path must not run on a runtime worker thread.
+    ///
+    /// Building an ONNX session reads the model file and initialises the
+    /// graph — hundreds of ms to seconds for a real detector. The activate and
+    /// upload handlers both call it and both are `async fn`, so a synchronous
+    /// call stalls every other request sharing that worker for the duration.
+    /// This test pins the property directly: on a single-threaded runtime a
+    /// concurrent timer task must keep ticking while a slow load is in flight.
+    /// A synchronous load starves it completely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn model_loading_does_not_block_the_executor_thread() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let config = streaming::ai::AiConfig {
+            allow_upload: true,
+            ..streaming::ai::AiConfig::default()
+        };
+        let engine = AiEngine::from_parts(config, Some(StdArc::new(FakeDetector)));
+        let factory: streaming::ai::DetectorFactory = StdArc::new(|_path: &str| {
+            // ~200ms of CPU spin, so a blocking implementation is unmistakable.
+            let start = std::time::Instant::now();
+            let mut acc: u64 = 0;
+            while start.elapsed() < Duration::from_millis(200) {
+                acc = acc
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+            }
+            std::hint::black_box(acc);
+            Ok((
+                StdArc::new(FakeDetector) as StdArc<dyn streaming::ai::AiDetector>,
+                416,
+            ))
+        });
+        let engine = StdArc::new(engine.with_factory(factory));
+
+        let ticks = StdArc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                while ticks.load(Ordering::SeqCst) < 1_000 {
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+
+        let loaded = engine.load_for_blocking("models/ai/fake.onnx").await;
+        let ticks_during_load = ticks.load(Ordering::SeqCst);
+        ticker.abort();
+
+        assert!(loaded.is_ok(), "the injected factory must succeed");
+        assert!(
+            ticks_during_load > 0,
+            "the executor was starved for the whole model load \
+             ({ticks_during_load} timer ticks) — the load ran on the worker thread"
+        );
+    }
+
+    /// A build without the `ai` feature has no factory at all; the async
+    /// wrapper must report that rather than panicking on the missing one.
+    #[tokio::test]
+    async fn load_for_blocking_reports_a_missing_factory_instead_of_panicking() {
+        let engine = AiEngine::from_parts(
+            streaming::ai::AiConfig::default(),
+            Some(std::sync::Arc::new(FakeDetector)),
+        );
+        assert!(!engine.can_load_models());
+        let Err(err) = engine.load_for_blocking("models/ai/fake.onnx").await else {
+            panic!("a factoryless engine must not report success");
+        };
+        let streaming::ai::registry::ActivateError::LoadFailed(msg) = err else {
+            panic!("expected LoadFailed, got a different variant");
+        };
+        assert!(
+            msg.contains("factory unavailable"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test]

@@ -13,8 +13,10 @@ configuration key, see [Configuration](configuration.md).
 - [The web interface](#the-web-interface)
   - [Live view](#live-view)
   - [Zones editor](#zones-editor)
-  - [Chat panel](#chat-panel)
-  - [Cameras / Devices / Status / Settings](#cameras--devices--status--settings)
+  - [Assistant](#assistant)
+  - [AI view](#ai-view)
+  - [System view](#system-view)
+  - [Status and resources](#status-and-resources)
 - [Alarms and notifications](#alarms-and-notifications)
 - [Talking to the device (voice)](#talking-to-the-device-voice)
 - [Enabling the AI features](#enabling-the-ai-features)
@@ -45,11 +47,21 @@ web UI reads it on load and renders exactly what this device can do:
 | `vlm` | Alarm-frame image descriptions — `alarm_description` events |
 | `ocr` | On-device text recognition — `POST /api/ocr` |
 | `substream` | A low-resolution secondary stream is available on at least one running camera |
-5. With the `decision` capability active, the transcript first passes a
-   **local decision engine** (Laya typed decisions) classifying it as
-   answer / device / ignore — `ignore` (noise, accidental wake) skips the
-   reply, the rest answer as usual; each decision rides a
-   `voice_decision` event.
+| `decision` | Local typed-decision triage over voice transcripts — the transcript is classified as answer / device / ignore before any model is asked (below) |
+| `tools` | Tool and skill framework — `GET /api/tools`, `agent_step` events, the **Tools & skills** card |
+| `away` | Away mode — an armed watch that greets visitors and records activity (SPEC §3.6) |
+| `meeting` | Local meeting minutes — explicit start/stop recording, offline speaker diarization and transcription (appendix A #27) |
+| `conversations` | Persistent conversation records — `GET /api/conversations`, the Assistant view's history |
+| `resource` | The boot-time resource admission snapshot, the budget and the per-feature decision |
+| `watermark` | A text watermark is burned into the encoded stream |
+
+With the `decision` capability active, a voice transcript first passes a
+**local decision engine** (Laya typed decisions) classifying it as answer /
+device / ignore — `ignore` (noise, accidental wake) skips the reply, the rest
+answer as usual; each decision rides a `voice_decision` event. A Cantonese
+transcript is an out-of-distribution input for that model, so an `ignore`
+verdict on Cantonese is treated as unreliable and the turn is answered
+anyway.
 
 
 A capability you do not see is a feature that is off, not broken. [Enabling
@@ -68,9 +80,23 @@ the AI features](#enabling-the-ai-features) explains how to turn each one on.
 
 ## The web interface
 
-The top bar has five views — **Live**, **Cameras**, **Settings**, **Status**,
-**Devices** — plus the language (zh/en) and theme (day/night) toggles on the
-right. All views react to the capability set.
+The top bar has **five destinations** — **Live**, **Assistant**, **Records**,
+**AI**, **System** — plus the language (zh/en) and theme (day/night) toggles
+on the right. Every destination is capability-gated: a tab you do not see
+belongs to a feature this device cannot currently run.
+
+| Destination | What lives there | Gated by |
+|-------------|------------------|----------|
+| **Live** | The stream, detection and zone overlays, the stream toolbar, the zones editor, PTZ and imaging controls, and the all-cameras grid | always present |
+| **Assistant** | Voice assistant, AI chat, the thinking panel, tools & skills, enrolled speakers and faces, and the conversation call chains | `chat`, `voice`, `tools`, `voice_speakers`, `face` |
+| **Records** | Hearing records, away mode, meeting minutes | `audio_records`, `away`, `meeting` |
+| **AI** | The model catalogue (download / activate / delete) and cloud AI configuration | `ai` |
+| **System** | Configuration editor, camera info, PTZ position, connection, resource profile and monitor, recent logs, request traces, model resources, video/audio device enumeration, host capabilities | always present |
+
+> Earlier releases of this guide described a flat "Cameras / Devices / Status
+> / Settings" tab bar. Those did not become four destinations — the
+> information is still there, regrouped under **Live**, **AI** and
+> **System**.
 
 ### Live view
 
@@ -82,8 +108,11 @@ top of the video:
 - **Zone overlay** (capability `zones`): your saved zones are drawn over the
   picture; a zone that fires lights up while the event is active.
 - **Stream toolbar**: start/stop, snapshot, stream quality (main/sub — sub is
-  the bandwidth-saving low-resolution stream), rotation, and the **zones
-  editor** button. With several cameras, each tile carries its own controls.
+  the bandwidth-saving low-resolution stream), rotation, horizontal/vertical
+  flip, and the **zones** editor button. With several cameras, each tile in
+  **All cameras** carries its own controls.
+- **PTZ control** and **Imaging controls** (brightness/contrast and friends)
+  appear only when the connected NVR actually exposes those services.
 
 ### Zones editor
 
@@ -104,15 +133,33 @@ To draw one:
 4. **Save** writes the zone list for this camera — it applies immediately,
    no restart.
 
+If the editor refuses to open, the snapshot it needs could not be fetched.
+That is deliberate: opening an empty editor over a failed snapshot would
+let *Save* clear the zones you already had.
+
 Zones need the `ai` capability (tracking rides on the detector); zone
 crossings arrive as `zone_event` SSE events and as alarm toasts.
 
-### Chat panel
+### Assistant
 
-When the device advertises `chat`, a round **chat button** floats at the
-bottom-right corner. Open it, type a message, and the assistant answers in
-the panel. The panel keeps your recent turns so you can ask follow-ups.
-Replies to voice interactions arrive in the same panel (or as a toast, if it
+The **Assistant** destination is where all interaction lives:
+
+- **Voice assistant** — the wake word, the live microphone waveform, the
+  transcript and the spoken reply.
+- **AI chat** — type a message and get an answer. A round chat button also
+  floats at the bottom-right of the Live view as a shortcut.
+- **Thinking** — a live timeline of the current turn's internal steps
+  (`agent_step`) and the most recent turn's chain, so you can see which model
+  answered and why.
+- **Tools & skills** — the registered built-in and MCP tools.
+- **Enrolled speakers** and **Enrolled faces** — voiceprint and face
+  enrollment (capability-gated).
+- **Call chains** — the per-turn conversation trace: a waterfall of the HTTP,
+  conversation and model calls that produced each reply, with duration, CPU
+  and token counts. This is the debugging surface for "why was that answer
+  slow".
+
+Replies to voice interactions arrive in the chat panel (or as a toast, if it
 is closed) — see [Talking to the device](#talking-to-the-device-voice).
 
 Every turn is **grounded** (appendix A #29): the answer knows what the
@@ -127,6 +174,49 @@ cloud AI is configured (appendix A #35) chat goes cloud-first with local
 fallback — the reply's engine field shows which path answered. A live
 microphone waveform strip under the chat log dances while you speak
 (appendix A #36).
+
+### AI view
+
+- **AI Models** — the model catalogue: what is installed, what is in use, what
+  has no public download source, and the download / activate / delete
+  actions. Activating a model restarts the service so the new weights are
+  picked up; the UI walks you through that restart. The vision model
+  selector also appears on the Live view, since switching it is the most
+  common operation.
+- **Online AI** — the cloud provider (OpenAI-compatible, e.g. OpenRouter)
+  with a write-only API key, model ids, the local-fallback switch, and a
+  *test* button that verifies the key without sending a conversation. The
+  key is never returned by `GET /api/cloud` — only whether one is set.
+
+### System view
+
+- **Configuration** — the unified configuration editor. Protocol sections
+  (ONVIF, GB28181, RTMP push, recording, watermark) and the hot-adjustable
+  `scene.*` keys (follow-up window, weather tool, away mode) apply
+  immediately on save. Keys that need a restart to take effect are marked as
+  such. UI preferences (language, theme) persist per browser.
+- **Camera Info** and **PTZ Position** — device identity and the current
+  pan/tilt/zoom readout.
+- **Connection**, **Resource Profile**, **Resource Monitor** — see
+  [Status and resources](#status-and-resources) below.
+- **Recent Logs**, **Request Traces**, **Model Resources** — the last log
+  lines, the recent API request window, and the per-model inference counters
+  parsed from the metrics endpoint.
+- **Video devices**, **Audio devices** — enumerate the machine's V4L2 video
+  and ALSA audio devices, with the formats each video device supports. Use it
+  to find the right device index before adding a camera or microphone.
+- **Host capabilities** — the raw operating-system view the device reports to
+  ONVIF clients.
+
+### Status and resources
+
+The **Resource Profile** card shows which AI features were admitted at boot
+against the memory budget, each one's estimated cost and, when a feature did
+not start, why (off in config / out of memory budget / dependency off).
+Small-memory hosts shed the heavy tail automatically; the decision
+re-evaluates on restart. **Resource Monitor** adds the live budget gauge
+and per-feature admission state, including the runtime low-water latch that
+fires when memory drops below the reserve.
 
 ### Cameras / Devices / Status / Settings
 

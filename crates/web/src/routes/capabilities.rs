@@ -37,7 +37,6 @@ pub struct CapabilitiesResponse {
 ///
 /// Probing is cheap (a handful of sysfs/`/proc` reads) but not free, so the
 /// result is cached for the process lifetime via a [`std::sync::OnceLock`].
-#[allow(clippy::too_many_arguments)]
 /// Resolved LLM resource tier (#30-E) as an Extension-safe newtype.
 #[derive(Debug, Clone)]
 pub struct LlmTier(pub String);
@@ -46,26 +45,59 @@ pub struct LlmTier(pub String);
 /// cannot collide with `Arc<String>` advertised-host.
 pub struct WakeWord(pub String);
 
+/// The engine handles `GET /api/capabilities` reports on, bundled into a
+/// single Extension.
+///
+/// **Why a struct and not one `Extension` per engine:** axum handlers top out
+/// at 16 extractors, and this handler was already sitting exactly on that
+/// ceiling with 15 engines + `AuthenticatedUser` — so adding the one engine
+/// that was missing (face) was a compile error, not a one-line change. (The
+/// same ceiling has bitten this file before; see the 2026-10-10 away-mode
+/// note in the workspace log.) Grouping the handles keeps the handler at two
+/// extractors and leaves room for the next engine.
+#[derive(Clone)]
+pub struct CapHandles {
+    pub ai: Arc<AiEngine>,
+    pub audio_ai: Arc<streaming::audio_ai::AudioAiEngine>,
+    pub ocr: Arc<streaming::ocr::OcrEngine>,
+    pub voice: Arc<streaming::voice::VoiceEngine>,
+    pub chat: Arc<streaming::llm::ChatEngine>,
+    pub llm_tier: Arc<LlmTier>,
+    pub resource: Arc<streaming::feature_gate::ResourceProfile>,
+    pub decision: Arc<streaming::decision::DecisionEngine>,
+    pub meeting: Arc<streaming::meeting::MeetingEngine>,
+    pub vlm: Arc<streaming::vlm::VlmEngine>,
+    pub face: Arc<streaming::face::FaceEngine>,
+    pub stream_manager: Arc<crate::stream_manager::StreamManager>,
+    pub convlog: Arc<crate::conversations::ConversationLog>,
+    pub agent: Arc<crate::agent::ToolRegistry>,
+    pub agent_config: crate::agent::AgentConfig,
+    pub away: Arc<crate::away::AwayEngine>,
+}
+
 #[tracing::instrument(skip_all)]
-#[allow(clippy::too_many_arguments)]
 pub async fn get_capabilities(
-    Extension(ai): Extension<Arc<AiEngine>>,
-    Extension(audio_ai): Extension<Arc<streaming::audio_ai::AudioAiEngine>>,
-    Extension(ocr): Extension<Arc<streaming::ocr::OcrEngine>>,
-    Extension(voice): Extension<Arc<streaming::voice::VoiceEngine>>,
-    Extension(chat): Extension<Arc<streaming::llm::ChatEngine>>,
-    Extension(llm_tier): Extension<Arc<LlmTier>>,
-    Extension(resource): Extension<Arc<streaming::feature_gate::ResourceProfile>>,
-    Extension(decision): Extension<Arc<streaming::decision::DecisionEngine>>,
-    Extension(meeting): Extension<Arc<streaming::meeting::MeetingEngine>>,
-    Extension(vlm): Extension<Arc<streaming::vlm::VlmEngine>>,
-    Extension(stream_manager): Extension<Arc<crate::stream_manager::StreamManager>>,
-    Extension(convlog): Extension<Arc<crate::conversations::ConversationLog>>,
-    Extension(agent): Extension<Arc<crate::agent::ToolRegistry>>,
-    Extension(agent_config): Extension<crate::agent::AgentConfig>,
-    Extension(away): Extension<Arc<crate::away::AwayEngine>>,
+    Extension(h): Extension<CapHandles>,
     Extension(_user): Extension<AuthenticatedUser>,
 ) -> impl IntoResponse {
+    let CapHandles {
+        ai,
+        audio_ai,
+        ocr,
+        voice,
+        chat,
+        llm_tier,
+        resource,
+        decision,
+        meeting,
+        vlm,
+        face,
+        stream_manager,
+        convlog,
+        agent,
+        agent_config,
+        away,
+    } = h;
     static CACHE: std::sync::OnceLock<CapabilitiesResponse> = std::sync::OnceLock::new();
     let cached = CACHE.get_or_init(|| {
         let system = probe();
@@ -132,6 +164,22 @@ pub async fn get_capabilities(
     // fires while any audio consumer keeps the monitor running.
     if voice.is_active() || audio_ai.is_active() || meeting.is_active() {
         events.push("audio_level");
+    }
+    // Voice-turn LLM replies (SPEC appendix A #22). Both emitters live on
+    // the voice bridge (`src/main.rs`), so the voice engine is the real gate.
+    //
+    // This was simply missing from the advertised list, which made the event
+    // unreachable from every client: `static/js/sse.js` registers listeners
+    // *only* for names in `capabilities.events`, so a `chat_reply` payload
+    // arriving on the wire had no handler. The frontend's conversations-off
+    // fallback in `chat.js` has been dead code for the same reason.
+    if voice.is_active() {
+        events.push("chat_reply");
+    }
+    // Laya typed-decision triage over voice transcripts (SPEC appendix A #26)
+    // — same omission, same dead-on-arrival shape.
+    if decision.is_active() {
+        events.push("voice_decision");
     }
     let superset = serde_json::json!({
         "spec_version": "1",
@@ -214,7 +262,14 @@ pub async fn get_capabilities(
         "config_apply": {"default": "immediate", "sections": {"scene": "immediate"},
                          "auto": true},
         "restart": true,
-        "face": true,
+        // Face recognition (SPEC appendix A #33): YuNet detect + SFace
+        // embeddings, `/api/faces`. Honesty matters more than coverage here —
+        // this used to be hardcoded `true`, so a stock install (where
+        // `[face]` defaults to off and the models are deployment assets)
+        // rendered the "Enrolled faces" card and clicking enroll returned
+        // 501. An over-promising capability is worse than an absent one,
+        // because the frontend gates every card on it.
+        "face": face.is_active(),
         "observability": observability_document(),
         // Device-specific extension: the host hardware probe.
         "system": cached.system,
@@ -294,42 +349,43 @@ mod tests {
             &streaming::audio_ai::AudioAiConfig::default(),
         ));
         let res = get_capabilities(
-            Extension(ai),
-            Extension(audio_ai),
-            Extension(Arc::new(streaming::ocr::OcrEngine::from_config(
-                &streaming::ocr::OcrConfig::default(),
-            ))),
-            Extension(Arc::new(streaming::voice::VoiceEngine::from_config(
-                &streaming::voice::VoiceConfig::default(),
-            ))),
-            Extension(Arc::new(streaming::llm::ChatEngine::from_config(
-                &streaming::llm::LlmConfig::default(),
-            ))),
-            Extension(Arc::new(crate::routes::capabilities::LlmTier(
-                "manual".into(),
-            ))),
-            Extension(Arc::new(
-                streaming::feature_gate::ResourceProfile::unrestricted(),
-            )),
-            Extension(Arc::new(streaming::decision::DecisionEngine::from_config(
-                &streaming::decision::DecisionConfig::default(),
-            ))),
-            Extension(Arc::new(streaming::meeting::MeetingEngine::from_config(
-                &streaming::meeting::MeetingConfig::default(),
-                &streaming::voice::VoiceConfig::default(),
-            ))),
-            Extension(Arc::new(streaming::vlm::VlmEngine::from_config(
-                &streaming::vlm::VlmConfig::default(),
-            ))),
-            Extension(Arc::new(crate::stream_manager::StreamManager::new())),
-            Extension(Arc::new(crate::conversations::ConversationLog::new(
-                create_test_pool().await,
-                Arc::new(crate::routes::events::new_event_bus()),
-                true,
-            ))),
-            Extension(crate::server::AppRouterState::agent_for_tests().0),
-            Extension(crate::server::AppRouterState::agent_for_tests().1),
-            Extension(crate::server::AppRouterState::away_for_tests()),
+            Extension(CapHandles {
+                ai,
+                audio_ai,
+                ocr: Arc::new(streaming::ocr::OcrEngine::from_config(
+                    &streaming::ocr::OcrConfig::default(),
+                )),
+                voice: Arc::new(streaming::voice::VoiceEngine::from_config(
+                    &streaming::voice::VoiceConfig::default(),
+                )),
+                chat: Arc::new(streaming::llm::ChatEngine::from_config(
+                    &streaming::llm::LlmConfig::default(),
+                )),
+                llm_tier: Arc::new(LlmTier("manual".into())),
+                resource: Arc::new(streaming::feature_gate::ResourceProfile::unrestricted()),
+                decision: Arc::new(streaming::decision::DecisionEngine::from_config(
+                    &streaming::decision::DecisionConfig::default(),
+                )),
+                meeting: Arc::new(streaming::meeting::MeetingEngine::from_config(
+                    &streaming::meeting::MeetingConfig::default(),
+                    &streaming::voice::VoiceConfig::default(),
+                )),
+                vlm: Arc::new(streaming::vlm::VlmEngine::from_config(
+                    &streaming::vlm::VlmConfig::default(),
+                )),
+                face: Arc::new(streaming::face::FaceEngine::from_config(
+                    &streaming::face::FaceConfig::default(),
+                )),
+                stream_manager: Arc::new(crate::stream_manager::StreamManager::new()),
+                convlog: Arc::new(crate::conversations::ConversationLog::new(
+                    create_test_pool().await,
+                    Arc::new(crate::routes::events::new_event_bus()),
+                    true,
+                )),
+                agent: crate::server::AppRouterState::agent_for_tests().0,
+                agent_config: crate::server::AppRouterState::agent_for_tests().1,
+                away: crate::server::AppRouterState::away_for_tests(),
+            }),
             Extension(security::middleware::AuthenticatedUser("admin".to_string())),
         )
         .await
@@ -380,6 +436,220 @@ mod tests {
         assert!(
             json["resource"]["features"].is_array() || json["resource"]["decisions"].is_array()
         );
+    }
+
+    /// Regression: `capabilities.face` was a hardcoded `true` while `[face]`
+    /// defaults to off and both models are deployment assets. A stock install
+    /// therefore rendered the "Enrolled faces" card and clicking enroll
+    /// returned 501. The flag must follow the engine's real state.
+    #[tokio::test]
+    async fn face_capability_follows_the_engine_not_a_constant() {
+        let res = capabilities_json(Arc::new(streaming::face::FaceEngine::from_config(
+            &streaming::face::FaceConfig::default(),
+        )))
+        .await;
+        assert_eq!(
+            res["face"],
+            serde_json::json!(false),
+            "an unconfigured face engine must not advertise the capability"
+        );
+    }
+
+    /// The gating itself: with no voice/decision models loaded, the
+    /// voice-bridge events must be absent (advertising them unconditionally
+    /// would be its own lie — the reverse of the bug this fixed).
+    #[tokio::test]
+    async fn voice_events_stay_gated_off_when_the_engines_are_inactive() {
+        let res = capabilities_json(Arc::new(streaming::face::FaceEngine::from_config(
+            &streaming::face::FaceConfig::default(),
+        )))
+        .await;
+        let events = res["events"].as_array().expect("events array");
+        for gated in ["chat_reply", "voice_decision", "voice_transcript"] {
+            assert!(
+                !events.contains(&serde_json::json!(gated)),
+                "`{gated}` must not be advertised while its engine is inactive"
+            );
+        }
+    }
+
+    /// The capabilities handler sits exactly on axum's 16-extractor ceiling —
+    /// which is why `face` could not simply be appended as a 17th. Bundling
+    /// them into `CapHandles` must not change what is advertised.
+    #[tokio::test]
+    async fn every_gated_capability_is_reachable_through_cap_handles() {
+        let res = capabilities_json(Arc::new(streaming::face::FaceEngine::from_config(
+            &streaming::face::FaceConfig::default(),
+        )))
+        .await;
+        for key in [
+            "ai",
+            "audio_ai",
+            "ocr",
+            "voice",
+            "chat",
+            "vlm",
+            "decision",
+            "meeting",
+            "face",
+            "conversations",
+            "away",
+            "resource",
+            "substream",
+            "tools",
+        ] {
+            assert!(
+                res.get(key).is_some(),
+                "capability `{key}` disappeared in the CapHandles refactor"
+            );
+        }
+    }
+
+    /// Every SSE wire name the server can emit must be advertised here.
+    ///
+    /// `static/js/sse.js` registers listeners *only* for names present in
+    /// `capabilities.events`, so an event that is emitted but not advertised is
+    /// dead on arrival — the payload arrives on the wire and nothing handles it.
+    /// That is not hypothetical: `chat_reply` and `voice_decision` were both
+    /// emitted by the voice bridge and absent from this list, which also made the
+    /// conversations-off fallback toast in `chat.js` unreachable.
+    ///
+    /// This test scans the single function that serialises `CameraEvent` into SSE
+    /// (`routes/events::event_to_sse`) for its wire names and requires each one to
+    /// appear here. It fails loudly the next time someone adds an event arm and
+    /// forgets the advertisement — which is exactly how the original bug shipped.
+    #[test]
+    fn every_emitted_sse_event_is_advertised_in_capabilities() {
+        let events_src = include_str!("events.rs");
+        // Only the production half of this file. The needles below are built from
+        // fragments so that this test's own source cannot match them — a scraper
+        // that finds its own literal passes vacuously, which is exactly what a
+        // first attempt at this test did.
+        let caps_src = include_str!("capabilities.rs")
+            .split_once("#[cfg(test)]")
+            .map_or(include_str!("capabilities.rs"), |(prod, _)| prod);
+        let push_needle: String = ["events.push(", "\""].concat();
+        let seed_needle: String = ["let mut events = vec", "!", "["].concat();
+
+        // The wire names the SSE layer actually produces.
+        let mut emitted: Vec<&str> = Vec::new();
+        let mut rest = events_src;
+        while let Some(idx) = rest.find(".event(\"") {
+            rest = &rest[idx + ".event(\"".len()..];
+            let end = rest.find('"').expect("unterminated event name");
+            emitted.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+        emitted.sort_unstable();
+        emitted.dedup();
+        assert!(
+            emitted.len() >= 12,
+            "expected to scrape the full SSE surface, only found {emitted:?} — the \
+         scraper drifted from the real shape and this test is now vacuous"
+        );
+
+        // Scrape the advertisement side from the *event-building* statements only.
+        // A naive `caps_src.contains("\"chat_reply\"")` is vacuous: the name also
+        // occurs in the explanatory comments above, so deleting the real
+        // `events.push("chat_reply")` would leave this test green.
+        //
+        // Two forms build the list: the seed `vec![...]` holding the always-on
+        // camera events, and `events.push("...")` for the gated ones.
+        let mut advertised: Vec<String> = Vec::new();
+        let mut rest = caps_src;
+        while let Some(idx) = rest.find(&push_needle) {
+            rest = &rest[idx + push_needle.len()..];
+            let end = rest.find('"').expect("unterminated event name");
+            advertised.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+        if let Some(idx) = caps_src.find(&seed_needle) {
+            let after = &caps_src[idx + seed_needle.len()..];
+            let list_end = after.find(']').expect("unterminated seed event list");
+            for element in after[..list_end].split(',') {
+                let name = element.trim();
+                let name = name
+                    .strip_prefix('"')
+                    .and_then(|p| p.strip_suffix('"'))
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    advertised.push(name.to_string());
+                }
+            }
+        }
+        // Some events are advertised by capability *object* rather than a literal
+        // push (their gate is the object, and the name is implied).
+        let implied = ["conversation", "agent_step", "away_event"];
+        let missing: Vec<&str> = emitted
+            .iter()
+            .copied()
+            .filter(|n| !advertised.iter().any(|a| a == n) && !implied.contains(n))
+            .collect();
+        assert!(
+            !advertised.is_empty(),
+            "the advertisement scraper found nothing — it has drifted from the \
+         real `events.push(...)` shape and this test is now vacuous"
+        );
+        assert!(
+            missing.is_empty(),
+            "these SSE events are emitted by event_to_sse but absent from \
+         capabilities.events, so no client can subscribe to them: {missing:?}"
+        );
+    }
+
+    /// Build the capability response against a chosen face engine.
+    async fn capabilities_json(face: Arc<streaming::face::FaceEngine>) -> serde_json::Value {
+        let ai = Arc::new(AiEngine::from_parts(
+            streaming::ai::AiConfig::default(),
+            None,
+        ));
+        let audio_ai = Arc::new(streaming::audio_ai::AudioAiEngine::from_config(
+            &streaming::audio_ai::AudioAiConfig::default(),
+        ));
+        let res = get_capabilities(
+            Extension(CapHandles {
+                ai,
+                audio_ai,
+                ocr: Arc::new(streaming::ocr::OcrEngine::from_config(
+                    &streaming::ocr::OcrConfig::default(),
+                )),
+                voice: Arc::new(streaming::voice::VoiceEngine::from_config(
+                    &streaming::voice::VoiceConfig::default(),
+                )),
+                chat: Arc::new(streaming::llm::ChatEngine::from_config(
+                    &streaming::llm::LlmConfig::default(),
+                )),
+                llm_tier: Arc::new(LlmTier("manual".into())),
+                resource: Arc::new(streaming::feature_gate::ResourceProfile::unrestricted()),
+                decision: Arc::new(streaming::decision::DecisionEngine::from_config(
+                    &streaming::decision::DecisionConfig::default(),
+                )),
+                meeting: Arc::new(streaming::meeting::MeetingEngine::from_config(
+                    &streaming::meeting::MeetingConfig::default(),
+                    &streaming::voice::VoiceConfig::default(),
+                )),
+                vlm: Arc::new(streaming::vlm::VlmEngine::from_config(
+                    &streaming::vlm::VlmConfig::default(),
+                )),
+                face,
+                stream_manager: Arc::new(crate::stream_manager::StreamManager::new()),
+                convlog: Arc::new(crate::conversations::ConversationLog::new(
+                    create_test_pool().await,
+                    Arc::new(crate::routes::events::new_event_bus()),
+                    true,
+                )),
+                agent: crate::server::AppRouterState::agent_for_tests().0,
+                agent_config: crate::server::AppRouterState::agent_for_tests().1,
+                away: crate::server::AppRouterState::away_for_tests(),
+            }),
+            Extension(security::middleware::AuthenticatedUser("admin".to_string())),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(res.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 }
 

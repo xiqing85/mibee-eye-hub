@@ -829,6 +829,91 @@ pub fn default_model_selection(config: &AppConfig) -> std::collections::HashMap<
 mod tests {
     use super::*;
 
+    /// The shipped example config is a *distribution artifact*: the release
+    /// tarball renames it to `config.example.toml` and `scripts/deploy.sh`
+    /// ships it as the live `config.local.toml`. A syntax error or a table
+    /// header that got swallowed into a comment therefore breaks every
+    /// fresh install — and no unit test ever noticed, because nothing parsed
+    /// this file (regression: 78a7eeb mangled `[away]` into a comment, which
+    /// silently dumped 19 away keys into `[desktop]`).
+    ///
+    /// This test is the permanent gate for that whole class of bug.
+    #[test]
+    fn shipped_example_config_parses_into_app_config() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.toml");
+        let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path));
+
+        // 1. Valid TOML.
+        let doc: toml::Value =
+            toml::from_str(&raw).unwrap_or_else(|e| panic!("{path} is not valid TOML: {e}"));
+
+        // 2. Every table header in the file names a real AppConfig section —
+        //    this is what catches "keys land in the wrong struct".
+        const KNOWN: &[&str] = &[
+            "agent",
+            "ai",
+            "audio_ai",
+            "away",
+            "capture",
+            "conversations",
+            "database",
+            "decision",
+            "desktop",
+            "gb28181",
+            "llm",
+            "meeting",
+            "models",
+            "observability",
+            "ocr",
+            "onvif",
+            "recording",
+            "resources",
+            "rtmp_push",
+            "rtsp",
+            "security",
+            "tts",
+            "voice",
+            "vlm",
+            "watermark",
+            "web",
+            "webrtc",
+        ];
+        let mut unknown: Vec<&str> = doc
+            .as_table()
+            .expect("config.toml must be a top-level table")
+            .keys()
+            .map(String::as_str)
+            .filter(|k| !KNOWN.contains(k))
+            .collect();
+        unknown.sort_unstable();
+        assert!(
+            unknown.is_empty(),
+            "config.toml declares table(s) {unknown:?} that AppConfig does not \
+             have — they would be silently ignored (or, worse, absorbed by the \
+             preceding table). Add the field to AppConfig or fix the header."
+        );
+
+        // 3. Deserializes into AppConfig with the documented away defaults
+        //    actually landing in `cfg.away` (not `cfg.desktop`).
+        let cfg: AppConfig = toml::from_str(&raw)
+            .unwrap_or_else(|e| panic!("{path} does not deserialize into AppConfig: {e}"));
+        assert_eq!(
+            cfg.away.interval_ms, 1000,
+            "[away] keys must land in cfg.away"
+        );
+        assert_eq!(cfg.away.person_gap_secs, 10);
+        assert_eq!(cfg.away.activity_labels, vec!["cat", "dog", "bird"]);
+        assert!(
+            cfg.desktop.tray == DesktopConfig::default().tray,
+            "[desktop] must keep its own (defaulted) shape — away keys leaking \
+             into it is the exact regression this test exists for"
+        );
+
+        // 4. And it passes startup validation.
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("shipped config.toml fails validate(): {e}"));
+    }
+
     #[test]
     fn model_overlay_maps_every_capability_to_engine_paths() {
         let mut cfg: AppConfig = toml::from_str("").expect("empty config");

@@ -203,7 +203,7 @@ async fn hot_switch(
     let Some(spec) = ai.registry().read().find(id).map(|s| s.path) else {
         return Err(ApiError::not_found(format!("unknown model id: {id}")));
     };
-    let built = match ai.load_for(&spec) {
+    let built = match ai.load_for_blocking(&spec).await {
         Ok(b) => b,
         Err(streaming::ai::registry::ActivateError::Unavailable(msg)) => {
             return Err(ApiError::conflict(msg));

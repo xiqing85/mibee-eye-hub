@@ -318,7 +318,7 @@ pub async fn get_config(
     ] {
         match db::get_protocol_config(&db, key).await {
             Ok(Some(v)) => {
-                protocols.insert(key.to_string(), v);
+                protocols.insert(key.to_string(), redact_secrets(v));
             }
             Ok(None) => {}
             Err(e) => {
@@ -385,7 +385,7 @@ pub async fn put_config(
                 other => other,
             };
             let section = section.clone();
-            let validated = match validate_and_coerce(db_key, &section) {
+            let mut validated = match validate_and_coerce(db_key, &section) {
                 Ok(v) => v,
                 Err(msg) => return ApiError::bad_request(&msg).into_response(),
             };
@@ -397,6 +397,13 @@ pub async fn put_config(
                     return ApiError::internal("database error").into_response();
                 }
             };
+            // SPEC §5: `"****"` written back verbatim means "keep the stored
+            // secret". GET hands the settings UI redacted values, and that UI
+            // does a read-modify-write of the whole document — so without this
+            // restore, simply saving an unrelated setting would overwrite the
+            // GB28181 SIP password with four asterisks and silently break SIP
+            // Digest auth on the next re-register.
+            restore_secrets(&mut validated, &current);
             if let Some(obj) = validated.as_object() {
                 for (k, v) in obj {
                     current[k.as_str()] = v.clone();
@@ -516,7 +523,21 @@ pub async fn put_config(
                         "schedule_arm" => s.schedule_arm = value.clone(),
                         "schedule_disarm" => s.schedule_disarm = value.clone(),
                         "push_url" => s.push_url = value.clone(),
-                        _ => unreachable!("validated scene.away keys"),
+                        // This arm used to be `unreachable!("validated scene.away keys")`,
+                        // which asserted that the validator above and this
+                        // applier enumerate the same key set. Two hand-kept
+                        // lists that must agree is a panic waiting to happen —
+                        // and a bad one: the settings row is already
+                        // persisted by the time we get here, so drifting the
+                        // lists turns an authenticated PUT into a remote 500
+                        // plus a stored-but-unapplied setting. Warn like the
+                        // sibling `other` arm instead; the next boot overlay
+                        // still picks it up.
+                        unknown => tracing::warn!(
+                            key = unknown,
+                            "scene.away key validated but not hot-applied; \
+                             it will apply on next start"
+                        ),
                     }
                 }
                 other => tracing::warn!(key = other, "scene key persisted but not hot-applied"),
@@ -561,13 +582,100 @@ pub async fn restart_handler(
 
 // ---------------------------------------------------------------------------
 // Router helper
-// ---------------------------------------------------------------------------
-
 pub fn routes() -> Router {
     Router::new()
         .route("/api/status", get(status_handler))
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/system/restart", axum::routing::post(restart_handler))
+}
+
+// ---------------------------------------------------------------------------
+// Secret redaction (SPEC §5)
+// ---------------------------------------------------------------------------
+
+/// The placeholder a redacted secret reads as on the wire, and the value a
+/// client sends back unchanged to mean "keep what is stored".
+pub const REDACTED: &str = "****";
+
+/// Config keys whose values are credentials and must never leave the device
+/// in cleartext.
+///
+/// This is a name match on the leaf key, applied at any depth, so a future
+/// subsection cannot accidentally opt out of it by nesting.
+///
+/// - `password` — the GB28181 SIP Digest secret (`Gb28181Config::password`).
+/// - `push_url` — RTMP ingest URLs conventionally carry the stream key, and
+///   usually the userinfo too (`rtmp://user:pass@host/app/key`).
+/// - `api_key` — the OpenRouter-compatible cloud key (SPEC §4.10), if it
+///   ever appears in the config surface rather than only the dedicated table.
+///
+/// ONVIF `username` is deliberately NOT redacted: SPEC treats it as
+/// configuration the settings UI renders, and the device's ONVIF credentials
+/// are already discoverable from the device itself by anyone on the LAN.
+const SECRET_KEYS: &[&str] = &["password", "push_url", "api_key"];
+
+/// Replace every secret leaf value with [`REDACTED`], recursing through
+/// objects and arrays. Non-string values under a secret key are redacted too
+/// (a number is still a value we should not echo).
+///
+/// Empty secrets stay empty rather than becoming `"****"` — `"****"` means
+/// "a secret exists", so showing it for an unset field would misreport the
+/// device's configuration state to the settings UI.
+#[must_use]
+pub fn redact_secrets(mut value: serde_json::Value) -> serde_json::Value {
+    fn walk(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    if SECRET_KEYS.contains(&key.to_ascii_lowercase().as_str())
+                        && !matches!(child, serde_json::Value::Null)
+                        && child.as_str() != Some("")
+                    {
+                        *child = serde_json::Value::String(REDACTED.to_string());
+                    } else {
+                        walk(child);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    walk(&mut value);
+    value
+}
+
+/// Restore stored secrets under a client-submitted document.
+///
+/// SPEC §5: a `"****"` value written back verbatim means "keep the stored
+/// secret" — that is what makes the settings UI's read-modify-write cycle
+/// safe. Without it, every save would overwrite the real password with four
+/// asterisks, silently breaking SIP Digest auth and RTMP push on the next
+/// reconnect. `stored` is the current document straight from storage.
+pub fn restore_secrets(submitted: &mut serde_json::Value, stored: &serde_json::Value) {
+    fn walk(submitted: &mut serde_json::Value, stored: &serde_json::Value) {
+        match (submitted, stored) {
+            (serde_json::Value::Object(sub_map), serde_json::Value::Object(stored_map)) => {
+                for (key, sub_child) in sub_map.iter_mut() {
+                    let Some(stored_child) = stored_map.get(key) else {
+                        continue;
+                    };
+                    if sub_child.as_str() == Some(REDACTED) {
+                        *sub_child = stored_child.clone();
+                    } else {
+                        walk(sub_child, stored_child);
+                    }
+                }
+            }
+            (serde_json::Value::Array(sub_items), serde_json::Value::Array(stored_items)) => {
+                for (sub_child, stored_child) in sub_items.iter_mut().zip(stored_items) {
+                    walk(sub_child, stored_child);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(submitted, stored);
 }
 
 #[cfg(test)]
@@ -578,6 +686,99 @@ mod tests {
     use rusqlite::Connection;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
+
+    // -- Secret redaction (SPEC §5) ----------------------------------------
+    //
+    // Before this, `GET /api/config` and both `GET /api/protocols/*` returned
+    // the stored document verbatim: the GB28181 SIP Digest password and the
+    // RTMP push URL (which conventionally embeds the stream key and userinfo)
+    // travelled to every browser session in cleartext, and every future
+    // credential field added to any subsection would too.
+
+    #[test]
+    fn redaction_masks_credentials_at_any_depth() {
+        let doc = serde_json::json!({
+            "enabled": true,
+            "password": "sip-secret",
+            "device_id": "34020000001320000001",
+            "nested": { "password": "deep-secret", "port": 5060 },
+            "list": [{ "password": "in-array" }],
+            "push_url": "rtmp://user:pw@ingest.example/live/key",
+        });
+        let redacted = redact_secrets(doc);
+        assert_eq!(redacted["password"], serde_json::json!(REDACTED));
+        assert_eq!(redacted["nested"]["password"], serde_json::json!(REDACTED));
+        assert_eq!(redacted["list"][0]["password"], serde_json::json!(REDACTED));
+        assert_eq!(redacted["push_url"], serde_json::json!(REDACTED));
+        // Non-secret siblings survive intact — the settings UI renders them.
+        assert_eq!(
+            redacted["device_id"],
+            serde_json::json!("34020000001320000001")
+        );
+        assert_eq!(redacted["nested"]["port"], serde_json::json!(5060));
+        assert_eq!(redacted["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn redaction_leaves_unset_secrets_empty_so_state_is_not_misreported() {
+        // `"****"` means "a secret exists". Showing it for an unset field
+        // would make the settings UI claim a password is configured when it
+        // is not.
+        let redacted = redact_secrets(serde_json::json!({
+            "password": "",
+            "push_url": null,
+        }));
+        assert_eq!(redacted["password"], serde_json::json!(""));
+        assert!(redacted["push_url"].is_null());
+    }
+
+    #[test]
+    fn settings_round_trip_does_not_overwrite_stored_secrets() {
+        // The exact bug: the UI GETs a redacted document, edits an unrelated
+        // field and PUTs the whole thing back. Without the restore, that saves
+        // `"****"` as the live SIP password and silently breaks Digest auth.
+        let stored = serde_json::json!({
+            "enabled": true,
+            "password": "real-sip-secret",
+            "device_id": "old-id",
+            "push_url": "rtmp://u:p@host/live/key",
+        });
+        let mut submitted = redact_secrets(stored.clone());
+        // The user flips one unrelated setting.
+        submitted["device_id"] = serde_json::json!("new-id");
+        restore_secrets(&mut submitted, &stored);
+
+        assert_eq!(submitted["password"], serde_json::json!("real-sip-secret"));
+        assert_eq!(
+            submitted["push_url"],
+            serde_json::json!("rtmp://u:p@host/live/key")
+        );
+        assert_eq!(submitted["device_id"], serde_json::json!("new-id"));
+    }
+
+    #[test]
+    fn an_explicitly_typed_secret_still_replaces_the_stored_one() {
+        // A user who actually wants to change the password types a new value,
+        // and that must win — the restore only fires on the exact placeholder.
+        let stored = serde_json::json!({ "password": "old" });
+        let mut submitted = serde_json::json!({ "password": "new" });
+        restore_secrets(&mut submitted, &stored);
+        assert_eq!(submitted["password"], serde_json::json!("new"));
+
+        // Clearing it is also intentional and must not be read as a placeholder.
+        let mut cleared = serde_json::json!({ "password": "" });
+        restore_secrets(&mut cleared, &stored);
+        assert_eq!(cleared["password"], serde_json::json!(""));
+    }
+
+    #[test]
+    fn restoring_is_safe_when_nothing_is_stored_yet() {
+        let mut submitted = serde_json::json!({ "password": REDACTED });
+        restore_secrets(&mut submitted, &serde_json::json!({}));
+        // No stored value to restore from: the placeholder stays rather than
+        // becoming a literal four-asterisk password.
+        assert_eq!(submitted["password"], serde_json::json!(REDACTED));
+    }
 
     async fn test_db() -> (sqlx::SqlitePool, Arc<Mutex<Connection>>) {
         let (pool, auth_db) = crate::db::create_test_dbs().await;
@@ -682,6 +883,123 @@ mod tests {
         } else {
             b.body(Body::empty()).unwrap()
         }
+    }
+
+    /// End-to-end through the real router: a stored GB28181 SIP password and RTMP
+    /// push URL must not appear anywhere in `GET /api/config`, and saving an
+    /// unrelated setting must leave them intact in storage.
+    #[tokio::test]
+    async fn config_endpoint_never_emits_stored_credentials() {
+        let (pool, auth_db) = test_db().await;
+        let token = {
+            let c = auth_db.lock().await;
+            security::auth::create_session(&c, "admin").unwrap()
+        };
+
+        let stored = serde_json::json!({
+            "enabled": true,
+            "device_id": "34020000001320000001",
+            "platform_sip_address": "192.0.2.10",
+            "platform_sip_port": 5060,
+            "username": "3402000000",
+            "password": "super-secret-sip-password",
+            "sip_domain": "3402000000",
+            "register_interval_secs": 60,
+            "heartbeat_interval_secs": 30,
+            "heartbeat_timeout_count": 3,
+            "channel_id": "34020000001320000001",
+            "local_sip_port": 5060,
+            "talkback_playback": false,
+        });
+        db::set_protocol_config(&pool, "gb28181", &stored)
+            .await
+            .unwrap();
+        db::set_protocol_config(
+            &pool,
+            "rtmp_push",
+            &serde_json::json!({
+                "enabled": true,
+                "push_url": "rtmp://user:hunter2@ingest.example/live/streamkey",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let app = crate::server::build_app_with_state(build_state(pool.clone(), auth_db));
+        let res = app
+            .clone()
+            .oneshot(config_req("GET", &token, None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let raw = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&raw);
+
+        assert!(
+            !body.contains("super-secret-sip-password"),
+            "GET /api/config leaked the GB28181 SIP password in cleartext"
+        );
+        assert!(
+            !body.contains("hunter2") && !body.contains("streamkey"),
+            "GET /api/config leaked RTMP push credentials"
+        );
+        // Redacted placeholders present, non-secret config intact.
+        let json: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            json["data"]["protocols"]["gb28181"]["password"],
+            Value::String(REDACTED.into())
+        );
+        assert_eq!(
+            json["data"]["protocols"]["gb28181"]["device_id"],
+            Value::String("34020000001320000001".into())
+        );
+
+        // Now do what the settings UI does: read the redacted document, change an
+        // unrelated field, write the whole `protocols` subtree back.
+        let mut protocols = json["data"]["protocols"].clone();
+        protocols["gb28181"]["device_id"] = Value::String("34020000001320000009".into());
+        let res = app
+            .clone()
+            .oneshot(config_req(
+                "PUT",
+                &token,
+                Some(serde_json::json!({ "protocols": protocols })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "the save must be accepted; body was {}",
+            serde_json::to_string_pretty(&protocols).unwrap()
+        );
+
+        // The secret in storage must be untouched.
+        let after = db::get_protocol_config(&pool, "gb28181")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after["password"],
+            Value::String("super-secret-sip-password".into()),
+            "saving an unrelated setting overwrote the SIP password with \"****\" — \
+         SIP Digest auth would fail on the next re-register"
+        );
+        assert_eq!(
+            after["device_id"],
+            Value::String("34020000001320000009".into())
+        );
+
+        let rtmp = db::get_protocol_config(&pool, "rtmp_push")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rtmp["push_url"],
+            Value::String("rtmp://user:hunter2@ingest.example/live/streamkey".into())
+        );
     }
 
     #[tokio::test]
