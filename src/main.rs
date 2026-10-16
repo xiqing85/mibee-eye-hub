@@ -1,4 +1,5 @@
 use clap::Parser;
+use mibee_eye::desc_gate::{self, DescDecision};
 
 use protocols::rtsp_server::{RtspServer, RtspServerConfig};
 use std::collections::HashMap;
@@ -56,11 +57,12 @@ struct Args {
     selftest_meeting: Option<PathBuf>,
 }
 
-/// VLM description scheduler state: single-flight flag + last-start
-/// watermark (floor below). See the alarm hook in main for the rationale.
-static VLM_DESC_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static VLM_DESC_LAST_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// VLM description admission gate. See `desc_gate` for the full rationale:
+/// single-flight plus a start-to-start floor, with the lease released by
+/// `Drop` so a panicking inference cannot wedge the feature off for the life
+/// of the process — which is exactly what the previous inline
+/// `VLM_DESC_IN_FLIGHT.store(false)` after the call did.
+static VLM_DESC_GATE: desc_gate::DescGate = desc_gate::DescGate::new(VLM_DESC_MIN_INTERVAL_MS);
 /// Minimum spacing between description starts — a description takes
 /// 35–60 s of near-full CPU; this keeps headroom for everything else.
 const VLM_DESC_MIN_INTERVAL_MS: u64 = 120_000;
@@ -671,46 +673,46 @@ async fn main() -> anyhow::Result<()> {
                             if vlm_engine.is_active()
                                 && let Some(jpeg) = ev.jpeg.clone()
                             {
-                                if VLM_DESC_IN_FLIGHT
-                                    .swap(true, std::sync::atomic::Ordering::SeqCst)
-                                {
-                                    // Another description is still running —
-                                    // drop this frame (never queue).
-                                    tracing::debug!(
-                                        "vlm: description in flight — alarm frame skipped"
-                                    );
-                                } else if now_ms.saturating_sub(
-                                    VLM_DESC_LAST_START.load(std::sync::atomic::Ordering::SeqCst),
-                                ) < VLM_DESC_MIN_INTERVAL_MS
-                                {
-                                    // Release OUR acquisition only (a run we
-                                    // just prevented, not someone else's).
-                                    VLM_DESC_IN_FLIGHT
-                                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                                    tracing::debug!(
-                                        "vlm: description throttled — alarm frame skipped"
-                                    );
-                                } else {
-                                    VLM_DESC_LAST_START
-                                        .store(now_ms, std::sync::atomic::Ordering::SeqCst);
-                                    let vlm = Arc::clone(&vlm_engine);
-                                    let tx = bridge_tx.clone();
-                                    let camera_id = sig.camera_id.clone();
-                                    let alarm_ts = sig.timestamp_ms;
-                                    let grounding_feed = Arc::clone(&grounding_feed);
-                                    tokio::task::spawn_blocking(move || {
-                                        let started = std::time::Instant::now();
-                                        let result = vlm.describe_jpeg(&jpeg);
-                                        VLM_DESC_IN_FLIGHT
-                                            .store(false, std::sync::atomic::Ordering::SeqCst);
-                                        match result {
-                                            Ok(description) => {
-                                                grounding_feed.record_vlm_description(
-                                                    &camera_id,
-                                                    alarm_ts,
-                                                    &description,
-                                                );
-                                                let _ = tx.send(
+                                let (decision, lease) = VLM_DESC_GATE.try_admit(now_ms);
+                                match (decision, lease) {
+                                    (DescDecision::Busy, _) => {
+                                        // Another description is still running —
+                                        // drop this frame (never queue).
+                                        tracing::debug!(
+                                            "vlm: description in flight — alarm frame skipped"
+                                        );
+                                    }
+                                    (DescDecision::Throttled, _) => {
+                                        tracing::debug!(
+                                            "vlm: description throttled — alarm frame skipped"
+                                        );
+                                    }
+                                    (DescDecision::Admitted, Some(lease)) => {
+                                        let vlm = Arc::clone(&vlm_engine);
+                                        let tx = bridge_tx.clone();
+                                        let camera_id = sig.camera_id.clone();
+                                        let alarm_ts = sig.timestamp_ms;
+                                        let grounding_feed = Arc::clone(&grounding_feed);
+                                        tokio::task::spawn_blocking(move || {
+                                            // The lease is moved in and dropped
+                                            // when this closure ends — including
+                                            // on unwind, which is the whole point:
+                                            // the old code released the flag with a
+                                            // `store(false)` *after* the call, so a
+                                            // panicking inference left the gate shut
+                                            // and every later frame was silently
+                                            // skipped for the life of the process.
+                                            let _lease = lease;
+                                            let started = std::time::Instant::now();
+                                            let result = vlm.describe_jpeg(&jpeg);
+                                            match result {
+                                                Ok(description) => {
+                                                    grounding_feed.record_vlm_description(
+                                                        &camera_id,
+                                                        alarm_ts,
+                                                        &description,
+                                                    );
+                                                    let _ = tx.send(
                                                     web::routes::events::CameraEvent::AlarmDescription {
                                                         camera_id,
                                                         alarm_timestamp_ms: alarm_ts,
@@ -723,13 +725,24 @@ async fn main() -> anyhow::Result<()> {
                                                             / 100.0,
                                                     },
                                                 );
+                                                }
+                                                Err(e) => tracing::warn!(
+                                                    error = %e,
+                                                    "vlm: description failed"
+                                                ),
                                             }
-                                            Err(e) => tracing::warn!(
-                                                error = %e,
-                                                "vlm: description failed"
-                                            ),
-                                        }
-                                    });
+                                        });
+                                    }
+                                    // `Admitted` without a lease is
+                                    // unreachable (the gate hands one out
+                                    // with the decision), but matching it
+                                    // keeps this arm total rather than
+                                    // relying on an `unreachable!`.
+                                    (DescDecision::Admitted, None) => {
+                                        tracing::warn!(
+                                            "vlm: gate admitted without a lease;                                              frame skipped"
+                                        );
+                                    }
                                 }
                             }
                             // ONVIF MotionAlarm rides the same accepted
@@ -2778,12 +2791,35 @@ async fn main() -> anyhow::Result<()> {
         handle.abort();
     }
     tracing::info!("All protocol tasks shut down");
-    // Skip destructors AND atexit handlers — same rationale as the
-    // self-test CLI: tearing down the dynamically loaded ONNX Runtime +
-    // OpenMP threads segfaults after the graceful path is done (observed
-    // as SIGTERM-time core-dumps 2026-10-10). Everything that matters
-    // (streams, protocols, GB registration refresh) has been shut down
-    // above; the process exit code stays 0.
+    // Skip destructors AND atexit handlers.
+    //
+    // Why: tearing down the dynamically loaded ONNX Runtime and its OpenMP
+    // thread pool segfaults once the graceful path above has finished. That
+    // is not a theory — it produced SIGTERM-time core dumps on 2026-10-10 and
+    // the self-test CLI had been working around it all along for the same
+    // reason. Everything that matters has already been shut down explicitly
+    // (streams, protocols, GB deregistration), so the destructors left to run
+    // only cover memory that the kernel is about to reclaim anyway.
+    //
+    // What skipping them costs, stated precisely so nobody has to guess:
+    //
+    //   Data:      nothing. Verified empirically — a writer that commits with
+    //               `synchronous=FULL` and then calls `_exit` with its
+    //               connection still open leaves a populated `-wal` behind,
+    //               and the next open recovers every row. SQLite durability is
+    //               per-commit, not per-close.
+    //   Buffers:   explicit. `tracing_subscriber::fmt` writes to stdout (not
+    //               stderr), and stdout is flushed below, so the final
+    //               "All protocol tasks shut down" line is not lost.
+    //   Checkpoint: the `-wal` is left for the next open to replay. It grows
+    //               only by the work done since the last checkpoint, so the
+    //               steady state is unchanged.
+    //   Exit code: still 0.
+    //
+    // The one thing that is genuinely lost is any `Drop` impl that has a
+    // side effect. Nothing in this shutdown path relies on one, which is why
+    // this is safe today — and why a future `Drop`-based cleanup would be a
+    // silent regression. Use the explicit stop calls above instead.
     use std::io::Write;
     let _ = std::io::stdout().flush();
     unsafe { libc::_exit(0) };

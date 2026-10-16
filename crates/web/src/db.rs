@@ -1044,9 +1044,39 @@ pub async fn init_pool(path: &str) -> Result<SqlitePool> {
     Ok(pool)
 }
 
+/// Apply the `users` / `sessions` schema to a connection.
+///
+/// The DDL is migration `003`, included rather than copied so the migration
+/// file stays the single source of truth — the whole reason the crate's
+/// `migrations/` directory exists.
+///
+/// Idempotent: every statement is `CREATE TABLE IF NOT EXISTS`, so calling
+/// this on an already-migrated database is a no-op.
+pub fn apply_auth_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("../../../migrations/003_users_sessions.sql"))
+        .context("Failed to initialize auth tables")?;
+    Ok(())
+}
+
 /// Initialize the blocking Connection for the security crate.
 ///
-/// This is used for blocking rusqlite operations (auth, sessions).
+/// This is used for blocking rusqlite operations (auth, sessions) on the same
+/// file the sqlx pool owns. Two connections to one SQLite file in WAL mode is
+/// supported, and both set a busy timeout, so writes serialise rather than
+/// fail — but that only holds if both sides agree on the schema.
+///
+/// They now agree by construction: this function applies the auth schema
+/// itself rather than assuming someone else already did.
+///
+/// It used to assume that, and the assumption had a real failure mode. The
+/// main path happens to be safe (`init_pool` runs the migrations, and returns
+/// before this is called), but `--reset-password` calls this *alone* against
+/// whatever path the operator names. On a machine with no database yet that
+/// created an empty file, and the very next query died with
+/// `no such table: users` — reported as a failed password reset, with a SQL
+/// error the operator has no way to interpret, and an empty `.db` left behind
+/// as evidence. Making the function self-sufficient removes the ordering
+/// dependency entirely rather than documenting it.
 pub fn init_auth_db(path: &str) -> Result<Connection> {
     let conn = Connection::open(path).context("Failed to open SQLite database for auth")?;
 
@@ -1055,6 +1085,8 @@ pub fn init_auth_db(path: &str) -> Result<Connection> {
 
     conn.execute_batch("PRAGMA busy_timeout=5000;")
         .context("Failed to set busy timeout")?;
+
+    apply_auth_schema(&conn)?;
 
     Ok(conn)
 }
@@ -1736,12 +1768,11 @@ pub async fn create_test_dbs() -> (SqlitePool, Arc<Mutex<rusqlite::Connection>>)
         .expect("Failed to create test pool");
 
     // Create in-memory connection for auth operations. The users/sessions
-    // schema (migration 003) lives on this connection — apply it here so
-    // every consumer gets a usable auth DB (single source of truth).
+    // schema lives on this connection. `apply_auth_schema` is the same call
+    // production `init_auth_db` makes, so a test can no longer pass against a
+    // schema that differs from the one the service runs on.
     let auth_conn = rusqlite::Connection::open_in_memory().expect("Failed to create test auth db");
-    auth_conn
-        .execute_batch(include_str!("../../../migrations/003_users_sessions.sql"))
-        .expect("Failed to apply auth schema (003) to test auth db");
+    apply_auth_schema(&auth_conn).expect("Failed to apply auth schema to test auth db");
     let auth_db = Arc::new(Mutex::new(auth_conn));
 
     (pool, auth_db)
@@ -1754,6 +1785,105 @@ pub async fn create_test_dbs() -> (SqlitePool, Arc<Mutex<rusqlite::Connection>>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch path under `std::env::temp_dir()`, unique per test.
+    fn scratch_db(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "mibee-auth-{}-{}-{:?}.db",
+            std::process::id(),
+            name,
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// The regression: `init_auth_db` used to assume the sqlx pool had already
+    /// run the migrations. `--reset-password` calls it alone, so on a machine
+    /// with no database the very next query failed with `no such table: users`
+    /// — reported to the operator as a failed password reset.
+    #[test]
+    fn init_auth_db_gives_a_usable_database_with_no_prior_migration() {
+        let path = scratch_db("bare");
+        let conn = init_auth_db(path.to_str().expect("utf-8 path"))
+            .expect("init_auth_db must succeed on a fresh path");
+
+        // Every statement the auth paths issue must work.
+        let users: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .expect("users table must exist without a prior run_migrations");
+        assert_eq!(users, 0);
+
+        let token = security::auth::create_session(&conn, "admin").expect("create session");
+        let valid = security::auth::validate_session(&conn, &token).expect("validate");
+        assert_eq!(valid.as_deref(), Some("admin"));
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// Idempotent, because the main path calls it against a file the sqlx
+    /// migration runner has already migrated.
+    #[test]
+    fn init_auth_db_is_idempotent_against_an_already_migrated_file() {
+        let path = scratch_db("twice");
+        {
+            init_auth_db(path.to_str().expect("utf-8 path")).expect("first open");
+        }
+        let conn = init_auth_db(path.to_str().expect("utf-8 path")).expect("second open");
+        let users: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .expect("users survives a second init");
+        assert_eq!(users, 0);
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// Both stacks must agree on the schema, since they share one file. A
+    /// user created through the rusqlite side has to be visible to a query
+    /// through the sqlx pool.
+    #[tokio::test]
+    async fn both_stacks_see_the_same_users_table() {
+        let path = scratch_db("dual");
+        let path_str = path.to_str().expect("utf-8 path").to_string();
+
+        // sqlx side first — this is the order the service boots in.
+        let pool = init_pool(&path_str).await.expect("sqlx pool");
+        let conn = init_auth_db(&path_str).expect("rusqlite conn");
+
+        conn.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?1, ?2)",
+            rusqlite::params!["admin", "hash"],
+        )
+        .expect("insert via rusqlite");
+
+        let via_sqlx: String =
+            sqlx::query_scalar("SELECT username FROM users WHERE username = 'admin'")
+                .fetch_one(&pool)
+                .await
+                .expect("sqlx must see the row written by rusqlite");
+        assert_eq!(via_sqlx, "admin");
+
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('ops', 'h')")
+            .execute(&pool)
+            .await
+            .expect("insert via sqlx");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+            .expect("rusqlite must see the row written by sqlx");
+        assert_eq!(count, 2, "both stacks share one file and one schema");
+
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
 
     /// Create an in-memory database pool for testing.
     async fn test_pool() -> SqlitePool {

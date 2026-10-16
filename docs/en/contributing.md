@@ -86,7 +86,7 @@ mibee-eye/
 │  └─ types.rs            # Core domain types (CameraId, StreamId, CameraType)
 ├─ crates/                # Workspace crates
 │  ├─ protocols/         # Media plane: RTSP server, RTMP push, RTP, H.264, RTCP (signaling lives in the shared protocol libraries)
-│  ├─ streaming/         # StreamHub fan-out, CaptureSource, Output adapters, MiBee client
+│  ├─ streaming/         # StreamHub fan-out, CaptureSource, Output adapters
 │  ├─ web/              # Axum REST API + embedded SPA + TLS + i18n + ProtocolRuntime
 │  ├─ security/         # Auth, TLS, rate limiting, CSRF, password hashing
 │  ├─ capture/           # Video (nokhwa) + Audio (cpal) + hot-plug (udev)
