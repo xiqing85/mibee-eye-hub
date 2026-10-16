@@ -77,8 +77,17 @@ fn default_onvif_serial() -> String {
 fn default_onvif_firmware() -> String {
     "1.0.0".into()
 }
+/// Default ONVIF device service port.
+///
+/// This is the SOAP/HTTP port advertised in XAddrs. It was 3702, which is the
+/// **WS-Discovery** port — the value every device got in its config document
+/// while the service actually served 8080, because the runtime builder
+/// hardcoded `ONVIF_HTTP_PORT` and never read this field. So the key was a
+/// no-op and its default named the wrong protocol's port. Both are fixed
+/// together; see `build_onvif_config_from_json` for the legacy-value mapping
+/// that keeps existing deployments on 8080.
 fn default_onvif_port() -> u16 {
-    3702
+    8080
 }
 
 impl Default for OnvifConfig {
@@ -90,7 +99,11 @@ impl Default for OnvifConfig {
             model: "Rec-01".into(),
             serial: "NC00000001".into(),
             firmware_version: "1.0.0".into(),
-            port: 3702,
+            // Must agree with `default_onvif_port()` and with the port the
+            // runtime binds. These were three separate literals and only one
+            // of them was real; `the_config_default_is_the_port_actually_served`
+            // now fails if they drift apart again.
+            port: default_onvif_port(),
             events_enabled: true,
             media2_enabled: true,
             http_digest: false,

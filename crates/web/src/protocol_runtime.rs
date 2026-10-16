@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use serde::Serialize;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
@@ -31,6 +31,11 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// ONVIF device HTTP service port (SOAP endpoint advertised in XAddrs).
 const ONVIF_HTTP_PORT: u16 = 8080;
+
+/// The value the old `protocols.onvif.port` default wrote (the WS-Discovery
+/// UDP port). Mapped back to [`ONVIF_HTTP_PORT`] when read — see
+/// `build_onvif_config_from_json`.
+const LEGACY_DISCOVERY_PORT_AS_DEFAULT: u16 = 3702;
 
 /// Default RTSP server port used in stream URLs.
 const RTSP_PORT: u16 = 8554;
@@ -116,6 +121,13 @@ pub fn build_onvif_config_from_json(
             .unwrap_or(default)
             .to_string()
     };
+    let get_u16 = |key: &str, default: u16| {
+        db_config
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u16)
+            .unwrap_or(default)
+    };
     let get_u32 = |key: &str, default: u32| {
         db_config
             .get(key)
@@ -167,7 +179,20 @@ pub fn build_onvif_config_from_json(
             name: model.clone(),
             model,
         },
-        onvif_port: ONVIF_HTTP_PORT,
+        // Honour `protocols.onvif.port` — it used to be ignored, so the
+        // settings page showed a value the device never used.
+        //
+        // `3702` is mapped back to the SOAP port for existing data. It is the
+        // old default, which named the WS-Discovery UDP port, so every
+        // deployment that never deliberately touched this key has it sitting
+        // in its config document and in the DB settings row. Treating it as a
+        // real choice would silently move SOAP off 8080 — the port every NVR
+        // is configured against, and the one this device has always served.
+        // Anything else the operator sets is taken at face value.
+        onvif_port: match get_u16("port", ONVIF_HTTP_PORT) {
+            0 | LEGACY_DISCOVERY_PORT_AS_DEFAULT => ONVIF_HTTP_PORT,
+            port => port,
+        },
         events_enabled: get_bool("events_enabled", true),
         media2_enabled: get_bool("media2_enabled", true),
         http_digest: get_bool("http_digest", false),
@@ -983,22 +1008,42 @@ impl ProtocolRuntime {
         );
 
         let mut shutdown_rx = shutdown_rx;
+        // Readiness channel. `start()` binds the listener, and only the task
+        // can know whether that succeeded — so the task reports back before
+        // the caller claims the protocol started.
+        //
+        // Without this the log said "ONVIF protocol started" unconditionally
+        // and *then* logged a bind error, which reads as a contradiction and
+        // tells the operator the opposite of the truth. It also made
+        // `start_onvif` return `Ok(())` on a failed bind, so the hot-restart
+        // supervisor retried a port the previous generation still held —
+        // a 27-second error loop that only stopped because something else
+        // released the socket.
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
         let handle = tokio::spawn(async move {
             tracing::info!(
                 port = soap_port,
                 "ONVIF SOAP + WS-Discovery starting (onvif-rs)"
             );
+            // start() resolves as soon as the accept loop is spawned and its
+            // handle's Drop stops the server — awaiting the handle here is
+            // what keeps the task (and the server) alive.
+            let server = match soap.start().await {
+                Ok(server) => {
+                    let _ = ready_tx.send(Ok(()));
+                    server
+                }
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    tracing::error!(error = %e, "ONVIF SOAP server error");
+                    let _ = ready_tx.send(Err(msg.clone()));
+                    return;
+                }
+            };
             tokio::select! {
-                // start() resolves as soon as the accept loop is spawned and
-                // its handle's Drop stops the server — awaiting the handle
-                // here is what keeps the task (and the server) alive.
-                res = soap.start() => match res {
-                    Ok(server) => {
-                        let _ = server.await;
-                        tracing::info!("ONVIF SOAP server exited");
-                    }
-                    Err(e) => tracing::error!(error = %e, "ONVIF SOAP server error"),
-                },
+                _ = server => {
+                    tracing::info!("ONVIF SOAP server exited");
+                }
                 _ = shutdown_rx.changed() => {
                     tracing::info!("ONVIF graceful shutdown signal received");
                 }
@@ -1015,6 +1060,42 @@ impl ProtocolRuntime {
 
         // SOAP task is the tracked lifecycle handle; discovery is aborted
         // alongside it by the same stop path.
+        // Only claim success once the listener is actually up. `start()`
+        // binds and returns, so this is normally milliseconds; the bound is
+        // there to stop a wedged task from hanging the caller, and hitting
+        // it is a failure rather than an unknown-but-assumed-fine.
+        match tokio::time::timeout(std::time::Duration::from_secs(10), ready_rx).await {
+            // Reported in: bound and listening.
+            Ok(Ok(Ok(()))) => {}
+            // Reported in: the bind itself failed.
+            Ok(Ok(Err(msg))) => {
+                handle.abort();
+                return Err(anyhow::anyhow!("ONVIF SOAP listener failed to bind: {msg}"));
+            }
+            // The task ended without reporting at all; nothing is listening.
+            Ok(Err(_)) => {
+                handle.abort();
+                return Err(anyhow::anyhow!(
+                    "ONVIF SOAP server task exited before the listener was up"
+                ));
+            }
+            // Not knowing is not knowing. A timeout must not fall through to
+            // the success path, or the whole point of this change is lost —
+            // and it is exactly what happened on a loaded CI runner, where
+            // scheduling pushed the bind past 5 s and the function returned
+            // `Ok` for a port it had not yet (and would not) acquire.
+            //
+            // Failing here is the right trade: the supervisor retries, and a
+            // retry against a genuinely free port succeeds. Reporting success
+            // for a listener that never came up does not recover.
+            Err(_) => {
+                handle.abort();
+                return Err(anyhow::anyhow!(
+                    "ONVIF SOAP listener did not report readiness within 10s"
+                ));
+            }
+        }
+
         self.onvif_handle = Some(handle);
         self.discovery_handle = Some(discovery_handle);
         tracing::info!("ONVIF protocol started");
@@ -2080,11 +2161,101 @@ mod tests {
         assert!(result.starts_with("127."));
     }
 
+    /// `protocols.onvif.port` has to reach the listener.
+    ///
+    /// It used to be a dead key: the builder hardcoded `ONVIF_HTTP_PORT`, so
+    /// the settings page rendered a value the device never used, accepted an
+    /// edit, persisted it, and served on a different port than the one on
+    /// screen. Found while testing the readiness handshake below — that test
+    /// passed locally and failed in CI precisely because it was occupying a
+    /// port the server never looked at.
+    #[test]
+    fn build_onvif_config_honours_the_configured_port() {
+        let cfg = build_onvif_config_from_json(
+            &serde_json::json!({ "enabled": true, "port": 18080 }),
+            "onvif",
+        );
+        assert_eq!(cfg.onvif_port, 18080, "a chosen SOAP port must be used");
+    }
+
+    /// The old default named the WS-Discovery UDP port, so every deployment
+    /// that never touched the key still has `3702` in its config document and
+    /// settings row. Honouring it literally would move SOAP off 8080 — the
+    /// port every NVR is configured against, and the one this device has
+    /// always served — with no way for an operator to have meant that.
+    #[test]
+    fn build_onvif_config_maps_the_legacy_discovery_port_back_to_soap() {
+        for legacy in [3702, 0] {
+            let cfg = build_onvif_config_from_json(
+                &serde_json::json!({ "enabled": true, "port": legacy }),
+                "onvif",
+            );
+            assert_eq!(
+                cfg.onvif_port, ONVIF_HTTP_PORT,
+                "legacy/absent port {legacy} must resolve to the SOAP port"
+            );
+        }
+        // Absent entirely.
+        let cfg = build_onvif_config_from_json(&serde_json::json!({ "enabled": true }), "onvif");
+        assert_eq!(cfg.onvif_port, ONVIF_HTTP_PORT);
+    }
+
+    /// A default that disagrees with what the service serves is the deeper
+    /// half of the same defect: the key was a no-op *and* its default named
+    /// another protocol's port.
+    #[test]
+    fn the_config_default_is_the_port_actually_served() {
+        assert_eq!(
+            crate::config::OnvifConfig::default().port,
+            ONVIF_HTTP_PORT,
+            "the shipped default must be the SOAP port the device binds"
+        );
+    }
+
     #[tokio::test]
     async fn test_stop_onvif_when_not_running_is_noop() {
         let mut rt = ProtocolRuntime::new();
         rt.stop_onvif().await; // should not panic
         assert!(!rt.status().onvif.running);
+    }
+
+    /// `start_onvif` must not claim success on a port it cannot bind.
+    ///
+    /// It used to log "ONVIF protocol started" unconditionally, straight after
+    /// spawning the task that does the binding — so the operator saw success
+    /// and then a bind error, in that order, and the function returned `Ok`
+    /// either way. The hot-restart supervisor then retried a port the previous
+    /// generation still held, producing a 27-second `EADDRINUSE` loop that
+    /// only ended when something else released the socket.
+    ///
+    /// Occupied by a real listener here, so the bind genuinely cannot succeed.
+    #[tokio::test]
+    async fn start_onvif_reports_a_port_it_cannot_bind() {
+        // Hold the port the runtime is about to try.
+        let squatter = std::net::TcpListener::bind("0.0.0.0:0").expect("bind squatter");
+        let port = squatter.local_addr().expect("addr").port();
+
+        let mut rt = ProtocolRuntime::new();
+        let config = build_onvif_config_from_json(
+            &serde_json::json!({ "enabled": true, "port": port }),
+            "onvif",
+        );
+        let result = rt
+            .start_onvif(
+                config,
+                Arc::new(crate::stream_manager::StreamManager::new()),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "binding an occupied port must be reported as a failure, not as \
+             'ONVIF protocol started' (got: {result:?})"
+        );
+        assert!(
+            !rt.status().onvif.running,
+            "a failed bind must not leave the runtime reporting ONVIF as up"
+        );
     }
 
     #[tokio::test]

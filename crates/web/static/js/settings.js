@@ -245,8 +245,26 @@ function collectConfig() {
 }
 
 function maybeNum(v) {
+  if (v === '' || typeof v !== 'string') return v;
   const n = Number(v);
-  return (v === '' || isNaN(n)) ? v : n;
+  if (isNaN(n)) return v;
+  // Only narrow to a number when doing so cannot change the value.
+  //
+  // GB/T 28181 identifiers are 20 digits. `Number("34020000001320000021")`
+  // is 34020000001320000000 — past Number.MAX_SAFE_INTEGER (16 digits), so
+  // the last digit is silently dropped and the value is emitted as a *number*
+  // where the config schema declares a string. The device then rejects the
+  // whole PUT with a type error, which is how this was found: saving an
+  // unrelated setting in the UI would break GB28181 registration.
+  //
+  // The test is integer-digit count rather than string equality, because
+  // "1.50" is also lossless (1.5) and must still reach a numeric schema as a
+  // number, while "007" is an identifier convention and must not. Digit count
+  // separates those two without a field list, so a new identifier-shaped key
+  // is safe by construction.
+  const intDigits = v.replace(/^[+-]/, '').split(/[.eE]/)[0].replace(/^0+(?=\d)/, '');
+  if (intDigits.length > 15) return v;
+  return n;
 }
 
 function markDirty(ev) {

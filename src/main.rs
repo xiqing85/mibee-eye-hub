@@ -295,15 +295,28 @@ async fn main() -> anyhow::Result<()> {
     // Apply the plan: a non-admitted enabled feature is turned off in the
     // config copy every engine reads — the engines' own fail-open logs
     // then explain it exactly like a config-disabled feature.
+    let mut accounted_mib: u64 = 0;
     for d in &resource_profile.features {
-        if d.admitted || d.reason != streaming::feature_gate::REASON_OFF_BUDGET {
+        if d.admitted {
+            accounted_mib = accounted_mib.saturating_add(d.cost_mib);
             continue;
         }
+        if d.reason != streaming::feature_gate::REASON_OFF_BUDGET {
+            continue;
+        }
+        // `accounted_mib` is what earlier, higher-priority features already
+        // consumed. Without it this line reads as a contradiction — the
+        // observed pair was `cost_mib: 1784, budget_mib: 6388`, which looks
+        // like it should have fit, and an operator debugging a missing VLM
+        // would reasonably conclude the gate is broken. The admission test is
+        // `accounted + cost <= budget`, so that is the arithmetic to show.
         tracing::warn!(
             feature = d.name,
             cost_mib = d.cost_mib,
+            accounted_mib,
             budget_mib = resource_profile.budget_mib,
-            "resource gate: feature shed by boot memory budget"
+            "resource gate: feature shed by boot memory budget \
+             (earlier features already account for {accounted_mib} MiB)"
         );
         match d.name {
             "ai" => config.ai.enabled = false,

@@ -88,9 +88,12 @@ function appendTurn(turn) {
       engine: turn.engine,
       thinking,
       tools,
+      interrupted: !!turn.interrupted,
     });
     history.push({ role: 'user', content: turn.user_text || '' });
     history.push({ role: 'assistant', content: turn.reply_text });
+  } else if (turn.interrupted) {
+    appendInterrupted(turn, thinking);
   } else {
     appendNoReply(turn);
   }
@@ -115,6 +118,29 @@ function appendNoReply(turn) {
   row.appendChild(wrap);
   log.appendChild(row);
   log.scrollTop = log.scrollHeight;
+}
+
+/// Interrupted before any sentence played (SPEC §3.4 `interrupted`,
+/// reply_text null): show the interrupt badge + thinking drawer.
+function appendInterrupted(turn, thinking) {
+  const log = $('chat-log');
+  if (!log) return;
+  log.querySelectorAll('.chat-hints').forEach((n) => n.remove());
+  const row = document.createElement('div');
+  row.className = 'chat-row theirs';
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-bubble-wrap';
+  const badge = document.createElement('span');
+  badge.className = 'state-pill off';
+  badge.textContent = t('chatInterrupted');
+  badge.title = t('chatInterruptedTitle');
+  wrap.appendChild(badge);
+  if (thinking.length) attachThinking(wrap, thinking);
+  row.appendChild(avatar('theirs'));
+  row.appendChild(wrap);
+  log.appendChild(row);
+  log.scrollTop = log.scrollHeight;
+  updateCount();
 }
 
 function avatar(side) {
@@ -153,6 +179,13 @@ function appendBubble(role, text, opts = {}) {
     badge.className = 'chat-badge scene';
     badge.textContent = t('chatGroundedScene');
     badge.title = t('chatGroundedSceneTitle');
+    bubble.appendChild(badge);
+  }
+  if (!mine && opts.interrupted) {
+    const badge = document.createElement('span');
+    badge.className = 'chat-badge vlm';
+    badge.textContent = t('chatInterrupted');
+    badge.title = t('chatInterruptedTitle');
     bubble.appendChild(badge);
   }
   if (!mine && opts.engine) {
