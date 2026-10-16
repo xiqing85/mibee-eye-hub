@@ -22,7 +22,7 @@ mibee-eye/
 ├─ crates/
 │  ├─ capture/         # Video (nokhwa) + Audio (cpal) + hot-plug (udev)
 │  ├─ protocols/       # RTSP server, RTMP push, ONVIF, GB28181, RTP, H.264, RTCP
-│  ├─ streaming/       # StreamHub fan-out, CaptureSource adapter, Output adapters, MiBee client
+│  ├─ streaming/       # StreamHub fan-out, CaptureSource adapter, Output adapters
 │  ├─ web/             # Axum REST API + embedded SPA + TLS + i18n + ProtocolRuntime
 │  ├─ security/        # Auth (bcrypt sessions), TLS (rustls), rate limiting, CSRF, password hashing
 │  └─ observability/   # tracing + OTel + Prometheus + Loki log shipping

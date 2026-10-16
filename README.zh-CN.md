@@ -25,7 +25,6 @@
 - **接地对话（SPEC 附录 A #29/#35）** — 每轮回答都知道相机当前看到什么（实时检测 + VLM 告警描述）、本地时钟与系统状态，可选注入天气；`vision:true` 把新鲜帧交给端侧 VLM 看图直答；配置云端后对话云优先、失败回落本地（`engine` 披露实际路径）
 - **告警智能** — 告警画面的视觉-语言描述（Qwen3-VL 经 llama.cpp mtmd），异步 `alarm_description` SSE，绝不延迟告警本身；单飞调度 + 描述间隔下限
 - **H.264 / H.265** — 手写 NAL 单元解析器、关键帧检测、SPS/PPS 提取
-- **MiBee NVR 集成** — REST API 客户端、摄像头同步、SSE 事件流
 - **Web 界面** — Axum REST API + 嵌入式 SPA、TLS 通过 rustls、基于会话的身份认证、双语（zh-CN / en-US）、日/夜间主题
 - **本地录制** — MP4 分段归档，自动清理，可按摄像头配置
 - **浏览器预览** — MJPEG 多部分实时流、JPEG 快照端点、fMP4/MSE H.264 直播（`stream.mse`），可选低分辨率省流子码流（`stream.sub.mse`、RTSP `/live/{id}/sub`、ONVIF `sub` Profile —— 每相机 `config.substream`，SPEC 附录 A #20）
@@ -40,14 +39,18 @@
 
 ### Crate 职责
 
+代码行数为当前代码树的实测值（`grep -v '^\s*\(//\|/\*\|\*\)' | grep -v '^\s*$'`，
+排除空行与注释）——此前的数字最多偏差 8 倍。
+
 | Crate | 代码行数 | 作用 |
 |-------|---------|------|
-| `protocols` | ~11k | 媒体面协议实现：RTSP、RTMP、RTP、H.264（信令协议来自共享协议库） |
-| `streaming` | ~4k | StreamHub 扇出编排器（到 Web 预览、文件输出、RTSP、RTMP、ONVIF、GB28181）、源/输出适配器、MiBee NVR 客户端 |
-| `web` | ~2.5k | Axum REST API + 嵌入式 SPA + 通过 rustls 的 TLS + 国际化 + 主题 |
-| `security` | ~1.9k | 基于会话的身份认证、速率限制、CSRF 保护、加密 |
-| `capture` | ~800 | 视频（nokhwa）+ 音频（cpal）设备包装器 |
-| `observability` | ~423 | 结构化追踪、OpenTelemetry 导出、Prometheus 指标、Loki 远程日志发送 |
+| `web` | ~21k | Axum REST API、约 40 个路由模块、嵌入式 SPA、TLS、国际化、主题 |
+| `streaming` | ~18k | StreamHub 扇出编排器（到 Web 预览、文件输出、RTSP、RTMP、ONVIF、GB28181）、源/输出适配器、进程内 OpenH264/AAC 编解码栈，以及整个 AI 面（检测、声音事件、ASR、LLM、VLM、TTS、人脸、OCR、决策辅助） |
+| `protocols` | ~6.5k | 媒体面协议实现：RTSP、RTMP、RTP、H.264（信令协议来自共享协议库） |
+| 根包（`src/`） | ~5.1k | 二进制入口：配置、语音/对话桥、离家监控、桌面集成 |
+| `security` | ~1.8k | 基于会话的身份认证、速率限制、CSRF 保护、加密 |
+| `observability` | ~1.4k | 结构化追踪、OpenTelemetry 导出、Prometheus 指标、Loki 远程日志发送 |
+| `capture` | ~1.4k | 视频（nokhwa）+ 音频（cpal）设备包装器 |
 
 ## 架构
 

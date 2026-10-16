@@ -23,7 +23,6 @@ Part of the **MiBee Eye** camera family: [mibee-eye-rs](https://github.com/xiqin
 - **Grounded dialogue (SPEC appendix A #29/#35)** — every answer knows what the camera sees (live detections + VLM alarm descriptions), the local clock/system state, and optionally the weather; `vision:true` asks a fresh frame to the on-device VLM; with cloud AI configured the chat goes cloud-first with local fallback (`engine` discloses the path)
 - **Alarm intelligence** — vision-language descriptions of alarm frames (Qwen3-VL via llama.cpp mtmd) as async `alarm_description` SSE, never delaying the alarm; single-flight scheduling with an inter-description floor
 - **H.264 / H.265** — hand-written NAL unit parser, keyframe detection, SPS/PPS extraction
-- **MiBee NVR integration** — REST API client, camera sync, SSE event stream
 - **Web UI** — Axum REST API + embedded SPA, TLS via rustls, session-based auth, bilingual (zh-CN / en-US), day/night theme
 - **Local recording** — MP4 segment archive with auto-prune, configurable per-camera
 - **Browser preview** — MJPEG multipart live stream, JPEG snapshot endpoint, fMP4/MSE H.264 delivery (`stream.mse`) with an optional low-resolution bandwidth-saving substream (`stream.sub.mse`, RTSP `/live/{id}/sub`, ONVIF `sub` profile — per-camera `config.substream`, SPEC appendix A #20)
@@ -38,14 +37,18 @@ Part of the **MiBee Eye** camera family: [mibee-eye-rs](https://github.com/xiqin
 
 ### Crate Responsibilities
 
+Counts are non-blank, non-comment lines (`grep -v '^\s*\(//\|/\*\|\*\)' | grep -v '^\s*$'`),
+measured on the current tree — the previous values here were off by up to 8x.
+
 | Crate | LOC | Role |
 |-------|-----|------|
-| `protocols` | ~11k | Media-plane protocol implementations: RTSP, RTMP, RTP, H.264 (signaling protocols come from the shared protocol libraries) |
-| `streaming` | ~4k | StreamHub fan-out orchestrator (to Web Preview, File Output, RTSP, RTMP, ONVIF, GB28181), source/output adapters, MiBee NVR client |
-| `web` | ~2.5k | Axum REST API + embedded SPA + TLS via rustls + i18n + theme |
-| `security` | ~1.9k | Session-based auth, rate limiting, CSRF protection, encryption |
-| `capture` | ~800 | Video (nokhwa) + Audio (cpal) device wrappers |
-| `observability` | ~423 | Structured tracing, OpenTelemetry export, Prometheus metrics, Loki remote log shipping |
+| `web` | ~21k | Axum REST API, ~40 route modules, embedded SPA, TLS, i18n, theme |
+| `streaming` | ~18k | StreamHub fan-out orchestrator (to Web Preview, File Output, RTSP, RTMP, ONVIF, GB28181), source/output adapters, in-process OpenH264/AAC codec stack, and the whole AI surface (detection, audio events, ASR, LLM, VLM, TTS, face, OCR, decision assist) |
+| `protocols` | ~6.5k | Media-plane protocol implementations: RTSP, RTMP, RTP, H.264 (signaling protocols come from the shared protocol libraries) |
+| root (`src/`) | ~5.1k | Binary entry: config, the voice/dialogue bridge, the away monitor, desktop integration |
+| `security` | ~1.8k | Session-based auth, rate limiting, CSRF protection, encryption |
+| `observability` | ~1.4k | Structured tracing, OpenTelemetry export, Prometheus metrics, Loki remote log shipping |
+| `capture` | ~1.4k | Video (nokhwa) + Audio (cpal) device wrappers |
 
 ## Architecture
 
@@ -92,7 +95,7 @@ mibee-eye/
 ├─ src/                # Binary entry, config, types, error
 ├─ crates/
 │  ├─ protocols/       # RTSP, RTMP, ONVIF, GB28181, RTP, H.264
-│  ├─ streaming/       # StreamHub fan-out, source/output adapters, MiBee client
+│  ├─ streaming/       # StreamHub fan-out, source/output adapters
 │  ├─ web/             # Axum REST API + embedded SPA + TLS
 │  ├─ security/        # Auth, TLS, encryption, rate limiting
 │  ├─ capture/         # Video + Audio capture wrappers

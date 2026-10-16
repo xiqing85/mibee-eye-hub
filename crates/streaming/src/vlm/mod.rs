@@ -606,87 +606,88 @@ mod tests {
 
     /// A restore that the kernel refuses must be *reported*, never swallowed.
     ///
-    /// This is the assertion that catches the production bug, and unlike the
-    /// end-to-end version above it works on any host. The failure it models is
-    /// exactly what an unprivileged service hits: it demoted itself from nice
-    /// 0 to 5, and restoring to 0 means asking for a higher priority, which
-    /// needs `CAP_SYS_NICE`. The old code discarded the return value, so the
-    /// thread kept its demotion for life and the wake-word work sharing that
-    /// pooled thread ran at low priority from then on — the exact starvation
-    /// the demotion was added to prevent.
+    /// This is the assertion that catches the production bug: the old code
+    /// discarded `setpriority`'s return value, so a failed restore and a
+    /// successful one looked identical from the outside, and an unprivileged
+    /// service silently kept its demotion for the life of the process.
     ///
-    /// Here the guard is constructed with an unreachable `original`, so the
-    /// restore is guaranteed to be refused on a host without privileges, and
-    /// the test asserts the refusal is visible.
+    /// It deliberately asserts only on the *reporting*, never on the thread's
+    /// ambient nice value. An earlier version of this test did check the nice
+    /// value and was flaky: the process priority is ambient state that other
+    /// threads in the test binary can move, and whether a given
+    /// `setpriority` succeeds depends on the privilege of whoever happens to
+    /// be running — so the assertion measured the environment, not the code.
+    /// The same trap has already been sprung twice in this crate (a shared
+    /// static rate-limit table, and the process environment), which is why the
+    /// third test of that shape tests the logic and leaves the ambient state
+    /// alone.
     #[test]
     #[cfg(feature = "vlm")]
     fn an_unreachable_restore_is_reported_not_swallowed() {
-        let nice = || unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-        let current = nice();
-
-        // Demote for real, then rewrite the remembered original to a value
-        // that can only be reached by raising priority.
-        let Some(mut guard) = NiceGuard::demote(current + 1) else {
-            // Host forbids demotion at all; the reporting path is still
-            // exercised directly below.
-            guard_unreachable_restore_directly();
-            return;
-        };
-        guard.original = current - 1;
-
-        let ok = guard.restore();
-        assert!(
-            !ok,
-            "restoring to a higher priority without CAP_SYS_NICE must report \
-             failure, not be treated as success"
-        );
-        // A second attempt is a no-op that keeps reporting the truth rather
-        // than claiming success on a retry that never happened.
-        assert!(
-            !guard.restore(),
-            "a still-failed restore must keep reporting false"
-        );
-        // And the thread is where the kernel left it — the demotion stands.
-        assert_eq!(nice(), current + 1);
-    }
-
-    /// Build a guard that never touched the thread, to exercise the reporting
-    /// path on hosts that forbid demotion.
-    #[cfg(feature = "vlm")]
-    fn guard_unreachable_restore_directly() {
         let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        // A target *below* the current nice means asking for a higher
+        // priority, which an unprivileged process cannot do. If this host
+        // happens to be privileged the syscall will succeed, so the test
+        // accepts either outcome and only insists the result is truthful.
+        let target = current - 1;
         let mut guard = NiceGuard {
-            original: current - 1,
+            original: target,
             restored: false,
         };
-        assert!(
-            !guard.restore(),
-            "an impossible restore must report failure"
+
+        let reported = guard.restore();
+        let after = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        assert_eq!(
+            reported,
+            after == target,
+            "restore() reported {reported} but the thread ended at {after}              having asked for {target} — the return value must reflect what              the kernel actually did"
+        );
+
+        // A second call must not flip the verdict to success on a retry that
+        // either did nothing or repeated the same failure.
+        let again = guard.restore();
+        assert_eq!(
+            again, reported,
+            "a repeated restore must keep reporting the same outcome"
         );
     }
 
-    /// The guard must never claim a demotion it did not perform.
+    /// A returned guard must imply a *real* demotion.
     ///
-    /// `demote` returning `None` is the "the kernel said no" path. If that
-    /// ever returned a guard anyway, every caller would believe the thread was
-    /// de-prioritised when it was not — the mitigation would silently do
-    /// nothing, which is indistinguishable from it working until the VLM
-    /// starts starving the wake word again.
+    /// If `demote` ever handed back a guard when the kernel had refused, every
+    /// caller would believe the thread was de-prioritised when it was not — the
+    /// mitigation would silently do nothing, which is indistinguishable from it
+    /// working right up until the VLM starts starving the wake word again.
+    ///
+    /// Stated as an invariant rather than a fixed expectation, because whether
+    /// a given `setpriority` succeeds depends on the privilege of whoever is
+    /// running: asking for a *lower* nice number raises priority and needs
+    /// `CAP_SYS_NICE`. On an unprivileged host that is refused and `demote`
+    /// must return `None`; on a privileged one it succeeds and `demote` must
+    /// return a guard. Either way the two must agree, and that is the property
+    /// worth testing.
     #[test]
     #[cfg(feature = "vlm")]
     fn nice_guard_reports_a_refused_demotion_honestly() {
         let nice = || unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
         let before = nice();
-        // Demoting to a *higher* priority (a lower number) than the current
-        // one is exactly the operation an unprivileged process cannot do.
-        // On a host already at nice 0 this must be refused.
-        if before > 0 {
-            assert!(
-                NiceGuard::demote(before - 1).is_none(),
-                "raising priority without CAP_SYS_NICE must be refused, not \
-                 silently reported as applied"
-            );
-            assert_eq!(nice(), before);
+
+        // Below -20 is clamped to -20 by the kernel, which is still a raise
+        // relative to any realistic nice and therefore still needs privilege.
+        let lease = NiceGuard::demote(before.saturating_sub(1).min(-21));
+        let after = nice();
+        let applied = after != before;
+
+        match (lease, applied) {
+            (None, false) => {}   // refused, and honestly reported as refused
+            (Some(_), true) => {} // applied, and reported
+            (lease, applied) => panic!(
+                "demote() and the kernel disagree: guard={} but priority {} \
+                 -> {} (changed={applied}). A guard must imply a real demotion.",
+                lease.is_some(),
+                before,
+                after
+            ),
         }
     }
 
