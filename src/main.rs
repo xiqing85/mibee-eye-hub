@@ -856,121 +856,19 @@ async fn main() -> anyhow::Result<()> {
     // with the same pinned 2022 standard triple; the description carries
     // the detected class. The microphone is device-level hardware, so the
     // event is attributed to camera "0".
-    {
-        let mut sound_events = audio_ai_engine.subscribe_events();
-        let bridge_tx = event_tx.clone();
-        let notifier_slot = Arc::clone(&notifier_slot);
-        let alarm_notify_gate = Arc::clone(&alarm_notify_gate);
-        let records_pool = pool.clone();
-        let grounding_sound = Arc::clone(&grounding_state);
-        let sound_pool_for_scene = pool.clone();
-        // Away audio link (#44 amendment): sound alarms become away
-        // activity records while armed.
-        let away_for_sound = Arc::clone(&away_engine);
-        let streams_for_sound = Arc::clone(&segment_registry);
-        let desktop_sound_alarm = Arc::clone(&desktop);
-        tokio::spawn(async move {
-            loop {
-                match sound_events.recv().await {
-                    Ok(ev) => {
-                        // Persistent hearing record (SPEC appendix A #24) —
-                        // fail-open: a DB hiccup never touches the alarm
-                        // pipeline. Scene = what the camera saw when the
-                        // sound fired (#30-C).
-                        let camera = web::db::list_cameras(&sound_pool_for_scene)
-                            .await
-                            .ok()
-                            .and_then(|cams| cams.first().map(|c| c.id.clone()));
-                        let scene = camera
-                            .as_deref()
-                            .and_then(|id| grounding_sound.scene_summary(id, ev.timestamp_ms))
-                            .unwrap_or_default();
-                        // Video dimension (#30-C): the MP4 segment covering
-                        // this sound, when the camera is recording.
-                        let media_ref = camera
-                            .as_deref()
-                            .and_then(|id| {
-                                web::stream_manager::StreamManager::segment_covering(
-                                    &streams_for_sound,
-                                    id,
-                                    ev.timestamp_ms,
-                                )
-                            })
-                            .unwrap_or_default();
-                        if let Err(e) = web::db::insert_hearing_record(
-                            &records_pool,
-                            "sound",
-                            &ev.class,
-                            Some(ev.score as f64),
-                            "",
-                            "",
-                            &scene,
-                            &media_ref,
-                            ev.timestamp_ms as i64,
-                        )
-                        .await
-                        {
-                            tracing::warn!(error = %e, "hearing record: insert failed");
-                        }
-                        let _ = bridge_tx.send(web::routes::events::CameraEvent::Alarm {
-                            camera_id: "0".to_string(),
-                            targets: 1,
-                            timestamp_ms: ev.timestamp_ms,
-                            source: "audio".to_string(),
-                            class: Some(ev.class.clone()),
-                            score: Some(ev.score),
-                        });
-                        // Desktop notification (SPEC appendix A #42).
-                        desktop_sound_alarm.notify_alarm("audio", 1, Some(&ev.class));
-                        // Away audio link (#44): one activity record per
-                        // cooldown while armed (observe_audio gates the
-                        // audio_link setting + cooldown internally).
-                        if away_for_sound.is_armed()
-                            && let Some(labels) =
-                                away_for_sound.observe_audio(&ev.class, ev.score, ev.timestamp_ms)
-                        {
-                            mibee_eye::away_monitor::record_audio_event(
-                                &away_for_sound,
-                                &sound_pool_for_scene,
-                                &bridge_tx,
-                                &labels,
-                            )
-                            .await;
-                        }
-                        if alarm_notify_gate.load(std::sync::atomic::Ordering::SeqCst) {
-                            let notifier =
-                                notifier_slot.lock().expect("gb notifier slot lock").clone();
-                            if let Some(n) = notifier {
-                                let description = format!(
-                                    "audio event: {} ({:.2})",
-                                    if ev.label_zh.is_empty() {
-                                        &ev.class
-                                    } else {
-                                        &ev.label_zh
-                                    },
-                                    ev.score
-                                );
-                                let sent = n.send_alarm(
-                                    "4",
-                                    "5",
-                                    &gb28181_rs::client::format_gb_time_ms(ev.timestamp_ms),
-                                    "2",
-                                    &description,
-                                );
-                                if !sent {
-                                    tracing::debug!("alarm notify: no active subscription");
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "audio_ai: SSE bridge lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+    // (M1 slice 6: the block itself lives in runtime::sound_bridge now.)
+    mibee_eye::runtime::sound_bridge::SoundBridge {
+        events: audio_ai_engine.subscribe_events(),
+        bridge_tx: event_tx.clone(),
+        notifier_slot: Arc::clone(&notifier_slot),
+        alarm_notify_gate: Arc::clone(&alarm_notify_gate),
+        pool: pool.clone(),
+        grounding: Arc::clone(&grounding_state),
+        away: Arc::clone(&away_engine),
+        streams: Arc::clone(&segment_registry),
+        desktop: Arc::clone(&desktop),
     }
+    .spawn();
 
     // OCR engine (fail-open: missing models leave it inactive).
     let ocr_engine = Arc::new(streaming::ocr::OcrEngine::from_config(&config.ocr));
