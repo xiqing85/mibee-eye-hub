@@ -1,5 +1,4 @@
 use clap::Parser;
-use mibee_eye::desc_gate::{self, DescDecision};
 
 use protocols::rtsp_server::{RtspServer, RtspServerConfig};
 use std::collections::HashMap;
@@ -56,16 +55,6 @@ struct Args {
     #[arg(long)]
     selftest_meeting: Option<PathBuf>,
 }
-
-/// VLM description admission gate. See `desc_gate` for the full rationale:
-/// single-flight plus a start-to-start floor, with the lease released by
-/// `Drop` so a panicking inference cannot wedge the feature off for the life
-/// of the process — which is exactly what the previous inline
-/// `VLM_DESC_IN_FLIGHT.store(false)` after the call did.
-static VLM_DESC_GATE: desc_gate::DescGate = desc_gate::DescGate::new(VLM_DESC_MIN_INTERVAL_MS);
-/// Minimum spacing between description starts — a description takes
-/// 35–60 s of near-full CPU; this keeps headroom for everything else.
-const VLM_DESC_MIN_INTERVAL_MS: u64 = 120_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -613,237 +602,20 @@ async fn main() -> anyhow::Result<()> {
     // Bridge AI detection events into the SSE event bus (SPEC v1 §6), and
     // fire alarms on detection rising edges (SPEC §6 `alarm` + §9.5.2
     // Alarm NOTIFY when GB28181 is up and the AlarmReport gate allows).
-    {
-        let vlm_engine = Arc::clone(&vlm_engine);
-        let grounding_feed = Arc::clone(&grounding_state);
-        let face_for_ai = Arc::clone(&face_engine);
-        let mut ai_events = ai_engine.subscribe_events();
-        let bridge_tx = event_tx.clone();
-        let mut alarm_bridge =
-            web::alarm::AlarmBridge::new(std::time::Duration::from_secs(alarm_cooldown_secs));
-        let notifier_slot = Arc::clone(&notifier_slot);
-        let alarm_notify_gate = Arc::clone(&alarm_notify_gate);
-        let onvif_events_slot = Arc::clone(&onvif_events_slot);
-        let desktop_ai_alarm = Arc::clone(&desktop);
-        tokio::spawn(async move {
-            loop {
-                match ai_events.recv().await {
-                    Ok(ev) => {
-                        let targets = ev.detections.len();
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let frame_w = ev
-                            .jpeg
-                            .as_deref()
-                            .and_then(web::grounding::jpeg_dimensions)
-                            .map_or(0, |(w, _)| w);
-                        grounding_feed.record_detections(
-                            &ev.camera_id,
-                            now_ms,
-                            frame_w,
-                            &ev.detections,
-                        );
-                        // Face recognition (#33): names + enrollment feed
-                        // on the same frame the detection ran on.
-                        if face_for_ai.is_active()
-                            && let Some(jpeg) = ev.jpeg.clone()
-                        {
-                            let face = Arc::clone(&face_for_ai);
-                            let cam_id = ev.camera_id.clone();
-                            let feed = Arc::clone(&grounding_feed);
-                            tokio::task::spawn_blocking(move || {
-                                let hits = face.match_jpeg(&jpeg);
-                                if !hits.is_empty() {
-                                    let mut named: std::collections::BTreeMap<String, usize> =
-                                        std::collections::BTreeMap::new();
-                                    let mut unknown = 0usize;
-                                    for h in &hits {
-                                        match &h.name {
-                                            Some(n) => {
-                                                *named.entry(n.clone()).or_default() += 1;
-                                            }
-                                            None => unknown += 1,
-                                        }
-                                    }
-                                    let mut text: Vec<String> = named
-                                        .into_iter()
-                                        .map(|(n, c)| format!("{n}×{c}"))
-                                        .collect();
-                                    if unknown > 0 {
-                                        text.push(format!("未识别×{unknown}"));
-                                    }
-                                    let ts = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|d| d.as_millis() as u64)
-                                        .unwrap_or(0);
-                                    feed.record_face_labels(&cam_id, ts, &text.join("、"));
-                                }
-                                // Enrollment feed: any face in frame
-                                // advances the pending session.
-                                let in_session = face.with_registry(|r| {
-                                    r.enrollment_status(face.enroll_frames()).is_some()
-                                });
-                                if in_session {
-                                    let needed = face.enroll_frames();
-                                    if let Ok(emb) = face.embed_jpeg(&jpeg) {
-                                        face.with_registry(|r| {
-                                            r.feed_enroll(emb, needed);
-                                        });
-                                    }
-                                }
-                            });
-                        }
-                        let _ = bridge_tx.send(web::routes::events::CameraEvent::AiDetection {
-                            camera_id: ev.camera_id.clone(),
-                            detections: ev.detections,
-                            frame_number: ev.frame_number,
-                        });
-
-                        if let Some(sig) = alarm_bridge.observe(
-                            &ev.camera_id,
-                            targets,
-                            std::time::Instant::now(),
-                            now_ms,
-                        ) {
-                            let _ = bridge_tx.send(web::routes::events::CameraEvent::Alarm {
-                                camera_id: sig.camera_id.clone(),
-                                targets: sig.targets,
-                                timestamp_ms: sig.timestamp_ms,
-                                source: "ai".to_string(),
-                                class: None,
-                                score: None,
-                            });
-                            // Desktop notification rides the same accepted
-                            // edge (SPEC appendix A #42; no-op headless).
-                            desktop_ai_alarm.notify_alarm("ai", sig.targets, None);
-                            // VLM description of the triggering frame (SPEC
-                            // appendix A #23): the alarm never waits for it —
-                            // the description arrives as its own SSE event.
-                            // Single-flight + a floor between starts: a
-                            // flickering false-positive detection fires rising
-                            // edges every cooldown (30 s) while one
-                            // description takes 35–60 s — without the guard
-                            // they stack into concurrent contexts that
-                            // saturate the CPU (and can OOM-abort the
-                            // process). New triggers during a run or inside
-                            // the floor are dropped, not queued.
-                            if vlm_engine.is_active()
-                                && let Some(jpeg) = ev.jpeg.clone()
-                            {
-                                let (decision, lease) = VLM_DESC_GATE.try_admit(now_ms);
-                                match (decision, lease) {
-                                    (DescDecision::Busy, _) => {
-                                        // Another description is still running —
-                                        // drop this frame (never queue).
-                                        tracing::debug!(
-                                            "vlm: description in flight — alarm frame skipped"
-                                        );
-                                    }
-                                    (DescDecision::Throttled, _) => {
-                                        tracing::debug!(
-                                            "vlm: description throttled — alarm frame skipped"
-                                        );
-                                    }
-                                    (DescDecision::Admitted, Some(lease)) => {
-                                        let vlm = Arc::clone(&vlm_engine);
-                                        let tx = bridge_tx.clone();
-                                        let camera_id = sig.camera_id.clone();
-                                        let alarm_ts = sig.timestamp_ms;
-                                        let grounding_feed = Arc::clone(&grounding_feed);
-                                        tokio::task::spawn_blocking(move || {
-                                            // The lease is moved in and dropped
-                                            // when this closure ends — including
-                                            // on unwind, which is the whole point:
-                                            // the old code released the flag with a
-                                            // `store(false)` *after* the call, so a
-                                            // panicking inference left the gate shut
-                                            // and every later frame was silently
-                                            // skipped for the life of the process.
-                                            let _lease = lease;
-                                            let started = std::time::Instant::now();
-                                            let result = vlm.describe_jpeg(&jpeg);
-                                            match result {
-                                                Ok(description) => {
-                                                    grounding_feed.record_vlm_description(
-                                                        &camera_id,
-                                                        alarm_ts,
-                                                        &description,
-                                                    );
-                                                    let _ = tx.send(
-                                                    web::routes::events::CameraEvent::AlarmDescription {
-                                                        camera_id,
-                                                        alarm_timestamp_ms: alarm_ts,
-                                                        description,
-                                                        elapsed_s: (started
-                                                            .elapsed()
-                                                            .as_secs_f64()
-                                                            * 100.0)
-                                                            .round()
-                                                            / 100.0,
-                                                    },
-                                                );
-                                                }
-                                                Err(e) => tracing::warn!(
-                                                    error = %e,
-                                                    "vlm: description failed"
-                                                ),
-                                            }
-                                        });
-                                    }
-                                    // `Admitted` without a lease is
-                                    // unreachable (the gate hands one out
-                                    // with the decision), but matching it
-                                    // keeps this arm total rather than
-                                    // relying on an `unreachable!`.
-                                    (DescDecision::Admitted, None) => {
-                                        tracing::warn!(
-                                            "vlm: gate admitted without a lease;                                              frame skipped"
-                                        );
-                                    }
-                                }
-                            }
-                            // ONVIF MotionAlarm rides the same accepted
-                            // edge (no NVR subscribed = no-op).
-                            if let Some(events) = onvif_events_slot
-                                .lock()
-                                .expect("onvif events slot lock")
-                                .clone()
-                            {
-                                events.publish_event(web::onvif_alarm::motion_alarm_event(
-                                    &sig.camera_id,
-                                    sig.targets,
-                                ));
-                            }
-                            if alarm_notify_gate.load(std::sync::atomic::Ordering::SeqCst) {
-                                let notifier =
-                                    notifier_slot.lock().expect("gb notifier slot lock").clone();
-                                if let Some(n) = notifier {
-                                    // 2022 standard table: priority 4, video
-                                    // alarm (method 5), motion target (type 2).
-                                    let sent = n.send_alarm(
-                                        "4",
-                                        "5",
-                                        &gb28181_rs::client::format_gb_time_ms(now_ms),
-                                        "2",
-                                        "motion target detected",
-                                    );
-                                    if !sent {
-                                        tracing::debug!("alarm notify: no active subscription");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "ai: SSE bridge lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+    // (M1 slice 3: the block itself lives in runtime::ai_bridge now.)
+    mibee_eye::runtime::ai_bridge::AiBridge {
+        events: ai_engine.subscribe_events(),
+        vlm: Arc::clone(&vlm_engine),
+        grounding: Arc::clone(&grounding_state),
+        face: Arc::clone(&face_engine),
+        bridge_tx: event_tx.clone(),
+        alarm_cooldown_secs,
+        notifier_slot: Arc::clone(&notifier_slot),
+        alarm_notify_gate: Arc::clone(&alarm_notify_gate),
+        onvif_events_slot: Arc::clone(&onvif_events_slot),
+        desktop: Arc::clone(&desktop),
     }
+    .spawn();
 
     // Model manager (SPEC §4.9): the download engine + the boot-time
     // default selection per capability (engine paths matched against the
