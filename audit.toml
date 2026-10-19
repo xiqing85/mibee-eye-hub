@@ -15,5 +15,28 @@
 #   - The attack surface (MySQL cached-password RSA auth) is unreachable.
 # Re-evaluate if sqlx ever makes backend stanzas optional or a fixed rsa
 # ships. Everything else stays loud on purpose.
+#
+# RUSTSEC-2026-0367/0368/0369 — zip 2.x archive-extraction flaws (2026-10-19;
+# the fix line for all three is `>= 9.0.0`). Accepted for this product:
+#   - Build-dependency only: the sole consumer is `sherpa-onnx-sys` 1.13.8's
+#     build script, which unpacks release archives it downloads. zip is never
+#     compiled into a shipped binary (`cargo tree -i zip@2.4.2 -e normal,dev
+#     --target all --features voice` resolves to nothing).
+#   - The patch line is semver-incompatible with the consumer's `zip = "2"`
+#     requirement, so it cannot be taken from this workspace. Cargo
+#     maximises the lockfile version, so any future patched 2.x release is
+#     picked up automatically.
+#   - The flagged flaws (a malicious archive planting symlinks / paths
+#     outside its extraction directory) are a build-machine supply-chain
+#     surface only: they would require attacker control of the sherpa-onnx
+#     release artefacts themselves.
+# Re-evaluate enforced by CI: `tools/check-audit-waiver.sh` re-derives the
+# premise every run and fails the job if zip gains a normal/dev edge, moves
+# past 9.0.0, or vanishes from the lockfile (dead config → remove entries).
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = [
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+]

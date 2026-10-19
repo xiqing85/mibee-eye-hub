@@ -7,7 +7,13 @@
 # which is how the 2026-10-15 "audit clean" claim stayed stale for so long.
 
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = [
+    "RUSTSEC-2023-0071",
+    # zip (build-only, see rationale below — one comment, three advisories)
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+]
 
 # RUSTSEC-2023-0071 — `rsa`, Marvin Attack (timing side-channel key recovery).
 #
@@ -24,3 +30,27 @@ ignore = ["RUSTSEC-2023-0071"]
 # re-derives the justification on every CI run and fails the job if `rsa`
 # becomes reachable for a real target, or if a patched version ships. If that
 # script fails, fix the dependency rather than editing this file.
+
+# RUSTSEC-2026-0367/0368/0369 — `zip` 2.x (archive-extraction flaws; the fix
+# line for all three is `>= 9.0.0`).
+#
+# The only consumer of `zip` in this lockfile is `sherpa-onnx-sys` 1.13.8's
+# BUILD script (`zip::ZipArchive::new` in build.rs, unpacking release archives
+# fetched from the sherpa-onnx project). Verified structurally:
+# `cargo tree -i zip@2.4.2 -e build` shows only that chain, and zip appears in
+# NO normal/dev graph for any target — it is never compiled into a shipped
+# binary. The flagged flaws (malicious archives planting symlinks / paths
+# outside their extraction directory) are therefore a build-machine,
+# supply-chain surface only: they would require attacker control of the
+# sherpa-onnx release artefacts themselves.
+#
+# The patch line (9.0.0) is semver-incompatible with the consumer's requirement
+# (`sherpa-onnx-sys` requests `zip = "2"`), so it cannot be taken from this
+# workspace. Cargo maximises the lockfile version, so any future PATCHED 2.x
+# release is picked up automatically without any action here.
+#
+# This waiver is CONDITIONAL. `tools/check-audit-waiver.sh` re-derives the
+# justification on every CI run and fails the job if `zip` acquires a
+# normal/dev edge (a compiled, not merely build-time, surface), or if zip's
+# lockfile version moves past the patch line (waiver is now dead config and
+# these entries must be removed).
