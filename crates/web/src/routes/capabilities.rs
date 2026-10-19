@@ -431,8 +431,16 @@ mod tests {
         // tests, fail-open) → no hearing-records capability.
         assert_eq!(json["audio_records"], serde_json::json!(false));
         // Boot-time admission snapshot rides along (#40) — even the
-        // unrestricted fixture carries the object with its mode.
+        // unrestricted fixture carries the object with its mode. The
+        // named-tier trio (named-tier addendum) is additive so old
+        // clients parsing resource.mode keep working.
         assert_eq!(json["resource"]["mode"], serde_json::json!("all"));
+        assert_eq!(json["resource"]["tier"], serde_json::json!("full"));
+        assert_eq!(
+            json["resource"]["preset_source"],
+            serde_json::json!("config")
+        );
+        assert!(json["resource"]["profile"].is_object());
         assert!(
             json["resource"]["features"].is_array() || json["resource"]["decisions"].is_array()
         );

@@ -34,7 +34,8 @@ impl Default for ToolsConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ResourcesConfig {
-    /// Auto-pick the LLM tier from available memory at startup.
+    /// Auto-pick the LLM tier from available memory at startup
+    /// (legacy single key; kept for deployed-config back-compat).
     pub auto_tier: bool,
     /// Feature-level gate mode (SPEC appendix A #40): `"auto"` (default)
     /// admits AI features greedily against the boot memory budget;
@@ -45,6 +46,11 @@ pub struct ResourcesConfig {
     /// file-size ×1.15 factor plus per-engine overheads carry the rest
     /// of the conservatism.
     pub reserve_mib: u64,
+    /// Named boot tier (appendix A #40 named-tier addendum): `"auto"`
+    /// (default, hardware-derived by `feature_gate::resolve_tier`) or
+    /// pinned `"minimal"|"basic"|"standard"|"full"`. A pin selects the
+    /// wanted feature subset preset and caps the LLM tier rank.
+    pub tier: String,
 }
 
 impl Default for ResourcesConfig {
@@ -53,36 +59,69 @@ impl Default for ResourcesConfig {
             auto_tier: false,
             feature_gate: "auto".into(),
             reserve_mib: 512,
+            tier: "auto".into(),
         }
     }
 }
 
-/// Resolve the LLM model path for the current tier (#30-E).
-/// Thresholds (available RAM): ≥8 GiB → full, ≥4 GiB → mid, else lite.
-/// Empty tier paths fall back to `model_path`; the resolved tier name is
-/// returned alongside for logging/capabilities.
+/// Resolve the LLM model path for the current tier (#30-E + the #40
+/// named-tier addendum). The memory suggestion (available RAM: ≥8 GiB →
+/// full, ≥4 GiB → mid, else lite) is unchanged and then clamped by two
+/// upper bounds: physical cores (< 4 → at most `mid`, < 2 → `lite` —
+/// llama decode throughput collapses on narrow cores, larger files are
+/// compute failures not memory failures) and the pinned
+/// `[resources] tier` rank (`minimal` → `lite`, `basic` → `mid`,
+/// `standard`/`full` → uncapped). The effective tier is the minimum of
+/// the three. Empty tier paths fall back to `model_path`; the resolved
+/// tier name returns alongside for logging/capabilities.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_llm_tier(
     model_path: &str,
     model_path_mid: &str,
     model_path_lite: &str,
     auto_tier: bool,
     avail_mib: u64,
+    physical_cores: u32,
+    tier_cap: &str,
 ) -> (String, &'static str) {
     if !auto_tier {
         return (model_path.to_string(), "manual");
     }
-    if avail_mib >= 8 * 1024 {
-        (model_path.to_string(), "full")
+    let suggested: &'static str = if avail_mib >= 8 * 1024 {
+        "full"
     } else if avail_mib >= 4 * 1024 {
-        if model_path_mid.is_empty() {
-            (model_path.to_string(), "mid")
-        } else {
-            (model_path_mid.to_string(), "mid")
-        }
-    } else if model_path_lite.is_empty() {
-        (model_path.to_string(), "lite")
+        "mid"
     } else {
-        (model_path_lite.to_string(), "lite")
+        "lite"
+    };
+    let core_cap: &'static str = if physical_cores < 2 {
+        "lite"
+    } else if physical_cores < 4 {
+        "mid"
+    } else {
+        "full"
+    };
+    let rank_cap: &'static str = match crate::feature_gate::Tier::from_name(tier_cap) {
+        Some(crate::feature_gate::Tier::Minimal) => "lite",
+        Some(crate::feature_gate::Tier::Basic) => "mid",
+        // standard/full → no pin below full; auto/unknown pins → no cap.
+        _ => "full",
+    };
+    let rank = |t: &'static str| match t {
+        "full" => 2_u8,
+        "mid" => 1,
+        _ => 0,
+    };
+    let effective: &'static str = [suggested, core_cap, rank_cap]
+        .into_iter()
+        .min_by_key(|t| rank(t))
+        .unwrap_or("lite");
+    match effective {
+        "mid" if !model_path_mid.is_empty() => (model_path_mid.to_string(), "mid"),
+        "lite" if !model_path_lite.is_empty() => (model_path_lite.to_string(), "lite"),
+        // Empty tier paths load the primary model under the honest
+        // (smaller) tier name.
+        _ => (model_path.to_string(), effective),
     }
 }
 
@@ -350,6 +389,15 @@ mod resources_config_tests {
     }
 
     #[test]
+    fn named_tier_key_defaults_to_auto_and_roundtrips() {
+        let cfg: ResourcesConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.tier, "auto");
+        // Pinned tier (.41's planned deploy shape) parses standalone.
+        let cfg: ResourcesConfig = toml::from_str("tier = \"standard\"").unwrap();
+        assert_eq!(cfg.tier, "standard");
+    }
+
+    #[test]
     fn memory_parser_takes_kb_to_mib() {
         let text =
             "MemTotal:       3916720 kB\nMemFree:         123456 kB\nMemAvailable:   2987000 kB\n";
@@ -368,18 +416,93 @@ mod tier_tests {
 
     #[test]
     fn tier_thresholds_and_fallbacks() {
-        let (p, t) = resolve_llm_tier("full.gguf", "mid.gguf", "lite.gguf", true, 12 * 1024);
+        let (p, t) = resolve_llm_tier(
+            "full.gguf",
+            "mid.gguf",
+            "lite.gguf",
+            true,
+            12 * 1024,
+            4,
+            "auto",
+        );
         assert_eq!((p.as_str(), t), ("full.gguf", "full"));
-        let (p, t) = resolve_llm_tier("full.gguf", "mid.gguf", "lite.gguf", true, 5 * 1024);
+        let (p, t) = resolve_llm_tier(
+            "full.gguf",
+            "mid.gguf",
+            "lite.gguf",
+            true,
+            5 * 1024,
+            4,
+            "auto",
+        );
         assert_eq!((p.as_str(), t), ("mid.gguf", "mid"));
-        let (p, t) = resolve_llm_tier("full.gguf", "mid.gguf", "lite.gguf", true, 2 * 1024);
+        let (p, t) = resolve_llm_tier(
+            "full.gguf",
+            "mid.gguf",
+            "lite.gguf",
+            true,
+            2 * 1024,
+            4,
+            "auto",
+        );
         assert_eq!((p.as_str(), t), ("lite.gguf", "lite"));
         // Empty tier path → fall back to the primary model, tier still named.
-        let (p, t) = resolve_llm_tier("full.gguf", "", "", true, 2 * 1024);
+        let (p, t) = resolve_llm_tier("full.gguf", "", "", true, 2 * 1024, 4, "auto");
         assert_eq!((p.as_str(), t), ("full.gguf", "lite"));
         // auto_tier off → manual, primary path.
-        let (p, t) = resolve_llm_tier("full.gguf", "mid.gguf", "lite.gguf", false, 512);
+        let (p, t) = resolve_llm_tier("full.gguf", "mid.gguf", "lite.gguf", false, 512, 4, "auto");
         assert_eq!((p.as_str(), t), ("full.gguf", "manual"));
+    }
+
+    #[test]
+    fn llm_tier_anchor_hosts_with_core_cap() {
+        // Workstation i5-1135G7 (4 physical cores, plenty of RAM) → full(4B).
+        let t = resolve_llm_tier("p", "m", "l", true, 12_000, 4, "auto").1;
+        assert_eq!(t, "full");
+        // i5-6200U 2C/4T with a fat memory read: memory suggests full, the
+        // core cap holds it at mid (1.7B).
+        let t = resolve_llm_tier("p", "m", "l", true, 10_000, 2, "auto").1;
+        assert_eq!(t, "mid");
+        // i3-2370M 2C/3.7G (Sandy Bridge): memory says lite anyway.
+        let t = resolve_llm_tier("p", "m", "l", true, 1_700, 2, "auto").1;
+        assert_eq!(t, "lite");
+        // A single-vCPU VM stays at lite even with huge RAM.
+        let t = resolve_llm_tier("p", "m", "l", true, 32_000, 1, "auto").1;
+        assert_eq!(t, "lite");
+    }
+
+    #[test]
+    fn llm_tier_pinned_tier_cap() {
+        // Pin minimal on a large box → lite forces the small model.
+        let (p, t) = resolve_llm_tier("p", "m", "l", true, 16_000, 8, "minimal");
+        assert_eq!((p.as_str(), t), ("l", "lite"));
+        // Pin basic → cap at mid.
+        let t = resolve_llm_tier("p", "m", "l", true, 16_000, 8, "basic").1;
+        assert_eq!(t, "mid");
+        // Pin standard/full → no rank cap.
+        for pin in ["standard", "full"] {
+            let t = resolve_llm_tier("p", "m", "l", true, 16_000, 8, pin).1;
+            assert_eq!(t, "full", "{pin}");
+        }
+        // Unknown pin strings don't cap (hardware derivation decides;
+        // main.rs logs the unknown-tier warning separately).
+        let t = resolve_llm_tier("p", "m", "l", true, 16_000, 4, "nonsense").1;
+        assert_eq!(t, "full");
+        // Pinned caps combine with memory: basic pin + 2 GiB → lite.
+        let t = resolve_llm_tier("p", "m", "l", true, 2_000, 8, "basic").1;
+        assert_eq!(t, "lite");
+    }
+
+    #[test]
+    fn llm_tier_missing_tier_files_fall_back_to_primary_under_honest_name() {
+        // Effective mid (2 cores) with an empty mid path: the primary
+        // model file loads under the honest tier name.
+        let (p, t) = resolve_llm_tier("p", "", "l", true, 10_000, 2, "auto");
+        assert_eq!(t, "mid");
+        assert_eq!(p, "p");
+        // A present mid path is used verbatim.
+        let (p, t) = resolve_llm_tier("p", "m", "l", true, 10_000, 2, "auto");
+        assert_eq!((p.as_str(), t), ("m", "mid"));
     }
 
     #[test]
