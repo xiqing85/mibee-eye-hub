@@ -1,4 +1,4 @@
-# mibee-eye-notebook
+# mibee-eye-hub
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
@@ -155,8 +155,8 @@ See [`docs/POSITIONING.md`](docs/POSITIONING.md) for the authoritative product s
 
 ```bash
 # Clone and enter
-git clone https://github.com/xiqing85/mibee-eye-notebook.git
-cd mibee-eye-notebook
+git clone https://github.com/xiqing85/mibee-eye-hub.git
+cd mibee-eye-hub
 
 # Install system dependencies (Linux)
 sudo apt install libv4l-dev libasound2-dev libclang-dev
