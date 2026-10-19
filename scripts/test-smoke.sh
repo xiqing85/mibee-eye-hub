@@ -103,11 +103,30 @@ else
 fi
 
 # ── 9. CRITICAL: zero ffmpeg references in journal ────────────────────────────
-FFMPEG_HITS=$(ssh "$HOST" "journalctl --user -u mibee-eye --since '5 min ago' --no-pager 2>/dev/null | grep -ci 'ffmpeg' || echo 0")
+# Both unit names are matched: test rigs run mibee-eye-test, fleet hosts run
+# mibee-eye — querying only one made this check pass vacuously on the other.
+FFMPEG_HITS=$(ssh "$HOST" "journalctl --user -u mibee-eye-test -u mibee-eye --since '5 min ago' --no-pager 2>/dev/null | grep -ci 'ffmpeg' || echo 0")
 if [ "$FFMPEG_HITS" = "0" ]; then
     pass "ZERO ffmpeg references in journal (full removal confirmed)"
 else
     fail "journal contains $FFMPEG_HITS ffmpeg references (removal incomplete?)"
+fi
+
+# ── 10. Build provenance: startup banner pins sha, clean build (mibee-rec #1) ──
+# SMOKE_EXPECT_SHA=<sha> additionally pins the deployed binary to an exact
+# commit (machine-checked "deployed == expected", no mtime archaeology).
+# Boot-bounded (-b): the banner logs once at startup, so any rolling window
+# would miss it on a long-running service; the current boot always has it.
+BANNER=$(ssh "$HOST" "journalctl --user -u mibee-eye-test -u mibee-eye -b --no-pager 2>/dev/null | grep -o 'mibee-eye starting.*' | tail -1" || echo '')
+RUN_SHA=$(echo "$BANNER" | grep -oP 'sha: "\K[0-9a-f]{7,40}' || echo '')
+RUN_DIRTY=$(echo "$BANNER" | grep -oP 'dirty: \K[a-z]+' || echo '')
+if [ -n "$RUN_SHA" ] && [ "$RUN_DIRTY" = "false" ]; then
+    pass "build provenance: sha=$RUN_SHA dirty=false"
+    if [ -n "$SMOKE_EXPECT_SHA" ] && [ "$RUN_SHA" != "$SMOKE_EXPECT_SHA" ]; then
+        fail "deployed sha $RUN_SHA != expected SMOKE_EXPECT_SHA=$SMOKE_EXPECT_SHA"
+    fi
+else
+    fail "build provenance banner missing/invalid (sha='$RUN_SHA' dirty='$RUN_DIRTY')"
 fi
 
 echo ""

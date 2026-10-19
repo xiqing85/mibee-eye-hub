@@ -40,6 +40,24 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libv4l-dev libasound2-dev libclang-dev
       - run: cargo test --workspace
 
+  coverage:
+    # 覆盖率棘轮（mibee-rec #6 M1 · 开发规范：85% 下限、93% 目标）。
+    # 基线在 tools/coverage-baseline.txt，只升不降（--update 棘轮上调）；
+    # 新模块 ≥85% 起步由评审执行。口径 = --workspace --lib 默认 feature，
+    # feature 门控模块（ocr/webrtc/mse/faces 等）的执行面在 feature-matrix
+    # job，本口径下计 0 不换算。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libv4l-dev libasound2-dev libclang-dev
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: tools/check-coverage.sh
+
   feature-matrix:
     # 跨 feature 编译面（AI 扩展规划横切项）：接口改动必须全矩阵过
     # 一遍。voice+llm 腿抓跨 feature 静态初始化回归（e02c2a6 一类）。
