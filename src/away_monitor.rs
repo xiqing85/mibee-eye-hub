@@ -595,4 +595,273 @@ mod tests {
         assert_eq!(safe_fragment("../../etc/passwd"), "etcpasswd");
         assert_eq!(safe_fragment("a/b\\c"), "abc");
     }
+
+    // ── Integration fixtures (fail-open inactive engines + scratch DB) ─────
+
+    /// Scratch SQLite file per test (the `:memory:` pool would give each
+    /// connection its own empty database; migrations must land in one file).
+    fn scratch_db(name: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "mibee-away-{}-{}-{:?}.db",
+            std::process::id(),
+            name,
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(p.with_extension("db-wal"));
+        let _ = std::fs::remove_file(p.with_extension("db-shm"));
+        p.to_str().expect("utf-8 path").to_string()
+    }
+
+    fn scratch_dir(name: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "mibee-away-{}-{}-{:?}",
+            std::process::id(),
+            name,
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p.to_str().expect("utf-8 path").to_string()
+    }
+
+    struct Rig {
+        away: Arc<AwayEngine>,
+        voice: Arc<VoiceEngine>,
+        tts: Arc<TtsEngine>,
+        face: Arc<FaceEngine>,
+        vlm: Arc<VlmEngine>,
+        desktop: Arc<Desktop>,
+        pool: SqlitePool,
+        event_tx: Arc<EventBus>,
+        events: tokio::sync::broadcast::Receiver<CameraEvent>,
+        snapshot_dir: String,
+        db_path: String,
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.snapshot_dir);
+            for ext in ["", ".db-wal", ".db-shm"] {
+                let _ = std::fs::remove_file(format!("{}{ext}", self.db_path));
+            }
+        }
+    }
+
+    async fn rig(name: &str) -> Rig {
+        rig_with(name, |_| {}).await
+    }
+
+    /// `tune` edits the live `AwaySettings` (hot-config surface) before
+    /// the rig is handed to the test.
+    async fn rig_with<F>(name: &str, tune: F) -> Rig
+    where
+        F: FnOnce(&mut web::away::AwaySettings),
+    {
+        let db_path = scratch_db(name);
+        let snapshot_dir = scratch_dir(name);
+        let pool = web::db::init_pool(&db_path).await.expect("scratch pool");
+        let config = AwayConfig {
+            snapshot_dir: snapshot_dir.clone(),
+            ..AwayConfig::default()
+        };
+        let away = Arc::new(AwayEngine::new(
+            config,
+            Arc::new(AiEngine::from_parts(
+                streaming::ai::AiConfig::default(),
+                None,
+            )),
+            true,
+        ));
+        tune(&mut away.settings_share().write());
+        // The remaining engines are inactive fail-open instances; the TTS
+        // player is pinned empty so no test ever spawns a real player.
+        let voice = Arc::new(VoiceEngine::from_config(
+            &streaming::voice::VoiceConfig::default(),
+        ));
+        // Pin the player empty so no test ever spawns a real player.
+        let tts_cfg = streaming::tts::TtsConfig {
+            player: String::new(),
+            ..Default::default()
+        };
+        let tts = Arc::new(TtsEngine::from_config(&tts_cfg));
+        let face = Arc::new(FaceEngine::from_config(
+            &streaming::face::FaceConfig::default(),
+        ));
+        let vlm = Arc::new(VlmEngine::from_config(&streaming::vlm::VlmConfig::default()));
+        let desktop = Desktop::new(&crate::config::DesktopConfig::default());
+        let event_tx = Arc::new(web::routes::events::new_event_bus());
+        let events = event_tx.subscribe();
+        Rig {
+            away,
+            voice,
+            tts,
+            face,
+            vlm,
+            desktop,
+            pool,
+            event_tx,
+            events,
+            snapshot_dir,
+            db_path,
+        }
+    }
+
+    async fn away_event_rows(r: &Rig) -> Vec<AwayEventRecord> {
+        web::db::list_away_events(&r.pool, 10)
+            .await
+            .expect("list away events")
+    }
+
+    #[tokio::test]
+    async fn visitor_flow_no_voice_leg_persists_and_broadcasts() {
+        let mut rig = rig("visitor").await;
+        let jpeg: Arc<[u8]> = Arc::from(&b"\xff\xd8fakejpeg"[..]);
+        visitor_flow(
+            &rig.away,
+            &rig.voice,
+            &rig.tts,
+            &rig.face,
+            &rig.vlm,
+            &rig.desktop,
+            &rig.pool,
+            &rig.event_tx,
+            "cam1",
+            2,
+            Some(jpeg.clone()),
+        )
+        .await;
+
+        // Inactive TTS => the no_voice state; the record still lands.
+        let rows = away_event_rows(&rig).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "person");
+        assert_eq!(rows[0].state, "no_voice");
+        assert_eq!(rows[0].labels, "person×2");
+        assert_eq!(rows[0].camera_id, "cam1");
+
+        // The snapshot is the exact triggering frame.
+        let snap_path = std::path::Path::new(&rig.snapshot_dir)
+            .join(rows[0].snapshot.as_deref().unwrap_or_default());
+        assert!(
+            snap_path.is_file(),
+            "snapshot missing: {}",
+            snap_path.display()
+        );
+        assert_eq!(std::fs::read(&snap_path).unwrap(), jpeg.to_vec());
+
+        // SSE got the same record.
+        match rig.events.try_recv().expect("one away SSE event") {
+            CameraEvent::AwayEvent { event } => assert_eq!(event.id, rows[0].id),
+            other => panic!("expected AwayEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn visitor_flow_without_frame_skips_snapshot_and_face() {
+        let rig = rig("visitor-noframe").await;
+        visitor_flow(
+            &rig.away,
+            &rig.voice,
+            &rig.tts,
+            &rig.face,
+            &rig.vlm,
+            &rig.desktop,
+            &rig.pool,
+            &rig.event_tx,
+            "cam1",
+            1,
+            None,
+        )
+        .await;
+        let rows = away_event_rows(&rig).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].snapshot, None);
+        // save_snapshot never even creates the directory without a frame.
+        let dir = std::path::Path::new(&rig.snapshot_dir);
+        let empty = !dir.exists()
+            || std::fs::read_dir(dir)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true);
+        assert!(empty, "no snapshot files expected without a frame");
+    }
+
+    #[tokio::test]
+    async fn visitor_flow_dead_push_url_is_fail_open() {
+        // scene.away.push_url set to a closed port: the spawned POST must
+        // not hang or fail the flow (PR#83 contract, now at the caller).
+        let rig = rig_with("visitor-push", |s| {
+            s.push_url = "http://127.0.0.1:9/away".into();
+        })
+        .await;
+        visitor_flow(
+            &rig.away,
+            &rig.voice,
+            &rig.tts,
+            &rig.face,
+            &rig.vlm,
+            &rig.desktop,
+            &rig.pool,
+            &rig.event_tx,
+            "cam1",
+            1,
+            None,
+        )
+        .await;
+        assert_eq!(
+            away_event_rows(&rig).await.len(),
+            1,
+            "record must land despite dead push_url"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_flow_persists_labels_and_snapshot() {
+        let mut rig = rig("activity").await;
+        let jpeg: Arc<[u8]> = Arc::from(&b"dogframe"[..]);
+        activity_flow(
+            &rig.away,
+            &rig.pool,
+            &rig.event_tx,
+            "cam2",
+            "\u{1f50a} dog 0.82",
+            Some(jpeg),
+        )
+        .await;
+        let rows = away_event_rows(&rig).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "activity");
+        assert_eq!(rows[0].state, "recorded");
+        assert_eq!(rows[0].labels, "\u{1f50a} dog 0.82");
+        assert!(rows[0].snapshot.is_some());
+        assert!(matches!(
+            rig.events.try_recv().expect("SSE event"),
+            CameraEvent::AwayEvent { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn record_audio_event_lands_activity_row_without_snapshot() {
+        let rig = rig("audio-link").await;
+        record_audio_event(&rig.away, &rig.pool, &rig.event_tx, "\u{1f50a} Siren 0.9").await;
+        let rows = away_event_rows(&rig).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "activity");
+        assert_eq!(rows[0].camera_id, "0");
+        assert_eq!(rows[0].labels, "\u{1f50a} Siren 0.9");
+        assert_eq!(rows[0].snapshot, None);
+    }
+
+    #[tokio::test]
+    async fn speak_text_on_inactive_tts_returns_promptly() {
+        // Fail-open contract: an inactive TTS must not hang the voice leg.
+        let rig = rig("speak").await;
+        let done = tokio::time::timeout(
+            Duration::from_secs(3),
+            speak_text(&rig.tts, &rig.voice, "你好"),
+        )
+        .await;
+        assert!(done.is_ok(), "speak_text hung on inactive TTS");
+    }
 }
