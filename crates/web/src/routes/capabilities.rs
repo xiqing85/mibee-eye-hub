@@ -568,14 +568,36 @@ mod tests {
         let push_needle: String = ["events.push(", "\""].concat();
         let seed_needle: String = ["let mut events = vec", "!", "["].concat();
 
-        // The wire names the SSE layer actually produces.
+        // The wire names the SSE layer actually produces. event_wire arms
+        // carry them as `("name",` tuple heads (the Axum wrapper binds the
+        // name through a variable, so there is no .event("literal") left).
         let mut emitted: Vec<&str> = Vec::new();
-        let mut rest = events_src;
-        while let Some(idx) = rest.find(".event(\"") {
-            rest = &rest[idx + ".event(\"".len()..];
-            let end = rest.find('"').expect("unterminated event name");
-            emitted.push(&rest[..end]);
-            rest = &rest[end..];
+        // Scrape only event_wire's body — sse_headers and the test module
+        // also contain ("name", shaped pairs that are not SSE events.
+        let wire_body = events_src
+            .split_once("fn event_wire")
+            .and_then(|(_, tail)| tail.split_once("fn event_to_sse"))
+            .map_or(events_src, |(body, _)| body);
+        let mut rest = wire_body;
+        while let Some(idx) = rest.find('"') {
+            let (before, after) = rest.split_at(idx);
+            // `after` starts ON the opening quote; step past it so the
+            // guards see name-shaped text, not the quote itself.
+            let after = &after[1..];
+            let Some(end) = after.find('"') else { break };
+            // Tuple heads read `("name",` / `=> (
+            //     "name",` — the opening quote's preceding non-space is a
+            // paren (both the inline and fmt-split layouts), and the
+            // closing quote is followed by a comma. json! keys carry
+            // colons before their values and json! value strings sit
+            // after `: `, so neither shape can pass both guards.
+            let opens_tuple = before.trim_end().ends_with('(');
+            if opens_tuple && after[end + 1..].starts_with(',') && end > 0 {
+                emitted.push(&after[..end]);
+            }
+            // Advance past the closing quote — landing on it re-finds the
+            // same quote at index 0 forever.
+            rest = &after[end + 1..];
         }
         emitted.sort_unstable();
         emitted.dedup();
