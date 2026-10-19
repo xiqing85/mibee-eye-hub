@@ -6,3 +6,4 @@
 //! zero behavior change against the previous layout.
 
 pub mod bootstrap;
+pub mod voice_bridge;

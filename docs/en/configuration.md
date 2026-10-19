@@ -42,6 +42,7 @@ advertised_host = "192.168.1.100"
 | `port` | u16 | `8443` | HTTPS port for web UI and REST API (must be > 1024) |
 | `host` | String | `"0.0.0.0"` | Bind address: `"0.0.0.0"` (all interfaces) or `"127.0.0.1"` (localhost only) |
 | `advertised_host` | Option<String> | `None` | Advertised hostname/IP for URLs returned to clients. If None, auto-detected at startup via UDP probe. Eliminates hardcoded localhost in external URLs. |
+| `http_port` | u16 | `0` | Optional additional plain-HTTP listener for LAN access without TLS ceremony (SPEC appendix A). 0 = disabled. Session cookies issued over this listener omit the `Secure` flag; TLS-listener cookies keep it. |
 
 **Notes:**
 
@@ -181,6 +182,15 @@ The admission table surfaces as `capabilities.resource` (status page
 "Resource Profile" card) and as `mibee_eye_feature_admitted` /
 `mibee_eye_resource_budget_mib` Prometheus gauges. Re-evaluated on restart.
 
+**Field Reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tier` | String | `"auto"` | Named hardware tier (`full` / `balanced` / `lite` / `auto` = derive from detected hardware) |
+| `auto_tier` | bool | `false` | Single-key shorthand: pick the LLM tier model by available memory (full/mid/lite per `[llm]` model paths) |
+| `feature_gate` | String | `"auto"` | `"auto"` admits enabled features against the boot memory budget; `"all"` boots everything regardless of memory |
+| `reserve_mib` | u64 | `512` | MiB of headroom kept out of the admission budget (MemAvailable already includes reclaimable cache) |
+
 ### [conversations] - Dialogue turn records (SPEC §3.4)
 
 Master switch for the human-readable dialogue log: every turn (voice or
@@ -196,6 +206,12 @@ records nothing and hides the card (privacy switch).
 [conversations]
 enabled = true
 ```
+
+**Field Reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Master switch for dialogue-turn records; `false` records nothing and hides the conversation-log card (privacy switch) |
 
 ### [agent] - Agent tools & skills (SPEC §3.5 / appendix A #43)
 
@@ -236,6 +252,16 @@ args = ["/home/you/.config/mibee-eye/mcp/home_tools.py"]
 voice_tool_gate = true
 ```
 
+**Field Reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Master gate. `true` with an empty registry is a no-op — the loop needs at least one tool before it engages |
+| `max_steps` | u32 | `3` | Tool-calling iteration bound; the final iteration drops the tool table so the model must produce a text answer |
+| `step_timeout_ms` | u64 | `15_000` | Per tool-execution timeout in milliseconds |
+| `voice_tool_gate` | bool | `true` | Voice turns carry the tool table only on tool-shaped utterances (weather/time/snapshot/device control); HTTP chat always carries the full table |
+| `mcp_servers` | array of tables | `[]` | MCP stdio servers (`[[agent.mcp_servers]]`): `name`, `command`, `args`, `env` per entry |
+
 ### [away] - Away mode watch (SPEC §3.6 / appendix A #44)
 
 The armed watch for when nobody is home. It rides the existing AI
@@ -264,18 +290,31 @@ greeting_known = "欢迎回家，{name}。"     # {name} = enrolled face name
 greeting_unknown = "你好，这里是主人的智能看家助手。主人现在不在家，请问你是谁？"
 ```
 
-The six runtime features are **web-configurable live** (`PUT /api/config`
-`scene.away.*`, no restart; the TOML above only seeds boot defaults):
+**Field Reference** (every key is **web-configurable live** via
+`PUT /api/config` `scene.away.*`, no restart; the `[away]` TOML block above
+only seeds boot defaults):
 
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `scene.away.voice_control` | `true` | "我要出门了/我回来了" utterances arm/disarm the watch ahead of the LLM |
-| `scene.away.summary_on_disarm` | `true` | Disarm produces a summary (local LLM one-liner, plain-count fallback); returned by the API and spoken on voice disarm |
-| `scene.away.deterrence` | `false` | Unanswered strangers are re-asked once (`reask_text`, half window), then played `deterrence_text` |
-| `scene.away.reask_text` / `deterrence_text` | see TOML | The two escalation messages |
-| `scene.away.schedule_arm` / `schedule_disarm` | `""` | `HH:MM` local-time boundary edges; empty disables that edge. `schedule_weekdays_only` (default `false`) restricts to Mon–Fri |
-| `scene.away.push_url` | `""` | Visitor push webhook: one JSON POST per visitor event (text only, never images), 5 s timeout, fail-open. **Empty keeps the device fully air-gapped** — configuring a URL is the informed opt-in to outbound text |
-| `scene.away.audio_link` | `true` | While armed, voted sound-alarm rising edges also land as away activity records (labels `🔊 class score`, one per activity cooldown) |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `interval_ms` | u64 | `1000` | Event-throttle floor stacked on the `[ai]` sampling interval (no separate pipeline) |
+| `person_gap_secs` | u64 | `10` | Person-absence grace before the visitor stream considers the person gone |
+| `greeting_cooldown_secs` | u64 | `120` | Minimum spacing between two greeting interactions |
+| `activity_cooldown_secs` | u64 | `60` | Minimum spacing between two activity records of the same class |
+| `activity_labels` | Vec<String> | `["cat","dog","bird"]` | Detection classes that count as "activity" records while armed |
+| `listen_secs` | u64 | `10` | One-shot wake-free listening window after a greeting question |
+| `snapshot_dir` | String | `"away-snapshots"` | Evidence JPEG directory (cwd-relative); pruning/clearing deletes the files |
+| `greeting_known` | String | `"欢迎回家，{name}。"` | Greeting for enrolled faces (`{name}` = the person name) |
+| `greeting_unknown` | String | `"你好，这里是主人的智能看家助手。主人现在不在家，请问你是谁？"` | Greeting + identity question for unrecognized visitors |
+| `voice_control` | bool | `true` | "我要出门了/我回来了" utterances arm/disarm the watch ahead of the LLM |
+| `summary_on_disarm` | bool | `true` | Disarm produces a summary (local LLM one-liner, plain-count fallback); returned by the API and spoken on voice disarm |
+| `deterrence` | bool | `false` | Unanswered strangers are re-asked once (`reask_text`, half window), then played `deterrence_text` |
+| `deterrence_text` | String | `"请注意：您的影像和声音已被记录，主人将收到通知。"` | The deterrence message played to a silent stranger |
+| `reask_text` | String | `"请问你是谁？请说明来意。"` | The second-chance question for an unanswered greeting |
+| `schedule_arm` | String | `""` | `HH:MM` local-time daily arm edge; empty disables that edge. Manual state inside the window is never fought |
+| `schedule_disarm` | String | `""` | `HH:MM` local-time daily disarm edge; empty disables that edge |
+| `schedule_weekdays_only` | bool | `false` | Scheduled edges fire Mon–Fri only |
+| `push_url` | String | `""` | Visitor push webhook: one JSON POST per visitor event (text only, never images), 5 s timeout, fail-open. **Empty keeps the device fully air-gapped** — configuring a URL is the informed opt-in to outbound text |
+| `audio_link` | bool | `true` | While armed, voted sound-alarm rising edges also land as away activity records (labels `🔊 class score`, one per activity cooldown) |
 
 ### [desktop] - Tray icon & desktop notifications (SPEC appendix A #42)
 
@@ -294,6 +333,14 @@ tray = true                # StatusNotifierItem tray icon
 notifications = true       # desktop notifications on alarm edges
 notify_conversations = false  # also notify on completed voice replies
 ```
+
+**Field Reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tray` | bool | `true` | StatusNotifierItem tray icon (opens the web UI on click) |
+| `notifications` | bool | `true` | Desktop notifications on accepted alarm rising edges |
+| `notify_conversations` | bool | `false` | Also notify when a voice reply finishes playing |
 
 
 ### [observability] - Monitoring and Logging
@@ -381,6 +428,9 @@ events_enabled = true
 | `firmware_version` | String | `"1.0.0"` | Firmware version |
 | `port` | u16 | `3702` | WS-Discovery UDP port (hardcoded) |
 | `events_enabled` | bool | `true` | Pull-Point events service: AI motion alarms publish as `tns1:VideoSource/MotionAlarm` while an NVR holds a subscription |
+| `media2_enabled` | bool | `true` | ONVIF Media2 (Profile T) endpoint alongside classic Media |
+| `http_digest` | bool | `false` | HTTP Digest auth for the SOAP listener (default WS-UsernameToken) |
+| `ip_filter` | Vec<String> | `[]` | IPv4 allow-list (`a.b.c.d[/prefix]`) for the SOAP listener; empty = no filtering, otherwise peers outside the list get 403 before any SOAP processing. Restart-to-apply |
 
 **Notes:**
 
@@ -484,6 +534,70 @@ contract:
   [`models/README.md`](../../models/README.md) for sources, sizes and
   licenses.
 
+### [watermark] - Video Watermark Overlay
+
+Burns a text/timestamp overlay into the encoded stream (SPEC v1 §5.2).
+Bootstrap default only — the runtime settings live in the DB
+(`protocols.watermark`) and are edited in the Web UI.
+
+```toml
+[watermark]
+enabled = false
+```
+
+**Field Reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch |
+| `text` | String | `""` | Custom text (≤128 chars); CJK requires a `font_path` with CJK glyphs |
+| `show_timestamp` | bool | `true` | Burn the timestamp line |
+| `timestamp_format` | String | `"%Y-%m-%d %H:%M:%S"` | strftime subset: `%Y %m %d %H %M %S %F %T %%` + literals |
+| `position` | String | `top_left` | One of `top_left` / `top_right` / `bottom_left` / `bottom_right` |
+| `font_size` | u32 | `24` | Pixel height, 12..96 |
+| `font_path` | String | `""` | Optional TTF/OTF (needed for CJK); empty = embedded ASCII subset font |
+
+### [webrtc] - WebRTC Playback (Experimental)
+
+Whep-style WebRTC playback endpoint. Ice candidates gather from a small
+UDP range; STUN servers enable non-LAN topologies (empty = host
+candidates only).
+
+```toml
+[webrtc]
+enabled = false
+```
+
+**Field Reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch |
+| `udp_port_min` | u16 | `0` | UDP port range start for ICE host candidates (0 = OS chooses) |
+| `udp_port_max` | u16 | `0` | UDP port range end (inclusive; 0 = OS chooses) |
+| `stun_servers` | String | `""` | Comma-separated STUN URLs (e.g. `stun:stun.l.google.com:19302`); empty = LAN-only host candidates |
+
+### [ai] - Object Detection (NanoDet-Plus)
+
+Visual object detection feeding alarms, zones and the away watch. Off by
+default — inference is opt-in like the outbound protocols.
+
+```toml
+[ai]
+enabled = false
+```
+
+**Field Reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch |
+| `model` | String | `"nanodet-plus-m-320"` | Registry id of the startup model (SPEC §4.6); a non-default `model_path` overrides it |
+| `allow_upload` | bool | `false` | Allow runtime model uploads (SPEC §4.6 capability `ai_upload`; model files are untrusted input) |
+| `model_path` | String | `"models/nanodet-m.onnx"` | NanoDet-Plus ONNX path (cwd-relative or absolute) |
+| `confidence_threshold` | f32 | `0.5` | Minimum confidence for a detection to be reported (0..=1) |
+| `interval_ms` | u64 | `1000` | Minimum spacing between inferences per camera |
+
 ### [audio_ai] - Sound-Event Detection
 
 Constant microphone listening with YAMNet classification. When a watched
@@ -570,11 +684,19 @@ barge_in = "off"
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Master switch (requires the `voice` build feature). |
-| `kws_encoder` / `kws_decoder` / `kws_joiner` / `kws_tokens` | String | `models/voice/kws/…` | Zipformer transducer KWS model trio + tokens. |
+| `kws_encoder` | String | `"models/voice/kws/encoder.int8.onnx"` | Zipformer transducer KWS encoder |
+| `kws_decoder` | String | `"models/voice/kws/decoder.int8.onnx"` | Zipformer transducer KWS decoder |
+| `kws_joiner` | String | `"models/voice/kws/joiner.int8.onnx"` | Zipformer transducer KWS joiner |
+| `kws_tokens` | String | `"models/voice/kws/tokens.txt"` | KWS tokens file |
+| `wake_word` | String | `"小蜜蜂"` | The wake phrase the KWS listens for |
 | `keywords_file` | String | `"models/voice/kws/keywords.txt"` | Keywords file — one keyword per line, `tokens… @display-name` (zh-en phoneme model, e.g. `x iǎo m ì f ēng @小蜜蜂`). |
 | `keywords_threshold` | f32 | `0.25` | Wake sensitivity — lower fires more easily. |
 | `keywords_score` | f32 | `1.0` | Minimum score for an accepted wake. |
-| `paraformer_model` / `paraformer_tokens` | String | `models/voice/paraformer/…` | Offline paraformer checkpoint. Default is the zh build (Mandarin + embedded English); **for Cantonese/Mandarin/English use the trilingual build** (`models/voice/paraformer-trilingual/…`, 234MB, Apache-2.0, see `models/README.md`). |
+| `paraformer_model` | String | `"models/voice/paraformer/model.int8.onnx"` | Offline paraformer checkpoint. Default is the zh build (Mandarin + embedded English); **for Cantonese/Mandarin/English use the trilingual build** (`models/voice/paraformer-trilingual/…`, 234MB, Apache-2.0, see `models/README.md`). |
+| `paraformer_tokens` | String | `"models/voice/paraformer/tokens.txt"` | Paraformer tokens file |
+| `follow_up_window_secs` | f32 | `0.0` | Wake-free follow-up window after each reply (0 = off; armed on demand by the away monitor and interrupt rounds) |
+| `vad_model` | String | `"models/voice/vad/silero_vad.onnx"` | Silero VAD for endpointing / listen windows |
+| `capture_endpointing` | bool | `true` | VAD-based endpointing while capturing a question: soft deadline extends while speaking, ~0.6 s trailing silence ends the segment |
 | `capture_secs` | u32 | `4` | Seconds of audio captured after a wake word. |
 | `num_threads` | i32 | `1` | Inference threads (target hosts are small). |
 | `speaker_embedding_model` | String | `models/voice/speaker/campplus.onnx` | Speaker-embedding model (3D-Speaker CAM++ zh_en). **A missing file only disables voiceprint features** — wake + ASR keep working. |
@@ -627,6 +749,8 @@ no_think = true
 | `n_threads` | u32 | logical cores / 2, clamped to `2..=4` | CPU threads. Leave unset to let the device size this from the host. |
 | `max_tokens` | u32 | `200` | Generation cap per reply. |
 | `no_think` | bool | `true` | Append `/no_think` to user turns (Qwen3 thinking mode off — faster, conversational). |
+| `model_path_mid` | String | `""` | Mid-tier GGUF for `[resources] auto_tier` (empty = tier unavailable) |
+| `model_path_lite` | String | `""` | Lite-tier GGUF for `[resources] auto_tier` (empty = tier unavailable) |
 
 **Notes:**
 
@@ -745,7 +869,16 @@ num_threads = 4
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Master switch. No cargo feature needed. |
 | `binary` | String | `"tmp/sherpa-libs/tools-bin/bin/sherpa-onnx-offline-tts"` | sherpa-onnx-offline-tts binary path (downloaded separately from the k2-fsa release). |
-| `model` / `lexicon` / `tokens` / `dict_dir` | String | `models/voice/melo/…` | vits-melo-tts-zh_en voice assets. |
+| `model` | String | `"models/voice/melo/model.onnx"` | vits-melo-tts-zh_en voice model (Mandarin primary) |
+| `lexicon` | String | `"models/voice/melo/lexicon.txt"` | Pronunciation lexicon |
+| `tokens` | String | `"models/voice/melo/tokens.txt"` | TTS tokens file |
+| `dict_dir` | String | `"models/voice/melo/dict"` | Jieba dictionary directory |
+| `num_threads` | u32 | `2` | TTS synthesis threads |
+| `yue_model` | String | `""` | Cantonese voice model (empty = Cantonese unavailable) |
+| `yue_lexicon` | String | `""` | Cantonese lexicon |
+| `yue_dict_dir` | String | `""` | Cantonese dictionary directory |
+| `en_model` | String | `""` | English voice model (empty = English unavailable) |
+| `en_lexicon` | String | `""` | English lexicon |
 | `rule_fsts` | String | `"…/number.fst,…/date.fst"` | Number/date normalization FSTs (comma-joined). |
 | `player` | String | `"aplay -q"` | Playback command; empty = synthesize only (no speaker output). |
 
@@ -763,6 +896,14 @@ weather_enabled = false
 weather_city = ""
 timeout_secs = 5
 ```
+
+**Field Reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `weather_enabled` | bool | `false` | Master switch for the weather tool |
+| `weather_city` | String | `""` | Query city (empty = tool returns no data) |
+| `timeout_secs` | u64 | `5` | Fetch timeout in seconds |
 
 ### [vlm] - Alarm-Frame Image Descriptions
 
@@ -803,6 +944,45 @@ prompt = "这是安防摄像头的告警画面。请用一句中文描述画面�
   120 s floor separates consecutive starts — a flapping detector cannot
   stack VLM loads on a small host.
 - Shares the same llama.cpp backend instance and memory guardrail as `[llm]`.
+
+### [face] - Face Recognition
+
+YuNet detection + SFace 128-d embeddings (enrollment, per-event name
+attribution, known-visitor greetings in the away watch). Off by default —
+CPU cost is real on old hosts. `detect_input` follows the model author's
+reference implementation; the shipped zoo model accepts dynamic input.
+
+```toml
+[face]
+enabled = false
+```
+
+**Field Reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch |
+| `detect_model` | String | `"models/face/face_detection_yunet_2023mar.onnx"` | YuNet detection model (OpenCV zoo) |
+| `recog_model` | String | `"models/face/face_recognition_sface_2021dec.onnx"` | SFace recognition model (128-d embedding) |
+| `detect_input` | u32 | `320` | Detection input edge; larger finds smaller faces at quadratic CPU cost |
+| `match_threshold` | f32 | `0.363` | Cosine similarity threshold for a name match (OpenCV SFace reference value) |
+| `enroll_frames` | usize | `8` | Frames accepted into one enrollment (more = stabler template) |
+| `ttl_ms` | u64 | `10_000` | Skip detection when the frame is older than this |
+
+### [models] - Model Asset Directory
+
+Root directory for downloadable model assets (SPEC §4.6 model manager).
+
+```toml
+[models]
+dir = "models"
+```
+
+**Field Reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `dir` | String | `"models"` | Root directory for model assets (uploads, registry downloads) |
 
 ### [ocr] - Text Recognition
 
