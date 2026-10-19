@@ -8,5 +8,6 @@
 pub mod ai_bridge;
 pub mod bootstrap;
 pub mod hotplug;
+pub mod sound_bridge;
 pub mod voice_bridge;
 pub mod zone_bridge;
