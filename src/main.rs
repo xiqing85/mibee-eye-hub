@@ -167,13 +167,44 @@ async fn main() -> anyhow::Result<()> {
     // engine is built. The LLM tier model resolves first (#30-E) so the
     // gate charges the file that will actually load.
     let mem = streaming::tools::memory_mib().unwrap_or((0, 0));
+    // Named boot tier (#40 named-tier addendum): "auto" (default) derives
+    // from the hardware profile; a pinned name selects the preset
+    // directly. Unknown pins warn and fall back to hardware derivation —
+    // a typo must not fail the boot.
+    let hardware = streaming::feature_gate::HardwareProfile::detect();
+    let (tier, tier_source) = match streaming::feature_gate::Tier::from_name(&config.resources.tier)
+    {
+        Some(t) => (t, streaming::feature_gate::TierSource::Config),
+        None if config.resources.tier.is_empty() || config.resources.tier == "auto" => (
+            streaming::feature_gate::resolve_tier(&hardware, mem.0),
+            streaming::feature_gate::TierSource::Hardware,
+        ),
+        None => {
+            tracing::warn!(
+                tier = %config.resources.tier,
+                "resources.tier: unknown preset name (want minimal|basic|standard|full|auto); \
+                 falling back to hardware auto tier"
+            );
+            (
+                streaming::feature_gate::resolve_tier(&hardware, mem.0),
+                streaming::feature_gate::TierSource::Hardware,
+            )
+        }
+    };
     let (llm_model, llm_tier) = streaming::tools::resolve_llm_tier(
         &config.llm.model_path,
         &config.llm.model_path_mid,
         &config.llm.model_path_lite,
         config.resources.auto_tier,
         mem.1,
+        hardware.physical_cores,
+        &config.resources.tier,
     );
+    let tier_ctx = streaming::feature_gate::TierContext {
+        tier,
+        source: tier_source,
+        profile: hardware,
+    };
     if llm_model != config.llm.model_path {
         config.llm.model_path = llm_model;
     }
@@ -288,20 +319,24 @@ async fn main() -> anyhow::Result<()> {
     let resource_profile = Arc::new(streaming::feature_gate::plan(
         &feature_inputs,
         &config.resources.feature_gate,
+        &tier_ctx,
         mem.0,
         mem.1,
         config.resources.reserve_mib,
     ));
     // Apply the plan: a non-admitted enabled feature is turned off in the
     // config copy every engine reads — the engines' own fail-open logs
-    // then explain it exactly like a config-disabled feature.
+    // then explain it exactly like a config-disabled feature. `disables()`
+    // covers both shed classes (off_budget, off_tier) so the loop also
+    // disables tier-excluded features; off_config/dependency/unknown
+    // reasons are informational here (config stays as the user set it).
     let mut accounted_mib: u64 = 0;
     for d in &resource_profile.features {
         if d.admitted {
             accounted_mib = accounted_mib.saturating_add(d.cost_mib);
             continue;
         }
-        if d.reason != streaming::feature_gate::REASON_OFF_BUDGET {
+        if !streaming::feature_gate::disables(d.reason) {
             continue;
         }
         // `accounted_mib` is what earlier, higher-priority features already
@@ -310,14 +345,24 @@ async fn main() -> anyhow::Result<()> {
         // like it should have fit, and an operator debugging a missing VLM
         // would reasonably conclude the gate is broken. The admission test is
         // `accounted + cost <= budget`, so that is the arithmetic to show.
-        tracing::warn!(
-            feature = d.name,
-            cost_mib = d.cost_mib,
-            accounted_mib,
-            budget_mib = resource_profile.budget_mib,
-            "resource gate: feature shed by boot memory budget \
-             (earlier features already account for {accounted_mib} MiB)"
-        );
+        match d.reason {
+            streaming::feature_gate::REASON_OFF_BUDGET => tracing::warn!(
+                feature = d.name,
+                cost_mib = d.cost_mib,
+                accounted_mib,
+                budget_mib = resource_profile.budget_mib,
+                "resource gate: feature shed by boot memory budget \
+                 (earlier features already account for {accounted_mib} MiB)"
+            ),
+            streaming::feature_gate::REASON_OFF_TIER => tracing::warn!(
+                feature = d.name,
+                tier = %resource_profile.tier,
+                tier_source = %resource_profile.preset_source,
+                "resource gate: feature outside the boot tier preset \
+                 (excluded features cost nothing against the budget)"
+            ),
+            _ => {}
+        }
         match d.name {
             "ai" => config.ai.enabled = false,
             "audio_ai" => config.audio_ai.enabled = false,
@@ -334,6 +379,11 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!(
         mode = %resource_profile.mode,
+        tier = %resource_profile.tier,
+        tier_source = %resource_profile.preset_source,
+        hardware_cores = resource_profile.profile.physical_cores,
+        hardware_simd = resource_profile.profile.simd.name(),
+        hardware_battery = resource_profile.profile.battery,
         available_mib = resource_profile.available_mib,
         total_mib = resource_profile.total_mib,
         budget_mib = resource_profile.budget_mib,
