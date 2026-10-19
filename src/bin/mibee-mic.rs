@@ -1,4 +1,4 @@
-//! mibee-mic — audio-pickup form (design §2 basic form 2): microphone, sound events, speech-to-text records. Skeleton phase — assembly shared with the full form.
+//! mibee-mic — audio-pickup form (design §2 basic form 2): microphone, sound events, ASR transcribe records, KWS/speaker. Form-gated to the audio family (runtime/forms.rs).
 use clap::Parser;
 
 use mibee_eye::runtime::full::{Args, run_full};

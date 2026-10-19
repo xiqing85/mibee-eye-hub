@@ -1,4 +1,4 @@
-//! mibee-talk — intercom form (design §2 basic form 3): talkback plus PTZ. Skeleton phase — assembly shared with the full form.
+//! mibee-talk — intercom form (design §2 basic form 3): talkback plus PTZ. Form-gated to audio in+out (runtime/forms.rs).
 use clap::Parser;
 
 use mibee_eye::runtime::full::{Args, run_full};
