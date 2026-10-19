@@ -1,0 +1,5 @@
+# 棘轮基线（行覆盖 %，tools/check-coverage.sh 比较用）。
+# 权威口径 = GitHub Actions coverage job 实测——本地与 CI 有环境差
+# （desktop/dbus/音频设备路径，实测本地 79.37 vs CI 78.82），--update
+# 前以 CI 数字为准。78.5 = 首次 CI 实测 78.82 减去运行间抖动余量。
+78.5

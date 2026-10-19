@@ -57,10 +57,12 @@ scp -q -r "$OUT_DIR/migrations/"* "$HOST:$REMOTE_DIR/migrations/"
 echo "  Copying config (as config.local.toml — local override)..."
 scp -q "$OUT_DIR/config.toml" "$HOST:$REMOTE_DIR/config.local.toml"
 
-# ── 4. Atomic swap of the binary ─────────────────────────────────────────────
+# ── 4. Atomic swap + backup rotation ─────────────────────────────────────────
 # Move the new binary into place atomically. If the service is running, the
 # old inode stays open until restart; the new file is picked up on next start.
-ssh "$HOST" "chmod +x $REMOTE_DIR/mibee-eye.new && mv -f $REMOTE_DIR/mibee-eye.new $REMOTE_DIR/mibee-eye"
+# The replaced binary becomes a dated .bak, pruned to the newest 3 —
+# unbounded .bak piles cost ~95MB each (mibee-rec #1).
+ssh "$HOST" "cd $REMOTE_DIR && if [ -f mibee-eye ]; then cp -p mibee-eye mibee-eye.bak-\$(date +%Y%m%d-%H%M); ls -1t mibee-eye.bak-* 2>/dev/null | tail -n +4 | xargs -r rm -f; fi && chmod +x mibee-eye.new && mv -f mibee-eye.new mibee-eye"
 
 # ── 5. Verify camera device access ───────────────────────────────────────────
 echo "  Verifying camera device access..."
