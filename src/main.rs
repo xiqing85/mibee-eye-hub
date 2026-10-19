@@ -986,93 +986,17 @@ async fn main() -> anyhow::Result<()> {
     // Zone-event engine: tracked detections × user zones → intrusion /
     // loiter / line-cross events → SSE `zone_event` + GB Alarm NOTIFY
     // (same pinned triple; description names the zone).
-    {
-        let mut track_events = ai_engine.subscribe_tracks();
-        let bridge_tx = event_tx.clone();
-        let zones_ref = shared_zones.clone();
-        let grounding_zones = Arc::clone(&grounding_state);
-        let notifier_slot = Arc::clone(&notifier_slot);
-        let alarm_notify_gate = Arc::clone(&alarm_notify_gate);
-        let desktop_zone_alarm = Arc::clone(&desktop);
-        tokio::spawn(async move {
-            let mut engines: HashMap<String, streaming::ai::zones::ZoneEngine> = HashMap::new();
-            loop {
-                match track_events.recv().await {
-                    Ok(ev) => {
-                        let zones = zones_ref.read().clone();
-                        if zones.is_empty() {
-                            continue;
-                        }
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        let engine = engines.entry(ev.camera_id.clone()).or_default();
-                        for ze in engine.update(
-                            &ev.camera_id,
-                            zones.get(&ev.camera_id).map_or(&[], Vec::as_slice),
-                            &ev.tracks,
-                            now_ms,
-                        ) {
-                            let kind = match ze.event {
-                                streaming::ai::zones::ZoneEventKind::Intrusion => "intrusion",
-                                streaming::ai::zones::ZoneEventKind::Loiter => "loiter",
-                                streaming::ai::zones::ZoneEventKind::LineCross {
-                                    forward: true,
-                                } => "line_cross_forward",
-                                streaming::ai::zones::ZoneEventKind::LineCross {
-                                    forward: false,
-                                } => "line_cross_backward",
-                            };
-                            tracing::info!(
-                                camera = %ze.camera_id,
-                                zone = %ze.zone,
-                                kind,
-                                track = ze.track_id,
-                                "zones: event"
-                            );
-                            grounding_zones.record_zone_event(
-                                &ze.camera_id,
-                                ze.timestamp_ms,
-                                &ze.zone,
-                            );
-                            let _ = bridge_tx.send(web::routes::events::CameraEvent::ZoneEvent {
-                                camera_id: ze.camera_id.clone(),
-                                zone: ze.zone.clone(),
-                                event: kind.to_string(),
-                                track_id: ze.track_id,
-                                label: ze.label.clone(),
-                                timestamp_ms: ze.timestamp_ms,
-                            });
-                            // Desktop notification (SPEC appendix A #42).
-                            desktop_zone_alarm.notify_alarm("zone", 1, Some(&ze.zone));
-                            if alarm_notify_gate.load(std::sync::atomic::Ordering::SeqCst) {
-                                let notifier =
-                                    notifier_slot.lock().expect("gb notifier slot lock").clone();
-                                if let Some(n) = notifier {
-                                    let description = format!("zone event: {} ({kind})", ze.zone);
-                                    let sent = n.send_alarm(
-                                        "4",
-                                        "5",
-                                        &gb28181_rs::client::format_gb_time_ms(ze.timestamp_ms),
-                                        "2",
-                                        &description,
-                                    );
-                                    if !sent {
-                                        tracing::debug!("alarm notify: no active subscription");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(skipped = n, "zones: bridge lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+    // (M1 slice 4: the block itself lives in runtime::zone_bridge now.)
+    mibee_eye::runtime::zone_bridge::ZoneBridge {
+        events: ai_engine.subscribe_tracks(),
+        bridge_tx: event_tx.clone(),
+        zones: shared_zones.clone(),
+        grounding: Arc::clone(&grounding_state),
+        notifier_slot: Arc::clone(&notifier_slot),
+        alarm_notify_gate: Arc::clone(&alarm_notify_gate),
+        desktop: Arc::clone(&desktop),
     }
+    .spawn();
 
     // Voice interactions → SSE `voice_transcript`; when the local LLM is
     // active, non-empty transcripts also get one auto-reply (SSE
@@ -1258,100 +1182,12 @@ async fn main() -> anyhow::Result<()> {
 
     let protocol_runtime = Arc::new(Mutex::new(protocol_runtime));
 
-    // ── Hot-plug monitor: auto-discover plugged cameras, mark unplugged ──
-    //
-    // Listens to kernel netlink uevents for the video4linux subsystem.
-    // On ADD: re-runs auto-discovery (does NOT auto-start the stream).
-    // On REMOVE: marks the camera offline in DB and gracefully stops its
-    //   active stream (flushing any in-progress recording segment).
-    let hotplug_tx = event_tx.clone();
-    let hotplug_db = pool.clone();
-    let hotplug_stream_manager = stream_manager.clone();
-    let hotplug_handle = tokio::spawn(async move {
-        // Diagnostic escape hatch: MIBEE_DISABLE_HOTPLUG=1 skips the netlink
-        // monitor entirely (used to bisect runtime starvation).
-        if std::env::var_os("MIBEE_DISABLE_HOTPLUG").is_some_and(|v| v != "0") {
-            tracing::warn!("hot-plug monitor disabled via MIBEE_DISABLE_HOTPLUG");
-            return;
-        }
-        let monitor = match capture::hotplug::HotplugMonitor::new() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to start hot-plug monitor; camera plug/unplug will not be detected");
-                return;
-            }
-        };
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        tokio::spawn(async move {
-            monitor.run(tx).await;
-        });
-
-        while let Some(event) = rx.recv().await {
-            match event {
-                capture::hotplug::HotplugEvent::Added { device_index, .. } => {
-                    tracing::info!(device_index, "camera plugged in, running auto-discovery");
-                    // Re-run discovery. Does NOT auto-start (user decision).
-                    match web::db::auto_discover_cameras(&hotplug_db).await {
-                        Ok(n) if n > 0 => {
-                            // Find the newly-added camera to broadcast event.
-                            let cameras =
-                                web::db::list_cameras(&hotplug_db).await.unwrap_or_default();
-                            for cam in cameras.iter().filter(|c| {
-                                c.camera_type == "usb"
-                                    && c.config.get("device_index").and_then(|v| v.as_u64())
-                                        == Some(device_index as u64)
-                            }) {
-                                let _ = hotplug_tx.send(
-                                    web::routes::events::CameraEvent::CameraAdded {
-                                        camera_id: cam.id.clone(),
-                                        device_index,
-                                        name: cam.name.clone(),
-                                    },
-                                );
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(error = %e, "auto-discovery after hot-plug failed")
-                        }
-                    }
-                }
-                capture::hotplug::HotplugEvent::Removed { device_index } => {
-                    tracing::info!(device_index, "camera unplugged, marking offline");
-                    match web::db::mark_cameras_offline_by_device_index(
-                        &hotplug_db,
-                        device_index as i64,
-                    )
-                    .await
-                    {
-                        Ok(camera_ids) => {
-                            for cam_id in &camera_ids {
-                                // Gracefully stop the active stream (flushes FileOutput).
-                                if hotplug_stream_manager.has_stream(cam_id).await {
-                                    tracing::info!(camera_id = %cam_id, "stopping stream for unplugged camera");
-                                    if let Err(e) = hotplug_stream_manager.stop_stream(cam_id).await
-                                    {
-                                        tracing::warn!(camera_id = %cam_id, error = %e, "failed to stop stream for unplugged camera");
-                                    }
-                                }
-                                // Broadcast SSE event.
-                                let _ = hotplug_tx.send(
-                                    web::routes::events::CameraEvent::CameraOfflined {
-                                        camera_id: cam_id.clone(),
-                                        device_index,
-                                    },
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, device_index, "failed to mark camera offline");
-                        }
-                    }
-                }
-            }
-        }
-    });
+    let hotplug_handle = mibee_eye::runtime::hotplug::HotplugWatch {
+        bridge_tx: event_tx.clone(),
+        pool: pool.clone(),
+        stream_manager: stream_manager.clone(),
+    }
+    .spawn();
     protocol_handles.push(hotplug_handle);
     // Periodic session cleanup — runs every 5 minutes to purge expired auth sessions
     let cleanup_db_path = db_path_str.clone();
