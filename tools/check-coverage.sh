@@ -30,7 +30,12 @@ if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
     exit 1
 fi
 
-summary=$(cargo llvm-cov --workspace --lib --summary-only 2>/dev/null) || { echo "✗ 覆盖率测量失败"; exit 1; }
+# --ignore-filename-regex：组合根文件是装配序列（full.rs=引擎构造→桥
+# 接线→起服务；web_server.rs=34 参依赖结构+原样转发），行为由设备冒烟
+# 套件验证，不计入单测分母——否则共享装配会把棘轮拖成"为装配行数
+# 买单"。有可测逻辑的装配模块（models/protocols 等）照常计入。
+summary=$(cargo llvm-cov --workspace --lib --summary-only \
+    --ignore-filename-regex 'src/runtime/(full|web_server)\.rs' 2>/dev/null) || { echo "✗ 覆盖率测量失败"; exit 1; }
 
 # TOTAL 行的 Lines Cover% 列（Region %、Functions % 之后第三个百分数）。
 measured=$(echo "$summary" | awk '

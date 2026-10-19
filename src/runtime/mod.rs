@@ -7,7 +7,11 @@
 
 pub mod ai_bridge;
 pub mod bootstrap;
+pub mod full;
 pub mod hotplug;
+pub mod models;
+pub mod protocols;
 pub mod sound_bridge;
 pub mod voice_bridge;
+pub mod web_server;
 pub mod zone_bridge;
