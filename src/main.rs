@@ -163,6 +163,16 @@ async fn main() -> anyhow::Result<()> {
         loki_labels,
     )?;
 
+    // Build provenance (mibee-rec#1): one authoritative startup line mapping
+    // this binary to its source commit — no more archaeology on file mtimes.
+    // Must live after init_tracing or it is silently dropped (known gotcha).
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        sha = env!("MITBEE_BUILD_SHA"),
+        dirty = env!("MITBEE_BUILD_DIRTY") == "1",
+        "mibee-eye starting"
+    );
+
     // Feature-level resource admission (SPEC appendix A #40), before any
     // engine is built. The LLM tier model resolves first (#30-E) so the
     // gate charges the file that will actually load.
@@ -3053,5 +3063,19 @@ fn get_first_non_loopback_ipv4() -> Option<String> {
         }
         libc::freeifaddrs(ifap);
         ip
+    }
+}
+
+#[cfg(test)]
+mod build_provenance_tests {
+    /// The startup banner's sha is stamped by `build.rs`: a short git hex
+    /// hash, or the honest `"unknown"` when built outside a repository.
+    #[test]
+    fn build_sha_is_git_hex_or_unknown() {
+        let sha = env!("MITBEE_BUILD_SHA");
+        assert!(
+            sha == "unknown" || (sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())),
+            "unexpected build sha: {sha}"
+        );
     }
 }

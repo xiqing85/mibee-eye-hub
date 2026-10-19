@@ -189,6 +189,9 @@ pub async fn get_capabilities(
             "vendor": "MiBee Studio",
         },
         "auth": {"model": "session", "setup": true},
+        // Build provenance (mibee-rec#1): version + git sha + dirty flag
+        // stamped at compile time — additive wire key, old frontends ignore.
+        "build": build_document(),
         "multi_camera": true,
         "camera_management": true,
         "camera_control": true,
@@ -299,6 +302,18 @@ fn observability_document() -> serde_json::Value {
     })
 }
 
+/// The `build` provenance object (mibee-rec#1): the running binary's
+/// version, git sha and dirty flag, embedded by this crate's `build.rs`.
+/// Lets a deployment be verified against an expected commit without file
+/// mtime archaeology; `sha: "unknown"` honestly marks a git-less build.
+fn build_document() -> serde_json::Value {
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "sha": env!("MITBEE_BUILD_SHA"),
+        "dirty": env!("MITBEE_BUILD_DIRTY") == "1",
+    })
+}
+
 /// The `tools` capability object (SPEC §3.5) — same nesting-trick as
 /// [`observability_document`].
 fn tools_document(enabled: bool, count: usize) -> serde_json::Value {
@@ -335,6 +350,20 @@ mod tests {
         };
         let json = serde_json::to_value(&resp).expect("must serialise");
         assert!(json.get("system").is_some());
+    }
+
+    /// Build provenance (mibee-rec#1): the wire shape is version + a
+    /// short git hash (or the honest `"unknown"`) + a boolean dirty flag.
+    #[test]
+    fn build_provenance_is_advertised() {
+        let doc = super::build_document();
+        assert_eq!(doc["version"], env!("CARGO_PKG_VERSION"));
+        let sha = doc["sha"].as_str().expect("sha is a string");
+        assert!(
+            sha == "unknown" || (sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())),
+            "unexpected build sha: {sha}"
+        );
+        assert!(doc["dirty"].is_boolean());
     }
 
     /// The capability superset is hand-built JSON — a check that the
