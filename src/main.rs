@@ -69,23 +69,9 @@ const VLM_DESC_MIN_INTERVAL_MS: u64 = 120_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Cap the OpenMP pool before any ORT session spawns it (hosts like
-    // .40 have no swap — an oversubscribed spin-waiting pool is an
-    // OOM/latency hazard). Halve the logical CPUs, clamped to [1, 4];
-    // a user-provided OMP_NUM_THREADS always wins.
-    if std::env::var_os("OMP_NUM_THREADS").is_none() {
-        let logical = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2);
-        let omp = (logical / 2).clamp(1, 4);
-        // SAFETY: single-threaded startup, before any worker exists.
-        unsafe { std::env::set_var("OMP_NUM_THREADS", omp.to_string()) };
-    }
-
-    // Install rustls crypto provider (required for rustls 0.23+)
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install rustls crypto provider");
+    // Process-level setup (OpenMP cap + rustls provider) lives in the
+    // runtime tree now (design-capability-split M1 slice 1).
+    mibee_eye::runtime::bootstrap::init_process_env();
 
     let args = Args::parse();
 
