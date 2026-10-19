@@ -5,5 +5,6 @@
 //! extraction is complete. Modules land one slice per commit, each with
 //! zero behavior change against the previous layout.
 
+pub mod ai_bridge;
 pub mod bootstrap;
 pub mod voice_bridge;
