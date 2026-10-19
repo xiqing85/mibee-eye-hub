@@ -42,6 +42,7 @@ advertised_host = "192.168.1.100"
 | `port` | u16 | `8443` | Web UI 和 REST API 的 HTTPS 端口（必须 > 1024） |
 | `host` | String | `"0.0.0.0"` | 绑定地址：`"0.0.0.0"`（所有接口）或 `"127.0.0.1"`（仅本地主机） |
 | `advertised_host` | Option<String> | `None` | 返回给客户端的 URL 的通告主机名/IP。如果为 None，则在启动时通过 UDP 探测自动检测。消除外部 URL 中的硬编码 localhost。 |
+| `http_port` | u16 | `0` | 可选的附加纯 HTTP 监听口，局域网免 TLS 访问（SPEC 附录 A）。0 = 关闭。该监听口签发的会话 cookie 不带 `Secure` 标记；TLS 口的照常携带。 |
 
 **注意事项：**
 
@@ -180,6 +181,15 @@ auto_tier = false       # 按可用内存选 LLM 档位模型
 `mibee_eye_feature_admitted` / `mibee_eye_resource_budget_mib` Prometheus
 gauge 输出。重启时按届时水位重算。
 
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `tier` | String | `"auto"` | 具名硬件档位（`full` / `balanced` / `lite` / `auto` = 按检测到的硬件推导） |
+| `auto_tier` | bool | `false` | 单键简写：按可用内存选 LLM 档位模型（full/mid/lite，对应 `[llm]` 的模型路径） |
+| `feature_gate` | String | `"auto"` | `"auto"` 按启动内存预算贪心准入；`"all"` 无视内存全量启动 |
+| `reserve_mib` | u64 | `512` | 从准入预算中保留的余量（MiB；MemAvailable 本已含可回收缓存） |
+
 ### [conversations] - 对话记录（规范 §3.4）
 
 人读对话日志总开关：每轮对话（语音或网页）落 SQLite——听到/输入文本、内部"思考"条目（决策/云端/VLM/本地 LLM/TTS，含失败回落腿）与 AI 回复及引擎——经 `GET /api/conversations` 查询、SSE `conversation` 事件实时推送（助手页"对话记录"卡）。FIFO 封顶 1000 轮；写失败绝不影响对话管线。`enabled = false` 不记录且隐藏卡片（隐私开关）。
@@ -188,6 +198,12 @@ gauge 输出。重启时按届时水位重算。
 [conversations]
 enabled = true
 ```
+
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `enabled` | bool | `true` | 对话记录总开关；`false` 不记录且隐藏对话记录卡（隐私开关） |
 
 ### [agent] - 对话 Agent 工具与技能（SPEC §3.5 / 附录 A #43）
 
@@ -220,6 +236,16 @@ args = ["/home/you/.config/mibee-eye/mcp/home_tools.py"]
 voice_tool_gate = true
 ```
 
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `enabled` | bool | `true` | 总开关。注册表为空时开=true 也是 no-op——循环至少需要一个工具才介入 |
+| `max_steps` | u32 | `3` | 工具调用轮数上限；最后一轮去掉工具表，模型必须给文字答案 |
+| `step_timeout_ms` | u64 | `15_000` | 单次工具执行超时（毫秒） |
+| `voice_tool_gate` | bool | `true` | 语音轮仅在话术命中工具意图（天气/时间/画面/设备控制）时携带工具表；HTTP 恒全量 |
+| `mcp_servers` | 表数组 | `[]` | MCP stdio 服务器（`[[agent.mcp_servers]]`）：每项 `name`、`command`、`args`、`env` |
+
 ### [away] - 离家模式值守（规范 §3.6 / 附录 A #44）
 
 主人不在家时的值守。搭在既有 AI 检测流上（不另建采样管线）：
@@ -243,18 +269,30 @@ greeting_known = "欢迎回家，{name}。"     # {name} = 已登记人脸名
 greeting_unknown = "你好，这里是主人的智能看家助手。主人现在不在家，请问你是谁？"
 ```
 
-六项运行时能力**可 Web 热配置**（`PUT /api/config` 的 `scene.away.*`，
-即时生效；上方 TOML 仅播种启动默认值）：
+**字段参考**（全部**可 Web 热配置**：`PUT /api/config` 的 `scene.away.*`，
+即时生效；上方 `[away]` TOML 仅播种启动默认值）：
 
-| 键 | 缺省 | 含义 |
-|----|------|------|
-| `scene.away.voice_control` | `true` | "我要出门了/我回来了"语音布防/撤防（内建意图，先于 LLM） |
-| `scene.away.summary_on_disarm` | `true` | 撤防生成摘要（本地 LLM 一句话，回落纯统计文案）；API 响应携带、语音撤防时播报 |
-| `scene.away.deterrence` | `false` | 陌生人未应答先二次追问（`reask_text`、半窗），再播 `deterrence_text` |
-| `scene.away.reask_text` / `deterrence_text` | 见 TOML | 两条升级话术 |
-| `scene.away.schedule_arm` / `schedule_disarm` | `""` | `HH:MM` 本地时间边界沿，空=该沿关闭；`schedule_weekdays_only`（缺省 `false`）仅工作日 |
-| `scene.away.push_url` | `""` | 访客推送 webhook：每访客事件一次 JSON POST（纯文本、永不含图像），5s 超时 fail-open。**空值保持完全离线**——配置 URL 即知情选择外发文本 |
-| `scene.away.audio_link` | `true` | 布防期间投票声音上升沿也落离家活动记录（labels `🔊 类别 置信度`，按活动冷却） |
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `interval_ms` | u64 | `1000` | 事件节流下限，叠加在 `[ai]` 采样间隔上（不另建管线） |
+| `person_gap_secs` | u64 | `10` | 人员消失宽限秒数，超过即视为访客离开 |
+| `greeting_cooldown_secs` | u64 | `120` | 两次问候交互的最小间隔 |
+| `activity_cooldown_secs` | u64 | `60` | 同类活动记录的最小间隔 |
+| `activity_labels` | Vec<String> | `["cat","dog","bird"]` | 计入"活动"记录的检测类别 |
+| `listen_secs` | u64 | `10` | 问候后的一次性免唤醒监听窗 |
+| `snapshot_dir` | String | `"away-snapshots"` | 访客快照 JPEG 目录（相对工作目录）；修剪/清空同步删文件 |
+| `greeting_known` | String | `"欢迎回家，{name}。"` | 已登记人脸的问候（`{name}` = 人名） |
+| `greeting_unknown` | String | `"你好，这里是主人的智能看家助手。主人现在不在家，请问你是谁？"` | 陌生访客的问候+询问来意 |
+| `voice_control` | bool | `true` | "我要出门了/我回来了"语音布防/撤防（内建意图，先于 LLM） |
+| `summary_on_disarm` | bool | `true` | 撤防生成摘要（本地 LLM 一句话，回落纯统计文案）；API 响应携带、语音撤防时播报 |
+| `deterrence` | bool | `false` | 陌生人未应答先二次追问（`reask_text`、半窗），再播 `deterrence_text` |
+| `deterrence_text` | String | `"请注意：您的影像和声音已被记录，主人将收到通知。"` | 对沉默陌生人的威慑话术 |
+| `reask_text` | String | `"请问你是谁？请说明来意。"` | 问候未应答时的二次追问话术 |
+| `schedule_arm` | String | `""` | `HH:MM` 本地时间每日布防沿，空=关闭。窗口内手动状态不被对抗 |
+| `schedule_disarm` | String | `""` | `HH:MM` 本地时间每日撤防沿，空=关闭 |
+| `schedule_weekdays_only` | bool | `false` | 定时沿仅工作日触发 |
+| `push_url` | String | `""` | 访客推送 webhook：每访客事件一次 JSON POST（纯文本、永不含图像），5s 超时 fail-open。**空值保持完全离线**——配置 URL 即知情选择外发文本 |
+| `audio_link` | bool | `true` | 布防期间投票声音上升沿也落离家活动记录（labels `🔊 类别 置信度`，按活动冷却） |
 
 ### [desktop] - 托盘图标与桌面通知（规范 附录 A #42）
 
@@ -266,6 +304,14 @@ tray = true                # StatusNotifierItem 托盘图标
 notifications = true       # 告警上升沿桌面通知
 notify_conversations = false  # 语音回复完成时也通知
 ```
+
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `tray` | bool | `true` | StatusNotifierItem 托盘图标（点击打开 Web 界面） |
+| `notifications` | bool | `true` | 告警上升沿桌面通知 |
+| `notify_conversations` | bool | `false` | 语音回复播报完成时也通知 |
 
 
 ### [observability] - 监控和日志记录
@@ -351,6 +397,9 @@ events_enabled = true
 | `firmware_version` | String | `"1.0.0"` | 固件版本 |
 | `port` | u16 | `3702` | WS-Discovery UDP 端口（硬编码） |
 | `events_enabled` | bool | `true` | Pull-Point 事件服务：AI 运动告警以 `tns1:VideoSource/MotionAlarm` 推送给持有订阅的 NVR |
+| `media2_enabled` | bool | `true` | 在经典 Media 之外提供 ONVIF Media2（Profile T）端点 |
+| `http_digest` | bool | `false` | SOAP 监听的 HTTP Digest 认证（缺省 WS-UsernameToken） |
+| `ip_filter` | Vec<String> | `[]` | SOAP 监听 IPv4 白名单（`a.b.c.d[/prefix]`）；空=不过滤，非空时表外对端在任何 SOAP 处理前得 403。重启生效 |
 
 **注意事项：**
 
@@ -447,6 +496,68 @@ max_capacity_mb = 10240
 - 模型文件是不进 git 的部署期下载——来源、体积与许可见
   [`models/README.md`](../../models/README.md)。
 
+### [watermark] - 视频水印叠加
+
+在编码流上烙入文本/时间戳叠加（SPEC v1 §5.2）。此处仅为启动引导默认——
+运行时设置存 DB（`protocols.watermark`），在 Web UI 编辑。
+
+```toml
+[watermark]
+enabled = false
+```
+
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `enabled` | bool | `false` | 总开关 |
+| `text` | String | `""` | 自定义文本（≤128 字符）；CJK 需带 CJK 字形的 `font_path` |
+| `show_timestamp` | bool | `true` | 烙入时间戳行 |
+| `timestamp_format` | String | `"%Y-%m-%d %H:%M:%S"` | strftime 子集：`%Y %m %d %H %M %S %F %T %%` + 字面量 |
+| `position` | String | `top_left` | `top_left` / `top_right` / `bottom_left` / `bottom_right` 之一 |
+| `font_size` | u32 | `24` | 像素高，12..96 |
+| `font_path` | String | `""` | 可选 TTF/OTF（CJK 必需）；空 = 内嵌 ASCII 子集字体 |
+
+### [webrtc] - WebRTC 播放（实验性）
+
+Whep 风格 WebRTC 播放端点。ICE candidate 从一个小 UDP 端口段收集；
+STUN 服务器支撑非局域网拓扑（空 = 仅 host candidates）。
+
+```toml
+[webrtc]
+enabled = false
+```
+
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `enabled` | bool | `false` | 总开关 |
+| `udp_port_min` | u16 | `0` | ICE host candidate 的 UDP 端口段起点（0 = 系统自选） |
+| `udp_port_max` | u16 | `0` | UDP 端口段终点（含；0 = 系统自选） |
+| `stun_servers` | String | `""` | 逗号分隔的 STUN URL（如 `stun:stun.l.google.com:19302`）；空 = 仅局域网 host candidates |
+
+### [ai] - 目标检测（NanoDet-Plus）
+
+视觉目标检测，喂给告警、区域与离家看家。默认关——与出站协议同为
+opt-in。
+
+```toml
+[ai]
+enabled = false
+```
+
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `enabled` | bool | `false` | 总开关 |
+| `model` | String | `"nanodet-plus-m-320"` | 启动模型注册表 id（SPEC §4.6）；非缺省 `model_path` 覆盖它 |
+| `allow_upload` | bool | `false` | 允许运行时上传模型（SPEC §4.6 能力 `ai_upload`；模型文件属不可信输入） |
+| `model_path` | String | `"models/nanodet-m.onnx"` | NanoDet-Plus ONNX 路径（相对工作目录或绝对） |
+| `confidence_threshold` | f32 | `0.5` | 检测上报的最小置信度（0..=1） |
+| `interval_ms` | u64 | `1000` | 每相机两次推理的最小间隔 |
+
 ### [audio_ai] - 声音事件检测
 
 常驻麦克风监听 + YAMNet 分类。关注的声音类别触发时（投票平滑、逐类冷却），
@@ -524,11 +635,19 @@ barge_in = "off"
 | 字段 | 类型 | 默认值 | 描述 |
 |------|------|---------|------|
 | `enabled` | bool | `false` | 主开关（需 `voice` 构建特性）。 |
-| `kws_encoder` / `kws_decoder` / `kws_joiner` / `kws_tokens` | String | `models/voice/kws/…` | Zipformer transducer KWS 模型三件套 + tokens。 |
+| `kws_encoder` | String | `"models/voice/kws/encoder.int8.onnx"` | Zipformer transducer KWS 编码器 |
+| `kws_decoder` | String | `"models/voice/kws/decoder.int8.onnx"` | Zipformer transducer KWS 解码器 |
+| `kws_joiner` | String | `"models/voice/kws/joiner.int8.onnx"` | Zipformer transducer KWS joiner |
+| `kws_tokens` | String | `"models/voice/kws/tokens.txt"` | KWS tokens 文件 |
+| `wake_word` | String | `"小蜜蜂"` | KWS 监听的唤醒短语 |
 | `keywords_file` | String | `"models/voice/kws/keywords.txt"` | 关键词文件，每行 `音素串 @显示名`（zh-en 音素模型，如 `x iǎo m ì f ēng @小蜜蜂`）。 |
 | `keywords_threshold` | f32 | `0.25` | 唤醒灵敏度——越低越容易触发。 |
 | `keywords_score` | f32 | `1.0` | 接受唤醒的最低得分。 |
-| `paraformer_model` / `paraformer_tokens` | String | `models/voice/paraformer/…` | 离线 paraformer 转写模型。缺省为中文版（普通话+嵌入英文）；**粤语/普通话/英语请换三语版**（`models/voice/paraformer-trilingual/…`，234MB，Apache-2.0，见 `models/README.md`）。 |
+| `paraformer_model` | String | `"models/voice/paraformer/model.int8.onnx"` | 离线 paraformer 转写模型。缺省为中文版（普通话+嵌入英文）；**粤语/普通话/英语请换三语版**（`models/voice/paraformer-trilingual/…`，234MB，Apache-2.0，见 `models/README.md`）。 |
+| `paraformer_tokens` | String | `"models/voice/paraformer/tokens.txt"` | paraformer tokens 文件 |
+| `follow_up_window_secs` | f32 | `0.0` | 回复后的免唤醒跟问窗（0 = 关闭；离家监听与打断轮按需临时武装） |
+| `vad_model` | String | `"models/voice/vad/silero_vad.onnx"` | 断句/监听窗用的 Silero VAD |
+| `capture_endpointing` | bool | `true` | 采音期 VAD 断句：说话中软死线顺延，~0.6s 尾静音即切段转写 |
 | `capture_secs` | u32 | `4` | 唤醒词识别后采集音频的秒数。 |
 | `num_threads` | i32 | `1` | 推理线程数（目标主机较小）。 |
 | `speaker_embedding_model` | String | `models/voice/speaker/campplus.onnx` | 说话人声纹嵌入模型（3D-Speaker CAM++ zh_en）。**文件缺失只禁用声纹特性**，唤醒+转写照常。 |
@@ -583,6 +702,8 @@ no_think = true
 | `n_threads` | u32 | 逻辑核数 / 2，钳制 `2..=4` | CPU 线程数。留空则由设备按本机核数自行决定。 |
 | `max_tokens` | u32 | `200` | 每次回复的生成上限。 |
 | `no_think` | bool | `true` | user 轮追加 `/no_think`（关闭 Qwen3 思考模式——更快、对话向）。 |
+| `model_path_mid` | String | `""` | `[resources] auto_tier` 的中档 GGUF（空 = 该档不可用） |
+| `model_path_lite` | String | `""` | `[resources] auto_tier` 的轻档 GGUF（空 = 该档不可用） |
 
 **注意事项：**
 
@@ -692,7 +813,16 @@ num_threads = 4
 |------|------|---------|------|
 | `enabled` | bool | `false` | 主开关。无需 cargo feature。 |
 | `binary` | String | `"tmp/sherpa-libs/tools-bin/bin/sherpa-onnx-offline-tts"` | sherpa-onnx-offline-tts 二进制路径（另行从 k2-fsa release 下载）。 |
-| `model` / `lexicon` / `tokens` / `dict_dir` | String | `models/voice/melo/…` | vits-melo-tts-zh_en 音色资产。 |
+| `model` | String | `"models/voice/melo/model.onnx"` | vits-melo-tts-zh_en 语音模型（普通话主音色） |
+| `lexicon` | String | `"models/voice/melo/lexicon.txt"` | 发音词典 |
+| `tokens` | String | `"models/voice/melo/tokens.txt"` | TTS tokens 文件 |
+| `dict_dir` | String | `"models/voice/melo/dict"` | jieba 词典目录 |
+| `num_threads` | u32 | `2` | TTS 合成线程数 |
+| `yue_model` | String | `""` | 粤语语音模型（空 = 粤语不可用） |
+| `yue_lexicon` | String | `""` | 粤语词典 |
+| `yue_dict_dir` | String | `""` | 粤语词典目录 |
+| `en_model` | String | `""` | 英语语音模型（空 = 英语不可用） |
+| `en_lexicon` | String | `""` | 英语词典 |
 | `rule_fsts` | String | `"…/number.fst,…/date.fst"` | 数字/日期归一化 FST（逗号连接）。 |
 | `player` | String | `"aplay -q"` | 播放命令；留空 = 仅合成（不外放）。 |
 
@@ -708,6 +838,14 @@ weather_enabled = false
 weather_city = ""
 timeout_secs = 5
 ```
+
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `weather_enabled` | bool | `false` | 天气工具总开关 |
+| `weather_city` | String | `""` | 查询城市（空 = 工具无数据） |
+| `timeout_secs` | u64 | `5` | 拉取超时（秒） |
 
 ### [vlm] - 告警画面图像描述
 
@@ -738,6 +876,7 @@ prompt = "这是安防摄像头的告警画面。请用一句中文描述画面�
 | `n_ctx` | u32 | `2048` | 上下文窗口（仅图像就占约 1k 位置）。 |
 | `n_threads` | u32 | `2` | CPU 线程数。 |
 | `max_tokens` | u32 | `100` | 每次描述的生成上限。 |
+| `repeat_penalty` | f32 | `1.1` | 最近 64 个生成 token 的重复惩罚（llama.cpp 语义）。没有它贪心解码会在困难帧的列举项上循环；`1.0` 关闭。 |
 | `prompt` | String | 中文安防措辞指令 | 提供给模型的指令；要求一句话作答。 |
 
 **注意事项：**
@@ -745,6 +884,44 @@ prompt = "这是安防摄像头的告警画面。请用一句中文描述画面�
 - **单飞调度**：同时只跑一个描述，两次描述起点之间有 120 秒下限——检测
   抖动不会把 VLM 负载堆到小主机上。
 - 与 `[llm]` 共享同一 llama.cpp 后端实例与内存 guardrail。
+
+### [face] - 人脸识别
+
+YuNet 检测 + SFace 128 维嵌入（登记、按事件归属姓名、离家看家的已知访客
+问候）。默认关——老机器上 CPU 成本可观。`detect_input` 遵循模型作者参考
+实现；随包 zoo 模型接受动态输入。
+
+```toml
+[face]
+enabled = false
+```
+
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `enabled` | bool | `false` | 总开关 |
+| `detect_model` | String | `"models/face/face_detection_yunet_2023mar.onnx"` | YuNet 检测模型（OpenCV zoo） |
+| `recog_model` | String | `"models/face/face_recognition_sface_2021dec.onnx"` | SFace 识别模型（128 维嵌入） |
+| `detect_input` | u32 | `320` | 检测输入边长；更大可检出更小的脸，CPU 二次方增长 |
+| `match_threshold` | f32 | `0.363` | 姓名匹配的余弦相似度阈值（OpenCV SFace 参考值） |
+| `enroll_frames` | usize | `8` | 一次登记接受的帧数（更多 = 模板更稳） |
+| `ttl_ms` | u64 | `10_000` | 帧龄超过此值即跳过检测 |
+
+### [models] - 模型资产目录
+
+可下载模型资产的根目录（SPEC §4.6 模型管理器）。
+
+```toml
+[models]
+dir = "models"
+```
+
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `dir` | String | `"models"` | 模型资产根目录（上传、注册表下载） |
 
 ### [ocr] - 文字识别
 

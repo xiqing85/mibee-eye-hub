@@ -57,7 +57,10 @@ fn visit(dir: &Path, out: &mut BTreeMap<String, BTreeSet<String>>) {
                 continue;
             };
             let name = tail[..name_end].to_string();
-            if !name.ends_with("Config") {
+            // `*Settings` is the same role under a different suffix (e.g.
+            // WatermarkSettings backs the [watermark] section via re-export
+            // as WatermarkConfig).
+            if !(name.ends_with("Config") || name.ends_with("Settings")) {
                 continue;
             }
             let Some(open) = tail.find('{') else { continue };
@@ -335,4 +338,134 @@ fn documented_literal_defaults_match_the_code() {
         "configuration.md defaults disagree with the code:\n  {}",
         mismatches.join("\n  ")
     );
+}
+
+// ── Reverse conformance: code → docs (issue #5 second half) ────────────────
+//
+// The forward test above catches keys documented that exist nowhere; these
+// three catch the opposite drift: a section or field added to the config
+// structs with no documentation at all.
+
+/// Top-level `[section]` → the Config struct(s) that back it. This list is
+/// asserted to equal AppConfig's field set, so adding a config section
+/// without touching this map (or the docs) fails here.
+const SECTION_STRUCTS: &[(&str, &[&str])] = &[
+    ("web", &["WebConfig"]),
+    ("rtsp", &["RtspConfig"]),
+    ("rtmp_push", &["RtmpPushConfig"]),
+    ("capture", &["CaptureConfig"]),
+    ("security", &["SecurityConfig"]),
+    ("resources", &["ResourcesConfig"]),
+    ("conversations", &["ConversationsConfig"]),
+    ("agent", &["AgentConfig"]),
+    ("away", &["AwayConfig"]),
+    ("desktop", &["DesktopConfig"]),
+    ("observability", &["ObservabilityConfig", "RemoteLogConfig"]),
+    ("onvif", &["OnvifConfig"]),
+    ("gb28181", &["Gb28181Config"]),
+    ("recording", &["RecordingConfig"]),
+    ("watermark", &["WatermarkSettings"]),
+    ("webrtc", &["WebRtcConfig"]),
+    ("ai", &["AiConfig"]),
+    ("audio_ai", &["AudioAiConfig"]),
+    ("voice", &["VoiceConfig"]),
+    ("llm", &["LlmConfig"]),
+    ("decision", &["DecisionConfig"]),
+    ("meeting", &["MeetingConfig"]),
+    ("tts", &["TtsConfig"]),
+    ("tools", &["ToolsConfig"]),
+    ("vlm", &["VlmConfig"]),
+    ("face", &["FaceConfig"]),
+    ("models", &["ModelsConfig"]),
+    ("ocr", &["OcrConfig"]),
+    ("database", &["DatabaseConfig"]),
+];
+
+/// Struct fields documented somewhere other than the section's field table
+/// (nested sub-tables use dotted keys the flat row parser cannot see, or
+/// array-of-tables syntax), with the reason.
+const EXEMPT_FIELDS: &[(&str, &[&str])] = &[
+    // Nested sub-struct, documented as a nested key block in the section.
+    ("gb28181", &["gb35114"]),
+    // Documented as `[[agent.mcp_servers]]` array-of-tables in prose+toml.
+    ("agent", &["mcp_servers"]),
+];
+
+#[test]
+fn section_map_covers_exactly_the_appconfig_fields() {
+    let app = struct_fields()
+        .get("AppConfig")
+        .expect("AppConfig must be scannable")
+        .clone();
+    let mapped: BTreeSet<&str> = SECTION_STRUCTS.iter().map(|(s, _)| *s).collect();
+    let actual: BTreeSet<&str> = app.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        mapped, actual,
+        "SECTION_STRUCTS and AppConfig drifted — new sections must be mapped \
+         AND documented (docs/<locale>/configuration.md)"
+    );
+}
+
+#[test]
+fn every_config_section_is_documented() {
+    for locale in ["en", "zh"] {
+        let path = repo_root().join(format!("docs/{locale}/configuration.md"));
+        let doc = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let documented: BTreeSet<String> = documented_defaults(&doc)
+            .into_keys()
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut missing: Vec<String> = Vec::new();
+        for (section, _) in SECTION_STRUCTS {
+            if !documented.contains(*section) {
+                missing.push(format!("docs/{locale}: no [{section}] section"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "configuration.md is missing sections:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+}
+
+#[test]
+fn every_struct_field_is_documented() {
+    let fields = struct_fields();
+    for locale in ["en", "zh"] {
+        let path = repo_root().join(format!("docs/{locale}/configuration.md"));
+        let doc = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let sections = documented_defaults(&doc);
+        let mut missing: Vec<String> = Vec::new();
+        for (section, structs) in SECTION_STRUCTS {
+            let Some(doc_keys) = sections.get(*section) else {
+                continue; // covered by every_config_section_is_documented
+            };
+            let exempt: BTreeSet<&str> = EXEMPT_FIELDS
+                .iter()
+                .filter(|(s, _)| *s == *section)
+                .flat_map(|(_, fs)| fs.iter().copied())
+                .collect();
+            for struct_name in *structs {
+                let Some(declared) = fields.get(*struct_name) else {
+                    panic!("scanner cannot see {struct_name} — fix the map or scanner");
+                };
+                for field in declared {
+                    if doc_keys.contains_key(field) || exempt.contains(field.as_str()) {
+                        continue;
+                    }
+                    missing.push(format!(
+                        "docs/{locale}: [{section}] {struct_name}.{field} has no doc row"
+                    ));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "config struct fields without documentation (add a row or EXEMPT_FIELDS entry):\n  {}",
+            missing.join("\n  ")
+        );
+    }
 }

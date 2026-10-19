@@ -2,4 +2,10 @@
 # 权威口径 = GitHub Actions coverage job 实测——本地与 CI 有环境差
 # （desktop/dbus/音频设备路径，实测本地 79.37 vs CI 78.82），--update
 # 前以 CI 数字为准。78.5 = 首次 CI 实测 78.82 减去运行间抖动余量。
-78.5
+#
+# 2026-10-19 校准（下调 78.5 → 77.0）：M1 slice 2 把 main() 里 ~1160 行
+# voice 桥迁入 src/runtime/voice_bridge.rs——bin target 不计覆盖、lib
+# 计入，分母一夜变大（CI 78.82 → 77.13），已覆盖代码一行未动。这不是
+# 覆盖率回退而是计量口径扩张；后续 M1 切片会持续把同类编排代码移进
+# lib，配套测试（away_monitor 等低覆盖模块补测）负责把数字顶回 78+。
+77.0
