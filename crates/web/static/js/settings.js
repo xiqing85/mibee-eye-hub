@@ -18,7 +18,20 @@ const ENUMS = {
   'logging.level': ['debug', 'info', 'warn', 'error'],
   'watermark.position': ['top-left', 'top-right', 'bottom-left', 'bottom-right'],
   'protocols.watermark.position': ['top-left', 'top-right', 'bottom-left', 'bottom-right'],
+  // Named boot tier (SPEC appendix A #40 named-tier addendum): "auto"
+  // derives from the hardware, the four names pin the preset outright.
+  'resources.tier': ['auto', 'minimal', 'basic', 'standard', 'full'],
 };
+/// Human label for one resources.tier option.
+function tierOptionLabel(o) {
+  if (o === 'auto') return t('resTierAuto');
+  const names = {
+    minimal: 'resTierMinimal', basic: 'resTierBasic',
+    standard: 'resTierStandard', full: 'resTierFull',
+  };
+  return t(names[o]) || o;
+}
+const ENUM_LABELS = { 'resources.tier': tierOptionLabel };
 // Numeric enum fields render as a <select> too (SPEC appendix A #19: the
 // valid rotation values are exactly these quarter turns). collectConfig
 // feeds select values through maybeNum, so they go back as numbers.
@@ -157,7 +170,10 @@ function buildForm(obj, parent, prefix) {
       stringFields.add(p);
       const en = ENUMS[p];
       if (en) {
-        row.innerHTML = '<label for="cf-' + p + '">' + cfgLabel(p, key) + '</label><select id="cf-' + p + '" data-cfg="' + p + '">' + en.map((o) => '<option ' + (o === val ? 'selected' : '') + '>' + o + '</option>').join('') + '</select>';
+        // Explicit value attributes so a labelled option (ENUM_LABELS)
+        // still submits the canonical enum string, not its label.
+        const lbl = ENUM_LABELS[p];
+        row.innerHTML = '<label for="cf-' + p + '">' + cfgLabel(p, key) + '</label><select id="cf-' + p + '" data-cfg="' + p + '">' + en.map((o) => '<option value="' + esc(o) + '" ' + (o === val ? 'selected' : '') + '>' + esc(lbl ? lbl(o) : o) + '</option>').join('') + '</select>';
       } else if (PASSWORD_FIELDS.has(p)) {
         row.innerHTML = '<label for="cf-' + p + '">' + cfgLabel(p, key) + '</label><div class="password-wrap"><input type="password" id="cf-' + p + '" value="' + esc(String(val)) + '" data-cfg="' + p + '" autocomplete="new-password"><button type="button" class="password-toggle" data-target="cf-' + p + '" aria-label="' + t('showPassword') + '">' + icon('eye', 18) + '</button></div>';
       } else {

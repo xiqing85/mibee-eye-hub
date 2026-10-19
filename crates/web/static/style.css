@@ -2138,6 +2138,7 @@ input[type="range"]::-moz-range-thumb {
 #resource-card { grid-column: 1 / -1; }
 .res-summary { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
 .res-mode { font-weight: 700; font-size: 13px; padding: 2px 10px; border-radius: 999px; background: var(--accent-dim, rgba(59,130,246,.14)); color: var(--accent, #3b82f6); }
+.res-tier { font-weight: 600; font-size: 12px; padding: 2px 10px; border-radius: 999px; background: rgba(148,163,184,.16); color: var(--text-faint, #94a3b8); }
 .res-stats { font-size: 12px; color: var(--text-faint); }
 .res-features { list-style: none; display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 6px 14px; }
 .res-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
