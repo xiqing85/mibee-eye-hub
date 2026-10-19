@@ -66,3 +66,50 @@ pub fn build_loki_layer(config: LokiConfig) -> Option<(tracing_loki::Layer, Back
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(endpoint: &str, labels: &[(&str, &str)]) -> LokiConfig {
+        LokiConfig {
+            endpoint: endpoint.into(),
+            batch_size: 10,
+            flush_interval_secs: 1,
+            labels: labels
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn empty_endpoint_is_not_configured() {
+        assert!(build_loki_layer(config("", &[])).is_none());
+    }
+
+    #[test]
+    fn malformed_endpoint_fails_open_to_none() {
+        assert!(build_loki_layer(config("not a url", &[])).is_none());
+    }
+
+    #[test]
+    fn valid_endpoint_with_good_labels_builds() {
+        let built = build_loki_layer(config(
+            "http://loki.local:3100/loki/api/v1/push",
+            &[("host", "cam1")],
+        ));
+        assert!(built.is_some(), "valid endpoint + valid label must build");
+    }
+
+    #[test]
+    fn invalid_label_is_skipped_not_fatal() {
+        // Loki label names are restricted ([a-zA-Z_][a-zA-Z0-9_]*); a bad
+        // one must drop that label while the layer still builds.
+        let built = build_loki_layer(config(
+            "http://loki.local:3100/loki/api/v1/push",
+            &[("1bad-name!", "x"), ("host", "cam1")],
+        ));
+        assert!(built.is_some(), "one bad label must not kill the layer");
+    }
+}

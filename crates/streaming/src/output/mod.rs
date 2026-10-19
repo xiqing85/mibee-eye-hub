@@ -89,3 +89,44 @@ pub fn parse_h264_nal_units(data: &[u8]) -> Vec<Vec<u8>> {
 pub(crate) mod tests {
     pub(crate) use super::mock::MockOutput;
 }
+
+#[cfg(test)]
+mod wire_tests {
+    use super::parse_h264_nal_units;
+
+    #[test]
+    fn short_input_passes_through_whole() {
+        assert_eq!(parse_h264_nal_units(&[0x00, 0x01]), vec![vec![0x00, 0x01]]);
+        assert_eq!(parse_h264_nal_units(b""), vec![Vec::<u8>::new()]);
+    }
+
+    #[test]
+    fn annex_b_start_codes_split() {
+        // Two NAL units with 4-byte and 3-byte start codes.
+        let data = [
+            0x00, 0x00, 0x00, 0x01, 0x65, 0x11, 0x00, 0x00, 0x01, 0x41, 0x22,
+        ];
+        let nals = parse_h264_nal_units(&data);
+        assert_eq!(nals.len(), 2, "start codes must split: {nals:?}");
+        assert_eq!(nals[0], vec![0x65, 0x11]);
+        assert_eq!(nals[1], vec![0x41, 0x22]);
+    }
+
+    #[test]
+    fn avcc_length_prefixes_split() {
+        // No Annex B start code → AVCC: each unit is [len: u32 BE][payload].
+        // Length prefixes are chosen so no [0,0,1] byte triple appears —
+        // a length of 1 would encode as 00 00 00 01 and route this data
+        // down the Annex B path instead (the detector cannot tell a
+        // 4-byte start code from a length prefix that happens to be 1).
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u32.to_be_bytes());
+        data.extend_from_slice(&[0x65, 0x11]);
+        data.extend_from_slice(&4u32.to_be_bytes());
+        data.extend_from_slice(&[0x41, 0x42, 0x43, 0x44]);
+        let nals = parse_h264_nal_units(&data);
+        assert_eq!(nals.len(), 2, "length prefixes must split: {nals:?}");
+        assert_eq!(nals[0], vec![0x65, 0x11]);
+        assert_eq!(nals[1], vec![0x41, 0x42, 0x43, 0x44]);
+    }
+}
