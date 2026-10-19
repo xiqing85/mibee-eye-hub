@@ -156,6 +156,7 @@ async function pollRequests() {
 const RES_REASONS = {
   off_config: 'resOffConfig',
   off_budget: 'resOffBudget',
+  off_tier: 'resOffTier',
   dependency: 'resDep',
 };
 
@@ -175,6 +176,22 @@ function renderResourceProfile() {
     const mode = document.createElement('span');
     mode.className = 'res-mode';
     mode.textContent = (res.mode || 'auto') === 'all' ? t('resModeAll') : t('resModeAuto');
+    // Named tier pill (#40 named-tier addendum) — additive: devices on
+    // older firmware simply don't advertise `tier` and keep today's line.
+    const pills = [mode];
+    if (res.tier) {
+      const src = res.preset_source === 'config' ? t('resTierSrcCfg')
+        : res.preset_source === 'hardware' ? t('resTierSrcHw')
+        : res.preset_source;
+      const pill = document.createElement('span');
+      pill.className = 'res-tier mono';
+      pill.textContent = t('resTier') + ' ' + res.tier + (src ? ' · ' + src : '');
+      if (res.profile) {
+        pill.title = 'cores=' + res.profile.physical_cores + ' · ' + (res.profile.simd || '')
+          + (res.profile.battery ? ' · battery' : '');
+      }
+      pills.push(pill);
+    }
     const stats = document.createElement('span');
     stats.className = 'res-stats mono';
     stats.textContent =
@@ -182,7 +199,8 @@ function renderResourceProfile() {
       ' · ' + t('resAvailable') + ' ' + fmtMiB(res.available_mib) +
       ' / ' + fmtMiB(res.total_mib) +
       ' · ' + t('resReserve') + ' ' + fmtMiB(res.reserve_mib);
-    sum.replaceChildren(mode, stats);
+    pills.push(stats);
+    sum.replaceChildren(...pills);
   }
   const list = $('res-features');
   if (list) {
