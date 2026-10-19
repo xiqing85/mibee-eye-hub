@@ -47,14 +47,35 @@ impl FormProfile {
         dialogue: false,
     };
 
+    /// The audio-pickup form (design §2 basic form 2): microphone, sound
+    /// events, ASR transcribe records, KWS/speaker. No camera (hence no
+    /// visual AI), no speaker output, no dialogue — the extension form
+    /// (speech-to-text records) rides the audio family alone.
+    pub const MIC: FormProfile = FormProfile {
+        vision_ai: false,
+        audio: true,
+        voice_out: false,
+        dialogue: false,
+    };
+
+    /// The intercom form (design §2 basic form 3): talkback both ways —
+    /// microphone upstream plus speaker playback — and the PTZ proxy.
+    /// Audio in and out; no camera AI, no dialogue.
+    pub const TALK: FormProfile = FormProfile {
+        vision_ai: false,
+        audio: true,
+        voice_out: true,
+        dialogue: false,
+    };
+
     /// Profile lookup by the bin's form tag. Unknown tags (a future form
     /// before its wiring lands) fall back to the full profile — failing
     /// open keeps an unknown binary useful instead of silently crippled.
     pub fn for_form(form: &str) -> FormProfile {
         match form {
             "cam" => Self::CAM,
-            // mic/talk assemblies still run the full-form skeleton; their
-            // gates land with their own form slices.
+            "mic" => Self::MIC,
+            "talk" => Self::TALK,
             _ => Self::EYE,
         }
     }
@@ -185,10 +206,69 @@ mod tests {
 
     #[test]
     fn unknown_form_falls_back_to_eye() {
-        assert_eq!(FormProfile::for_form("mic"), FormProfile::EYE);
-        assert_eq!(FormProfile::for_form("talk"), FormProfile::EYE);
         assert_eq!(FormProfile::for_form("eye"), FormProfile::EYE);
         assert_eq!(FormProfile::for_form("whatever"), FormProfile::EYE);
         assert_eq!(FormProfile::for_form("cam"), FormProfile::CAM);
+        assert_eq!(FormProfile::for_form("mic"), FormProfile::MIC);
+        assert_eq!(FormProfile::for_form("talk"), FormProfile::TALK);
+    }
+
+    #[test]
+    fn mic_keeps_audio_only() {
+        let mut config = everything_on();
+        FormProfile::MIC.apply("mic", &mut config);
+        // The pickup family: microphone pipeline + sound events.
+        assert!(config.audio_ai.enabled);
+        assert!(config.voice.enabled, "ASR/KWS ride the voice engine");
+        // No speaker, no camera AI, no dialogue.
+        for off in [
+            config.tts.enabled,
+            config.ai.enabled,
+            config.face.enabled,
+            config.ocr.enabled,
+            config.llm.enabled,
+            config.vlm.enabled,
+            config.decision.enabled,
+            config.meeting.enabled,
+            config.conversations.enabled,
+            config.agent.enabled,
+        ] {
+            assert!(!off);
+        }
+    }
+
+    #[test]
+    fn talk_keeps_audio_in_and_out() {
+        let mut config = everything_on();
+        FormProfile::TALK.apply("talk", &mut config);
+        // Intercom: microphone upstream + speaker playback.
+        assert!(config.audio_ai.enabled);
+        assert!(config.voice.enabled);
+        assert!(config.tts.enabled, "the output-device family stays on");
+        // No camera AI, no dialogue.
+        for off in [
+            config.ai.enabled,
+            config.face.enabled,
+            config.ocr.enabled,
+            config.llm.enabled,
+            config.vlm.enabled,
+            config.decision.enabled,
+            config.meeting.enabled,
+            config.conversations.enabled,
+            config.agent.enabled,
+        ] {
+            assert!(!off);
+        }
+    }
+
+    #[test]
+    fn apply_is_idempotent_for_mic_and_talk() {
+        for (tag, profile) in [("mic", FormProfile::MIC), ("talk", FormProfile::TALK)] {
+            let mut config = everything_on();
+            profile.apply(tag, &mut config);
+            let once = config.clone();
+            profile.apply(tag, &mut config);
+            assert_eq!(config, once, "{tag} apply must be idempotent");
+        }
     }
 }
