@@ -159,6 +159,12 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         "mibee-eye starting"
     );
 
+    // Form capability gate (M2 form split): the bin's form tag forces
+    // the config into its capability subset BEFORE the resource gate and
+    // any engine is built — engines then construct inactive and the
+    // capabilities document shrinks on its own. eye is the identity.
+    crate::runtime::forms::FormProfile::for_form(form).apply(form, &mut config);
+
     // Feature-level resource admission (SPEC appendix A #40), before any
     // engine is built. The LLM tier model resolves first (#30-E) so the
     // gate charges the file that will actually load.
