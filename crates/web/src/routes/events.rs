@@ -241,15 +241,18 @@ pub async fn sse_events(
     ))
 }
 
-/// Convert a [`CameraEvent`] into an Axum SSE [`Event`].
-fn event_to_sse(event: CameraEvent) -> Event {
-    match &event {
+/// Convert a [`CameraEvent`] into its SSE wire pair: the event name and
+/// the JSON payload string (SPEC §6). Pure — the thin wrapper below is
+/// the only Axum-aware part, so the wire contract is unit-testable.
+fn event_wire(event: &CameraEvent) -> (&'static str, String) {
+    match event {
         CameraEvent::ChatReply {
             source,
             reply,
             grounded,
             timestamp_ms,
-        } => Event::default().event("chat_reply").data(
+        } => (
+            "chat_reply",
             serde_json::json!({
                 "source": source,
                 "reply": reply,
@@ -265,7 +268,8 @@ fn event_to_sse(event: CameraEvent) -> Event {
             scene,
             follow_up,
             timestamp_ms,
-        } => Event::default().event("voice_transcript").data(
+        } => (
+            "voice_transcript",
             serde_json::json!({
                 "keyword": keyword,
                 "transcript": transcript,
@@ -283,7 +287,8 @@ fn event_to_sse(event: CameraEvent) -> Event {
             confidence,
             act_probability,
             timestamp_ms,
-        } => Event::default().event("voice_decision").data(
+        } => (
+            "voice_decision",
             serde_json::json!({
                 "camera_id": camera_id,
                 "transcript": transcript,
@@ -299,7 +304,8 @@ fn event_to_sse(event: CameraEvent) -> Event {
             meeting_id,
             status,
             timestamp_ms,
-        } => Event::default().event("meeting_state").data(
+        } => (
+            "meeting_state",
             serde_json::json!({
                 "camera_id": camera_id,
                 "meeting_id": meeting_id,
@@ -315,7 +321,8 @@ fn event_to_sse(event: CameraEvent) -> Event {
             track_id,
             label,
             timestamp_ms,
-        } => Event::default().event("zone_event").data(
+        } => (
+            "zone_event",
             serde_json::json!({
                 "camera_id": camera_id,
                 "zone": zone,
@@ -329,21 +336,24 @@ fn event_to_sse(event: CameraEvent) -> Event {
         CameraEvent::AudioLevel {
             level,
             timestamp_ms,
-        } => Event::default().event("audio_level").data(
+        } => (
+            "audio_level",
             serde_json::json!({
                 "level": level,
                 "timestamp": timestamp_ms,
             })
             .to_string(),
         ),
-        CameraEvent::ModelTask { task } => Event::default()
-            .event("model_task")
-            .data(serde_json::to_value(task).unwrap_or_default().to_string()),
+        CameraEvent::ModelTask { task } => (
+            "model_task",
+            serde_json::to_value(task).unwrap_or_default().to_string(),
+        ),
         CameraEvent::CameraAdded {
             camera_id,
             device_index,
             name,
-        } => Event::default().event("camera_added").data(
+        } => (
+            "camera_added",
             serde_json::json!({
                 "camera_id": camera_id,
                 "device_index": device_index,
@@ -354,14 +364,16 @@ fn event_to_sse(event: CameraEvent) -> Event {
         CameraEvent::CameraOfflined {
             camera_id,
             device_index,
-        } => Event::default().event("camera_offlined").data(
+        } => (
+            "camera_offlined",
             serde_json::json!({
                 "camera_id": camera_id,
                 "device_index": device_index,
             })
             .to_string(),
         ),
-        CameraEvent::AiModelChanged { model } => Event::default().event("ai_model_changed").data(
+        CameraEvent::AiModelChanged { model } => (
+            "ai_model_changed",
             serde_json::json!({
                 "camera_id": "all",
                 "model": model,
@@ -372,7 +384,8 @@ fn event_to_sse(event: CameraEvent) -> Event {
             camera_id,
             detections,
             frame_number,
-        } => Event::default().event("ai_detection").data(
+        } => (
+            "ai_detection",
             serde_json::json!({
                 "camera_id": camera_id,
                 "detections": detections,
@@ -401,14 +414,15 @@ fn event_to_sse(event: CameraEvent) -> Event {
             if let Some(score) = score {
                 payload["score"] = serde_json::json!(score);
             }
-            Event::default().event("alarm").data(payload.to_string())
+            ("alarm", payload.to_string())
         }
         CameraEvent::AlarmDescription {
             camera_id,
             alarm_timestamp_ms,
             description,
             elapsed_s,
-        } => Event::default().event("alarm_description").data(
+        } => (
+            "alarm_description",
             serde_json::json!({
                 "camera_id": camera_id,
                 "alarm_timestamp": alarm_timestamp_ms,
@@ -417,13 +431,16 @@ fn event_to_sse(event: CameraEvent) -> Event {
             })
             .to_string(),
         ),
-        CameraEvent::ConversationRecord { turn } => Event::default()
-            .event("conversation")
-            .data(serde_json::to_value(turn).unwrap_or_default().to_string()),
-        CameraEvent::AwayEvent { event } => Event::default()
-            .event("away_event")
-            .data(serde_json::to_value(event).unwrap_or_default().to_string()),
-        CameraEvent::AwayState { active, since_ms } => Event::default().event("away_state").data(
+        CameraEvent::ConversationRecord { turn } => (
+            "conversation",
+            serde_json::to_value(turn).unwrap_or_default().to_string(),
+        ),
+        CameraEvent::AwayEvent { event } => (
+            "away_event",
+            serde_json::to_value(event).unwrap_or_default().to_string(),
+        ),
+        CameraEvent::AwayState { active, since_ms } => (
+            "away_state",
             serde_json::json!({
                 "active": active,
                 "since_ms": since_ms,
@@ -460,13 +477,16 @@ fn event_to_sse(event: CameraEvent) -> Event {
             if let Some(n) = note {
                 payload["note"] = serde_json::json!(n);
             }
-            Event::default()
-                .event("agent_step")
-                .data(payload.to_string())
+            ("agent_step", payload.to_string())
         }
     }
 }
 
+/// Convert a [`CameraEvent`] into an Axum SSE [`Event`].
+fn event_to_sse(event: CameraEvent) -> Event {
+    let (name, data) = event_wire(&event);
+    Event::default().event(name).data(data)
+}
 /// Returns the SSE-friendly headers for `text/event-stream`.
 ///
 /// Currently unused directly (Axum's `Sse` handles this), but documented
@@ -478,4 +498,263 @@ pub fn sse_headers() -> HeaderMap {
     headers.insert("cache-control", "no-cache".parse().unwrap());
     headers.insert("connection", "keep-alive".parse().unwrap());
     headers
+}
+
+#[cfg(test)]
+mod wire_tests {
+    //! SPEC §6 wire contract: every CameraEvent variant's SSE name and
+    //! JSON shape, pinned per variant through the pure [`event_wire`].
+
+    use super::*;
+
+    fn wire(event: CameraEvent) -> (&'static str, serde_json::Value) {
+        let (name, data) = event_wire(&event);
+        let json = serde_json::from_str(&data).expect("payload is valid JSON");
+        (name, json)
+    }
+
+    #[test]
+    fn dialogue_family_events() {
+        let (n, j) = wire(CameraEvent::ChatReply {
+            source: "voice".into(),
+            reply: "你好".into(),
+            grounded: String::new(),
+            timestamp_ms: 7,
+        });
+        assert_eq!(n, "chat_reply");
+        assert_eq!(j["source"], "voice");
+        assert_eq!(j["reply"], "你好");
+        assert_eq!(j["grounded"], "");
+        assert_eq!(j["timestamp"], 7);
+
+        let (n, j) = wire(CameraEvent::VoiceTranscript {
+            keyword: "小蜜蜂".into(),
+            transcript: "几点了".into(),
+            speaker: String::new(),
+            scene: "室内".into(),
+            follow_up: false,
+            timestamp_ms: 8,
+        });
+        assert_eq!(n, "voice_transcript");
+        assert_eq!(j["keyword"], "小蜜蜂");
+        assert_eq!(j["transcript"], "几点了");
+        assert_eq!(j["speaker"], "");
+        assert_eq!(j["scene"], "室内");
+        assert_eq!(j["follow_up"], false);
+
+        let (n, j) = wire(CameraEvent::VoiceDecision {
+            camera_id: "0".into(),
+            transcript: "天气".into(),
+            choice: "answer".into(),
+            confidence: 0.84,
+            act_probability: 0.9,
+            timestamp_ms: 9,
+        });
+        assert_eq!(n, "voice_decision");
+        assert_eq!(j["choice"], "answer");
+        assert_eq!(j["confidence"].as_f64().unwrap() as f32, 0.84);
+
+        let (n, j) = wire(CameraEvent::AgentStep {
+            conversation_id: "c1".into(),
+            kind: "tool".into(),
+            state: "done".into(),
+            tool: Some("weather.current".into()),
+            args: Some(serde_json::json!({"city": "广州"})),
+            result: Some("晴".into()),
+            duration_ms: Some(1041),
+            note: None,
+        });
+        assert_eq!(n, "agent_step");
+        assert_eq!(j["kind"], "tool");
+        assert_eq!(j["tool"], "weather.current");
+        assert_eq!(j["args"]["city"], "广州");
+        assert_eq!(j["result"], "晴");
+        assert_eq!(j["duration_ms"], 1041);
+        assert!(
+            j.get("note").is_none(),
+            "None optionals are omitted, not null"
+        );
+
+        let turn = crate::conversations::ConversationTurn {
+            id: 1,
+            conversation_id: "c1".into(),
+            origin: "voice".into(),
+            started_ms: 2,
+            user_text: Some("问".into()),
+            thinking: vec![],
+            reply_text: Some("答".into()),
+            engine: Some("local".into()),
+            interrupted: false,
+        };
+        let (n, j) = wire(CameraEvent::ConversationRecord { turn });
+        assert_eq!(n, "conversation");
+        assert_eq!(j["origin"], "voice");
+        assert_eq!(j["reply_text"], "答");
+        assert_eq!(j["engine"], "local");
+    }
+
+    #[test]
+    fn camera_and_detection_events() {
+        let (n, j) = wire(CameraEvent::CameraAdded {
+            camera_id: "c1".into(),
+            device_index: 2,
+            name: "USB Cam".into(),
+        });
+        assert_eq!(n, "camera_added");
+        assert_eq!(j["camera_id"], "c1");
+        assert_eq!(j["device_index"], 2);
+        assert_eq!(j["name"], "USB Cam");
+
+        let (n, j) = wire(CameraEvent::CameraOfflined {
+            camera_id: "c1".into(),
+            device_index: 2,
+        });
+        assert_eq!(n, "camera_offlined");
+        assert_eq!(j["device_index"], 2);
+
+        let det = streaming::ai::Detection {
+            label: "person".into(),
+            confidence: 0.9,
+            bbox: [1, 2, 3, 4],
+        };
+        let (n, j) = wire(CameraEvent::AiDetection {
+            camera_id: "c1".into(),
+            detections: vec![det],
+            frame_number: 42,
+        });
+        assert_eq!(n, "ai_detection");
+        assert_eq!(j["frame_number"], 42);
+        assert_eq!(j["detections"][0]["label"], "person");
+        assert_eq!(
+            j["detections"][0]["confidence"].as_f64().unwrap() as f32,
+            0.9
+        );
+        assert_eq!(j["detections"][0]["bbox"], serde_json::json!([1, 2, 3, 4]));
+
+        let (n, j) = wire(CameraEvent::AiModelChanged {
+            model: "nanodet-x".into(),
+        });
+        assert_eq!(n, "ai_model_changed");
+        assert_eq!(
+            j["camera_id"], "all",
+            "model change is fleet-wide by convention"
+        );
+        assert_eq!(j["model"], "nanodet-x");
+
+        let (n, j) = wire(CameraEvent::ZoneEvent {
+            camera_id: "c1".into(),
+            zone: "前门".into(),
+            event: "intrusion".into(),
+            track_id: 5,
+            label: "person".into(),
+            timestamp_ms: 10,
+        });
+        assert_eq!(n, "zone_event");
+        assert_eq!(j["zone"], "前门");
+        assert_eq!(j["event"], "intrusion");
+        assert_eq!(j["track_id"], 5);
+    }
+
+    #[test]
+    fn alarm_events_pin_the_pinned_triple_and_optionals() {
+        let (n, j) = wire(CameraEvent::Alarm {
+            camera_id: "c1".into(),
+            targets: 2,
+            timestamp_ms: 11,
+            source: "ai".into(),
+            class: None,
+            score: None,
+        });
+        assert_eq!(n, "alarm");
+        assert_eq!(j["active"], true, "rising-edge convention");
+        assert_eq!(j["source"], "ai");
+        assert_eq!(j["targets"], 2);
+        assert!(j.get("class").is_none());
+        assert!(j.get("score").is_none());
+
+        let (_n, j) = wire(CameraEvent::Alarm {
+            camera_id: "0".into(),
+            targets: 1,
+            timestamp_ms: 12,
+            source: "audio".into(),
+            class: Some("Siren".into()),
+            score: Some(0.82),
+        });
+        assert_eq!(j["class"], "Siren");
+        assert_eq!(j["score"].as_f64().unwrap() as f32, 0.82);
+
+        let (n, j) = wire(CameraEvent::AlarmDescription {
+            camera_id: "c1".into(),
+            alarm_timestamp_ms: 11,
+            description: "一个人经过".into(),
+            elapsed_s: 41.5,
+        });
+        assert_eq!(n, "alarm_description");
+        assert_eq!(j["alarm_timestamp"], 11);
+        assert_eq!(j["description"], "一个人经过");
+        assert_eq!(j["elapsed_s"], 41.5);
+    }
+
+    #[test]
+    fn audio_meeting_away_model_events() {
+        let (n, j) = wire(CameraEvent::AudioLevel {
+            level: 0.42,
+            timestamp_ms: 13,
+        });
+        assert_eq!(n, "audio_level");
+        assert_eq!(j["level"].as_f64().unwrap() as f32, 0.42);
+        assert_eq!(j["timestamp"], 13);
+
+        let (n, j) = wire(CameraEvent::MeetingState {
+            camera_id: "0".into(),
+            meeting_id: 7,
+            status: "recording".into(),
+            timestamp_ms: 14,
+        });
+        assert_eq!(n, "meeting_state");
+        assert_eq!(j["meeting_id"], 7);
+        assert_eq!(j["status"], "recording");
+
+        let task = streaming::models::TaskSnapshot {
+            task_id: "t1".into(),
+            capability: "llm".into(),
+            model_id: "qwen".into(),
+            model_name: "Qwen".into(),
+            status: streaming::models::TaskStatus::Downloading,
+            progress: 0.5,
+            downloaded_bytes: 10,
+            total_bytes: 20,
+            error: None,
+        };
+        let (n, j) = wire(CameraEvent::ModelTask { task });
+        assert_eq!(n, "model_task");
+        assert_eq!(j["task_id"], "t1");
+        assert_eq!(j["progress"], 0.5);
+        assert_eq!(j["total_bytes"], 20);
+
+        let rec = crate::away::AwayEventRecord {
+            id: 3,
+            camera_id: "0".into(),
+            kind: "person".into(),
+            started_ms: 15,
+            labels: "person×1".into(),
+            face_name: None,
+            description: None,
+            visitor_reply: None,
+            snapshot: None,
+            state: "silent".into(),
+        };
+        let (n, j) = wire(CameraEvent::AwayEvent { event: rec });
+        assert_eq!(n, "away_event");
+        assert_eq!(j["kind"], "person");
+        assert_eq!(j["state"], "silent");
+
+        let (n, j) = wire(CameraEvent::AwayState {
+            active: true,
+            since_ms: Some(16),
+        });
+        assert_eq!(n, "away_state");
+        assert_eq!(j["active"], true);
+        assert_eq!(j["since_ms"], 16);
+    }
 }
