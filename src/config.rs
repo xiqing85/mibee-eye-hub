@@ -354,6 +354,9 @@ pub struct AppConfig {
     /// tool-calling loop + MCP stdio plugin servers.
     #[serde(default)]
     pub agent: web::agent::AgentConfig,
+    /// Plugin manifests (`[plugin.<id>]`, SPEC appendix A #47).
+    #[serde(default)]
+    pub plugins: std::collections::HashMap<String, crate::runtime::plugins::PluginManifest>,
     /// Away mode (SPEC §3.6 / appendix A #44): the armed watch loop —
     /// cadence, cooldowns, greetings, listen window, snapshot dir.
     #[serde(default)]
@@ -366,12 +369,18 @@ pub struct AppConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelsConfig {
     pub dir: String,
+    /// Per-capability model routing (design §6, M5): nested tables
+    /// `[models.chat]` / `[models.vision]` / `[models.asr]` /
+    /// `[models.tts]`, each `provider` + `fallback` = `local` | `cloud`.
+    #[serde(default)]
+    pub routing: streaming::model_route::RoutingConfig,
 }
 
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
             dir: "models".into(),
+            routing: streaming::model_route::RoutingConfig::default(),
         }
     }
 }

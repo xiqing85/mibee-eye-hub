@@ -957,6 +957,32 @@ bitrate}`，SPEC 附录 A #20）：低分辨率 H.264 副码流，经 `stream.su
 RTSP `/live/{id}/sub` 挂载点与 ONVIF `sub` profile 暴露。在下次流
 （重）启动时生效。
 
+### [plugins] - 插件触发器框架（SPEC 附录 A #47）
+
+插件 = 按 id 声明的清单（`[plugin.<id>]`）：对设备自身事件源的触发规则，调
+用已注册工具（内置 + MCP stdio 服务器）。每次执行经 SSE `plugin_invocation`
+透明上报（outcome ok | error | skipped）。
+
+```toml
+[plugin.lamp-link]
+version = 1
+tools = ["mcp:home"]
+triggers = [
+  { on = "away_state", when = "armed", cooldown_secs = 60, run = [
+    { tool = "lamp.switch", args = { room = "客厅", on = true } } ] }
+]
+[plugin.lamp-link.permissions]
+events = ["away_state"]   # 最小事件集——规则源不在白名单内即 skipped
+egress = []               # 外发白名单（知情原则，沿用 #44）
+```
+
+**字段参考：**本节是任意键清单映射 + 嵌套触发表——完整语法见 SPEC 附录
+A #47。触发源首发已接线：`alarm`（`when` = ai/audio/zone 之一，空=任意）与
+`away_state`（`when` = armed/disarmed，空=两者）；`schedule` 与
+`audio_level` 可解析校验、接线随后续切片。动作首发：`tool` 调用（15s 超
+时）；TTS 播报/桌面通知/推送动作随后。冷却缺省 60s。触发源不在
+`permissions.events` 内的清单装载时告警跳过。
+
 ### [database] - SQLite 数据库
 
 配置用于摄像头设置、协议配置、会话和用户的 SQLite 数据库路径。

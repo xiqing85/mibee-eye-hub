@@ -57,10 +57,13 @@ fn visit(dir: &Path, out: &mut BTreeMap<String, BTreeSet<String>>) {
                 continue;
             };
             let name = tail[..name_end].to_string();
-            // `*Settings` is the same role under a different suffix (e.g.
-            // WatermarkSettings backs the [watermark] section via re-export
-            // as WatermarkConfig).
-            if !(name.ends_with("Config") || name.ends_with("Settings")) {
+            // `*Settings`/`*Manifest` are the same role under different
+            // suffixes (WatermarkSettings backs [watermark] via re-export;
+            // PluginManifest backs [plugins], SPEC appendix A #47).
+            if !(name.ends_with("Config")
+                || name.ends_with("Settings")
+                || name.ends_with("Manifest"))
+            {
                 continue;
             }
             let Some(open) = tail.find('{') else { continue };
@@ -358,6 +361,7 @@ const SECTION_STRUCTS: &[(&str, &[&str])] = &[
     ("resources", &["ResourcesConfig"]),
     ("conversations", &["ConversationsConfig"]),
     ("agent", &["AgentConfig"]),
+    ("plugins", &["PluginManifest"]),
     ("away", &["AwayConfig"]),
     ("desktop", &["DesktopConfig"]),
     ("observability", &["ObservabilityConfig", "RemoteLogConfig"]),
@@ -389,6 +393,12 @@ const EXEMPT_FIELDS: &[(&str, &[&str])] = &[
     ("gb28181", &["gb35114"]),
     // Documented as `[[agent.mcp_servers]]` array-of-tables in prose+toml.
     ("agent", &["mcp_servers"]),
+    // M5 routing family: nested sub-tables ([models.chat] provider/
+    // fallback…), dotted-key form invisible to the flat row parser.
+    ("models", &["chat", "vision", "asr", "tts", "routing"]),
+    // M6 plugin manifests: [plugin.<id>] arbitrary-key map + nested
+    // trigger tables — no flat field table applies (SPEC appendix A #47).
+    ("plugins", &["version", "tools", "triggers", "permissions"]),
 ];
 
 #[test]

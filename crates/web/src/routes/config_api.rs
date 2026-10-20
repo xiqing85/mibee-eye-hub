@@ -867,6 +867,8 @@ mod tests {
             conversations,
             agent: crate::server::AppRouterState::agent_for_tests().0,
             agent_config: crate::server::AppRouterState::agent_for_tests().1,
+            models_routing: streaming::model_route::RoutingConfig::default(),
+            plugins_loaded: 0,
             away: crate::server::AppRouterState::away_for_tests(),
         }
     }

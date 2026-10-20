@@ -31,6 +31,7 @@ pub mod llm;
 /// Recording machinery builds in every feature set; processing needs the
 /// `voice` feature.
 pub mod meeting;
+pub mod model_route;
 pub mod models;
 #[cfg(feature = "ai")]
 pub mod ocr;

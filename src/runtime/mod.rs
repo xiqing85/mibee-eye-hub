@@ -11,6 +11,7 @@ pub mod forms;
 pub mod full;
 pub mod hotplug;
 pub mod models;
+pub mod plugins;
 pub mod protocols;
 pub mod sound_bridge;
 pub mod telemetry;

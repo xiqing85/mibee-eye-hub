@@ -191,6 +191,15 @@ pub enum CameraEvent {
     /// A live agent step (SPEC v1 §6 `agent_step`, §3.5): tool executions
     /// (running → done/error) and phase switches (thinking/answering) —
     /// the frontend hero state and live thinking panel ride on this.
+    /// Plugin trigger invocation (SPEC appendix A #47): one rule action's
+    /// execution — outcome ok | error:<msg> | skipped:<reason>.
+    PluginInvocation {
+        plugin: String,
+        rule: usize,
+        action: String,
+        outcome: String,
+        timestamp_ms: u64,
+    },
     AgentStep {
         conversation_id: String,
         /// `"tool"` | `"phase"`.
@@ -456,6 +465,23 @@ fn event_wire(event: &CameraEvent) -> (&'static str, String) {
             serde_json::json!({
                 "active": active,
                 "since_ms": since_ms,
+            })
+            .to_string(),
+        ),
+        CameraEvent::PluginInvocation {
+            plugin,
+            rule,
+            action,
+            outcome,
+            timestamp_ms,
+        } => (
+            "plugin_invocation",
+            serde_json::json!({
+                "plugin": plugin,
+                "rule": rule,
+                "action": action,
+                "outcome": outcome,
+                "timestamp": timestamp_ms,
             })
             .to_string(),
         ),
