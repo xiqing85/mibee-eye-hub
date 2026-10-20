@@ -202,6 +202,42 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     // Feature-level resource admission (SPEC appendix A #40), before any
     // engine is built. The LLM tier model resolves first (#30-E) so the
     // gate charges the file that will actually load.
+    // Elasticity (M7, SPEC #48): a persisted LLM-tier decision from the
+    // elastic controller overrides the configured model path — the
+    // systematic memory-low-water action behind issue #3. This is the
+    // LLM ladder (full/mid/lite, #30-E vocabulary), NOT the #40 feature
+    // tier (minimal/basic/standard/full) — two different concepts.
+    // Scoped pool: the main pool initializes further down.
+    {
+        let db_str = args.db_path.to_string_lossy().into_owned();
+        if let Ok(scope) = web::db::init_pool(&db_str).await
+            && let Ok(Some(tier)) =
+                web::db::get_setting(&scope, crate::runtime::elastic::SETTING_TIER).await
+            && crate::runtime::elastic::LADDER.contains(&tier.as_str())
+        {
+            let pinned = match tier.as_str() {
+                "mid" if !config.llm.model_path_mid.is_empty() => {
+                    Some(config.llm.model_path_mid.clone())
+                }
+                "lite" if !config.llm.model_path_lite.is_empty() => {
+                    Some(config.llm.model_path_lite.clone())
+                }
+                _ => None, // full, or a tier with no model configured
+            };
+            if let Some(path) = pinned
+                && path != config.llm.model_path
+            {
+                tracing::info!(
+                    from = %config.llm.model_path,
+                    to = %path,
+                    tier = %tier,
+                    "elastic: persisted LLM-tier decision applies (runtime downgrade)"
+                );
+                config.llm.model_path = path;
+            }
+        }
+    }
+
     let mem = streaming::tools::memory_mib().unwrap_or((0, 0));
     // Named boot tier (#40 named-tier addendum): "auto" (default) derives
     // from the hardware profile; a pinned name selects the preset
@@ -227,27 +263,6 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
             )
         }
     };
-    // Elasticity (M7, SPEC #48): a persisted runtime tier decision from
-    // the elastic controller overrides the configured tier — the
-    // systematic memory-low-water action behind issue #3. Scoped pool:
-    // the main pool initializes further down.
-    {
-        let db_str = args.db_path.to_string_lossy().into_owned();
-        if let Ok(scope) = web::db::init_pool(&db_str).await
-            && let Ok(Some(tier)) =
-                web::db::get_setting(&scope, crate::runtime::elastic::SETTING_TIER).await
-            && streaming::feature_gate::Tier::from_name(&tier).is_some()
-            && tier != config.resources.tier
-        {
-            tracing::info!(
-                from = %config.resources.tier,
-                to = %tier,
-                "elastic: persisted tier decision applies (runtime downgrade)"
-            );
-            config.resources.tier = tier;
-        }
-    }
-
     let (llm_model, llm_tier) = streaming::tools::resolve_llm_tier(
         &config.llm.model_path,
         &config.llm.model_path_mid,
