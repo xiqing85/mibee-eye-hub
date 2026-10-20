@@ -34,7 +34,6 @@ pub use registry::{ActivateError, DetectorFactory, Registry};
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -195,11 +194,66 @@ impl AiState {
 
 /// Process-wide AI engine: owns the model, the shared detection state, and
 /// the detection event bus.
+/// L1 hot-adjustable sampling knobs (design §10): running workers read
+/// these per frame, so `[ai] interval_ms`/`confidence_threshold` changes
+/// take effect without a restart (config hot-apply). Lock-free atomics —
+/// the threshold is stored ×1000 (350 = 0.35) because f32 is not atomic.
+#[derive(Debug)]
+pub struct AiTuning {
+    interval_ms: std::sync::atomic::AtomicU64,
+    threshold_mille: std::sync::atomic::AtomicU32,
+}
+
+impl AiTuning {
+    #[must_use]
+    pub fn new(interval_ms: u64, threshold: f32) -> Self {
+        Self {
+            interval_ms: std::sync::atomic::AtomicU64::new(interval_ms.max(1)),
+            threshold_mille: std::sync::atomic::AtomicU32::new(Self::to_mille(threshold)),
+        }
+    }
+
+    fn to_mille(threshold: f32) -> u32 {
+        ((threshold.clamp(0.0, 1.0)) * 1000.0).round() as u32
+    }
+
+    /// Current sampling interval (≥1ms).
+    #[must_use]
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.interval_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1),
+        )
+    }
+
+    /// Current confidence threshold.
+    #[must_use]
+    pub fn threshold(&self) -> f32 {
+        (self
+            .threshold_mille
+            .load(std::sync::atomic::Ordering::Relaxed) as f32)
+            / 1000.0
+    }
+
+    /// Hot-update both knobs (invalid values clamp, never panic).
+    pub fn set(&self, interval_ms: u64, threshold: f32) {
+        self.interval_ms
+            .store(interval_ms.max(1), std::sync::atomic::Ordering::Relaxed);
+        self.threshold_mille.store(
+            Self::to_mille(threshold),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 pub struct AiEngine {
     config: AiConfig,
     /// Swappable detector slot (SPEC §4.6 hot-switch): workers clone the
     /// `Arc` out per inference, so swaps apply without restart.
     detector: Arc<RwLock<Option<Arc<dyn AiDetector>>>>,
+    /// L1 hot knobs — shared with running workers (see [`AiTuning`]).
+    tuning: Arc<AiTuning>,
     /// Active model id (SPEC §4.6 model identifier).
     active_model: Arc<RwLock<String>>,
     /// Runtime model registry (builtin + uploaded overlay).
@@ -289,6 +343,10 @@ impl AiEngine {
         let (event_tx, _) = broadcast::channel(64);
         let (track_tx, _) = broadcast::channel(64);
         let active_model = config.model.clone();
+        let tuning = Arc::new(AiTuning::new(
+            config.interval_ms,
+            config.confidence_threshold,
+        ));
         Self {
             config,
             detector: Arc::new(RwLock::new(detector)),
@@ -299,7 +357,14 @@ impl AiEngine {
             state: Arc::new(AiState::default()),
             event_tx,
             track_tx,
+            tuning,
         }
+    }
+
+    /// L1 hot knobs shared with running workers (`[ai]` hot-apply).
+    #[must_use]
+    pub fn tuning(&self) -> Arc<AiTuning> {
+        Arc::clone(&self.tuning)
     }
 
     /// Test seam: inject a detector factory for activate/upload routes.
@@ -449,26 +514,29 @@ impl AiEngine {
             return tokio::spawn(async {});
         }
         // The SLOT, not the detector: model swaps apply to running
-        // workers from the next frame on.
+        // workers from the next frame on. Same for the L1 knobs: the
+        // tuning Arc is read per frame, so hot-applied interval and
+        // threshold changes land without respawning workers.
         let slot = Arc::clone(&self.detector);
         let startup_name = self.model_name();
-        let threshold = self.config.confidence_threshold;
-        let interval = Duration::from_millis(self.config.interval_ms.max(1));
+        let startup_interval = self.tuning.interval();
+        let tuning = Arc::clone(&self.tuning);
         let state = Arc::clone(&self.state);
         let event_tx = self.event_tx.clone();
         let track_tx = self.track_tx.clone();
         let mut tracker = tracking::Tracker::new(tracking::TrackerParams::default());
 
-        info!(%camera_id, model = %startup_name, interval_ms = interval.as_millis() as u64, "ai: detection worker started");
+        info!(%camera_id, model = %startup_name, interval_ms = startup_interval.as_millis() as u64, "ai: detection worker started");
 
         tokio::spawn(async move {
             let mut last_run = tokio::time::Instant::now()
-                .checked_sub(interval)
+                .checked_sub(startup_interval)
                 .unwrap_or_else(tokio::time::Instant::now);
             let mut frame_number: u64 = 0;
             loop {
                 match jpeg_rx.recv().await {
                     Ok(jpeg) => {
+                        let interval = tuning.interval();
                         if last_run.elapsed() < interval {
                             continue;
                         }
@@ -502,7 +570,7 @@ impl AiEngine {
 
                         match result {
                             Ok(mut detections) => {
-                                detections.retain(|d| d.confidence >= threshold);
+                                detections.retain(|d| d.confidence >= tuning.threshold());
                                 observability::increment_ai_inferences();
                                 let timestamp = unix_now_secs();
                                 state.update(CameraDetections {
@@ -552,6 +620,38 @@ fn unix_now_secs() -> u64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn ai_tuning_roundtrip_and_clamping() {
+        let t = AiTuning::new(1000, 0.55);
+        assert_eq!(t.interval(), Duration::from_millis(1000));
+        assert!((t.threshold() - 0.55).abs() < 1e-6);
+        t.set(250, 0.35);
+        assert_eq!(t.interval(), Duration::from_millis(250));
+        assert!((t.threshold() - 0.35).abs() < 1e-6);
+        // Out-of-range values clamp, never panic — hot-apply input is
+        // user-edited config.
+        t.set(0, 1.7);
+        assert_eq!(t.interval(), Duration::from_millis(1));
+        assert!((t.threshold() - 1.0).abs() < 1e-6);
+        t.set(999, -0.5);
+        assert!((t.threshold() - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn engine_tuning_starts_from_config() {
+        let cfg = AiConfig {
+            interval_ms: 700,
+            confidence_threshold: 0.42,
+            ..AiConfig::default()
+        };
+        let engine = AiEngine::from_parts(cfg, None);
+        let t = engine.tuning();
+        assert_eq!(t.interval(), Duration::from_millis(700));
+        assert!((t.threshold() - 0.42).abs() < 1e-6);
+    }
+
     use super::*;
 
     /// Deterministic fake detector used across this crate and the web

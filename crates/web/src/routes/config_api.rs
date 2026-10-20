@@ -349,6 +349,7 @@ pub async fn put_config(
     Extension(stream_manager): Extension<Arc<StreamManager>>,
     Extension(advertised_host): Extension<Arc<String>>,
     Extension(scene): Extension<SceneHandles>,
+    Extension(ai): Extension<Arc<streaming::ai::AiEngine>>,
     Json(body): Json<Value>,
 ) -> Response {
     if !body.is_object()
@@ -367,11 +368,51 @@ pub async fn put_config(
         }
         let mut pairs = Vec::new();
         flatten_to_dotted("", settings, &mut pairs);
+        // L1 hot knobs (design §10): `[ai] interval_ms` and
+        // `confidence_threshold` validate first (a bad value must not
+        // persist) and hot-apply to running workers after the row lands.
+        let mut ai_interval: Option<u64> = None;
+        let mut ai_threshold: Option<f32> = None;
+        for (key, value) in &pairs {
+            match key.as_str() {
+                "ai.interval_ms" => match value.parse::<u64>() {
+                    Ok(v) if v >= 1 => ai_interval = Some(v),
+                    _ => {
+                        return ApiError::bad_request(
+                            "ai.interval_ms must be an integer >= 1 (milliseconds)",
+                        )
+                        .into_response();
+                    }
+                },
+                "ai.confidence_threshold" => match value.parse::<f64>() {
+                    Ok(v) if (0.0..=1.0).contains(&v) => ai_threshold = Some(v as f32),
+                    _ => {
+                        return ApiError::bad_request(
+                            "ai.confidence_threshold must be a number in 0.0..=1.0",
+                        )
+                        .into_response();
+                    }
+                },
+                _ => {}
+            }
+        }
         for (key, value) in pairs {
             if let Err(e) = db::set_setting(&db, &key, &value).await {
                 tracing::error!(error = %e, setting_key = %key, "failed to set setting");
                 return ApiError::internal("failed to update settings").into_response();
             }
+        }
+        if ai_interval.is_some() || ai_threshold.is_some() {
+            let t = ai.tuning();
+            t.set(
+                ai_interval.unwrap_or_else(|| t.interval().as_millis() as u64),
+                ai_threshold.unwrap_or_else(|| t.threshold()),
+            );
+            tracing::info!(
+                interval_ms = t.interval().as_millis() as u64,
+                threshold = t.threshold(),
+                "ai: L1 knobs hot-applied"
+            );
         }
     }
 
@@ -798,10 +839,10 @@ mod tests {
         (pool, auth_db)
     }
 
-    fn build_state(
+    fn build_state_with_ai(
         db: sqlx::SqlitePool,
         auth_db: Arc<Mutex<Connection>>,
-    ) -> crate::server::AppRouterState {
+    ) -> (crate::server::AppRouterState, Arc<streaming::ai::AiEngine>) {
         // Reuse the settings tests' default-state shape via a fresh build:
         // every engine is a fail-open default instance.
         let event_tx = Arc::new(crate::routes::events::new_event_bus());
@@ -810,7 +851,11 @@ mod tests {
             event_tx.clone(),
             true,
         ));
-        crate::server::AppRouterState {
+        let ai = Arc::new(streaming::ai::AiEngine::from_parts(
+            streaming::ai::AiConfig::default(),
+            None,
+        ));
+        let state = crate::server::AppRouterState {
             db,
             auth_db,
             active: crate::server::ActiveStreams::default(),
@@ -822,10 +867,7 @@ mod tests {
             protocol_runtime: Arc::new(Mutex::new(crate::protocol_runtime::ProtocolRuntime::new())),
             event_tx,
             advertised_host: Arc::new("localhost".to_string()),
-            ai: Arc::new(streaming::ai::AiEngine::from_parts(
-                streaming::ai::AiConfig::default(),
-                None,
-            )),
+            ai: Arc::clone(&ai),
             audio_ai: Arc::new(streaming::audio_ai::AudioAiEngine::from_config(
                 &streaming::audio_ai::AudioAiConfig::default(),
             )),
@@ -870,7 +912,15 @@ mod tests {
             models_routing: streaming::model_route::RoutingConfig::default(),
             plugins_loaded: 0,
             away: crate::server::AppRouterState::away_for_tests(),
-        }
+        };
+        (state, ai)
+    }
+
+    fn build_state(
+        pool: sqlx::SqlitePool,
+        auth_db: Arc<Mutex<rusqlite::Connection>>,
+    ) -> crate::server::AppRouterState {
+        build_state_with_ai(pool, auth_db).0
     }
 
     fn config_req(method: &str, token: &str, body: Option<Value>) -> Request<Body> {
@@ -1266,6 +1316,64 @@ mod tests {
             .expect("restart signal within 2s")
             .unwrap();
         assert!(*rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn ai_l1_knobs_hot_apply_and_persist() {
+        let (pool, auth_db) = test_db().await;
+        let (state, ai) = build_state_with_ai(pool.clone(), auth_db);
+        let token = {
+            let c = state.auth_db.lock().await;
+            security::auth::create_session(&c, "admin").unwrap()
+        };
+        let app = crate::server::build_app_with_state(state);
+        let res = app
+            .oneshot(config_req(
+                "PUT",
+                &token,
+                Some(json!({"settings": {
+                    "ai": {"interval_ms": 250, "confidence_threshold": 0.44}
+                }})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let t = ai.tuning();
+        assert_eq!(t.interval().as_millis(), 250);
+        assert!((t.threshold() - 0.44).abs() < 1e-6);
+        let persisted = db::get_setting(&pool, "ai.interval_ms").await.unwrap();
+        assert_eq!(persisted.as_deref(), Some("250"));
+    }
+
+    #[tokio::test]
+    async fn ai_l1_invalid_values_rejected_without_persisting() {
+        let (pool, auth_db) = test_db().await;
+        let (state, ai) = build_state_with_ai(pool.clone(), auth_db);
+        let before = ai.tuning();
+        let before_iv = before.interval();
+        let token = {
+            let c = state.auth_db.lock().await;
+            security::auth::create_session(&c, "admin").unwrap()
+        };
+        let app = crate::server::build_app_with_state(state);
+        for bad in [
+            json!({"settings": {"ai": {"interval_ms": 0}}}),
+            json!({"settings": {"ai": {"confidence_threshold": 1.5}}}),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(config_req("PUT", &token, Some(bad)))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(ai.tuning().interval(), before_iv, "tuning untouched");
+        assert!(
+            db::get_setting(&pool, "ai.interval_ms")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
