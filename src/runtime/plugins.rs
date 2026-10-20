@@ -248,6 +248,7 @@ impl TriggerEngine {
     /// Spawn the bus subscription (alarm + away_state sources).
     pub fn spawn(self: &Arc<Self>, event_tx: Arc<EventBus>) {
         let engine = Arc::clone(self);
+        let ticker_tx = Arc::clone(&event_tx);
         let mut events = event_tx.subscribe();
         tokio::spawn(async move {
             loop {
@@ -262,6 +263,40 @@ impl TriggerEngine {
                 engine.dispatch(trigger, &event_tx).await;
             }
         });
+
+        // Schedule ticker (SPEC #47 amendment): a 20-second tick whose
+        // per-rule cooldown dedups the boundary minute — the default 60 s
+        // window admits exactly one fire. Spawned only when some manifest
+        // declares schedule rules.
+        if self
+            .plugins
+            .values()
+            .any(|m| m.triggers.iter().any(|r| r.on == TriggerSource::Schedule))
+        {
+            let engine = Arc::clone(self);
+            let event_tx = ticker_tx;
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(20));
+                loop {
+                    tick.tick().await;
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let hhmm = local_hhmm(now_secs);
+                    engine
+                        .dispatch(
+                            Trigger {
+                                source: TriggerSource::Schedule,
+                                discriminator: hhmm,
+                                at_ms: now_secs.saturating_mul(1000) as u64,
+                            },
+                            &event_tx,
+                        )
+                        .await;
+                }
+            });
+        }
     }
 
     /// Match + dispatch every rule for one trigger. Fail-open per action.
