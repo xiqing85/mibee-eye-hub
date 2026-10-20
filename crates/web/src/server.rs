@@ -107,6 +107,11 @@ pub struct AppRouterState {
     /// Agent loop configuration (`[agent]`, SPEC appendix A #43) — read
     /// by the chat route and the voice bridge to gate the loop.
     pub agent_config: crate::agent::AgentConfig,
+    /// Per-capability model routing (design §6, M5) — the chat route
+    /// consults it; defaults reproduce the historic posture.
+    pub models_routing: streaming::model_route::RoutingConfig,
+    /// Loaded plugin manifest count (SPEC appendix A #47; 0 = none).
+    pub plugins_loaded: usize,
     /// Away mode engine (SPEC v1 §3.6): armed flag + decision state —
     /// shared by the away routes, the capabilities document and the
     /// orchestrator task in main.
@@ -547,6 +552,7 @@ pub fn build_app_with_state(state: AppRouterState) -> Router {
             convlog: conversations.clone(),
             agent: agent.clone(),
             agent_config: agent_config.clone(),
+            plugins_loaded: state.plugins_loaded,
             away: away.clone(),
         }))
         // CSP — strict Content-Security-Policy
@@ -633,6 +639,8 @@ pub fn build_app(db: sqlx::SqlitePool, auth_db: Arc<Mutex<Connection>>) -> Route
         conversations,
         agent: AppRouterState::agent_for_tests().0,
         agent_config: AppRouterState::agent_for_tests().1,
+        models_routing: streaming::model_route::RoutingConfig::default(),
+        plugins_loaded: 0,
         away: AppRouterState::away_for_tests(),
     })
 }
@@ -717,6 +725,8 @@ pub async fn test_app_with_user() -> Router {
         conversations,
         agent: AppRouterState::agent_for_tests().0,
         agent_config: AppRouterState::agent_for_tests().1,
+        models_routing: streaming::model_route::RoutingConfig::default(),
+        plugins_loaded: 0,
         away: AppRouterState::away_for_tests(),
     })
 }
@@ -962,6 +972,8 @@ pub async fn run(
         conversations,
         agent: AppRouterState::agent_for_tests().0,
         agent_config: AppRouterState::agent_for_tests().1,
+        models_routing: streaming::model_route::RoutingConfig::default(),
+        plugins_loaded: 0,
         away: AppRouterState::away_for_tests(),
     };
     let app = build_app_with_state(state);
@@ -1040,6 +1052,8 @@ pub async fn run_with_shutdown(
     conversations: Arc<crate::conversations::ConversationLog>,
     agent: Arc<crate::agent::ToolRegistry>,
     agent_config: crate::agent::AgentConfig,
+    models_routing: streaming::model_route::RoutingConfig,
+    plugins_loaded: usize,
     away: Arc<crate::away::AwayEngine>,
 ) -> anyhow::Result<()> {
     // Register Prometheus metrics
@@ -1088,6 +1102,8 @@ pub async fn run_with_shutdown(
         conversations,
         agent,
         agent_config,
+        models_routing,
+        plugins_loaded,
         away,
     };
     let app = build_app_with_state(state);

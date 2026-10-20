@@ -57,6 +57,8 @@ pub struct WebServerDeps {
     pub conversations: Arc<web::conversations::ConversationLog>,
     pub agent: Arc<web::agent::ToolRegistry>,
     pub agent_config: web::agent::AgentConfig,
+    pub models_routing: streaming::model_route::RoutingConfig,
+    pub plugins_loaded: usize,
     pub away: Arc<web::away::AwayEngine>,
 }
 
@@ -96,6 +98,8 @@ pub async fn serve(deps: WebServerDeps) -> anyhow::Result<()> {
         conversations,
         agent,
         agent_config,
+        models_routing,
+        plugins_loaded,
         away,
     } = deps;
     web::server::run_with_shutdown(
@@ -132,6 +136,8 @@ pub async fn serve(deps: WebServerDeps) -> anyhow::Result<()> {
         conversations,
         agent,
         agent_config,
+        models_routing,
+        plugins_loaded,
         away,
     )
     .await

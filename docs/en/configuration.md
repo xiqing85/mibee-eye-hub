@@ -1020,6 +1020,36 @@ low-resolution secondary H.264 stream exposed as `stream.sub.mse`, the RTSP
 `/live/{id}/sub` mount and the ONVIF `sub` profile. Applies on the next
 stream (re)start.
 
+### [plugins] - Plugin Trigger Framework (SPEC appendix A #47)
+
+Plugins are declarative manifests keyed by id (`[plugin.<id>]`): trigger
+rules over the device's own event sources dispatching registered tools
+(built-ins and MCP stdio servers). Every execution is reported on the
+SSE bus as `plugin_invocation` (outcome ok | error | skipped).
+
+```toml
+[plugin.lamp-link]
+version = 1
+tools = ["mcp:home"]
+triggers = [
+  { on = "away_state", when = "armed", cooldown_secs = 60, run = [
+    { tool = "lamp.switch", args = { room = "living room", on = true } } ] }
+]
+[plugin.lamp-link.permissions]
+events = ["away_state"]   # minimal event set — rules outside it are skipped
+egress = []               # outbound allowlist (informed-consent, as #44)
+```
+
+**Field Reference:** the section is an arbitrary-key manifest map with
+nested trigger tables — see SPEC appendix A #47 for the full grammar.
+Trigger sources first-release live: `alarm` (`when` = ai/audio/zone,
+empty = any) and `away_state` (`when` = armed/disarmed, empty = both);
+`schedule` and `audio_level` parse and validate with their wiring in a
+following slice. Actions first-release: `tool` calls (15 s timeout);
+TTS/desktop-notify/push actions follow. Default cooldown 60 s. A
+manifest whose trigger sources are not in `permissions.events` is
+skipped at load with a warning.
+
 ### [database] - SQLite Database
 
 Configure SQLite database path for camera settings, protocol configs, sessions, and users.

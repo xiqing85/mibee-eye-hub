@@ -221,14 +221,36 @@ pub fn route_chat(
     cloud_vision_ready: bool,
     vlm_active: bool,
 ) -> ChatRoute {
-    if cloud_on {
-        if vision && cloud_vision_ready {
-            return ChatRoute::CloudVision;
-        }
-        if !vision {
-            return ChatRoute::CloudChat;
-        }
-        // vision:true but the cloud has no vision model — local VLM.
+    route_chat_routed(
+        cloud_on,
+        vision,
+        cloud_vision_ready,
+        vlm_active,
+        &streaming::model_route::RoutingConfig::default(),
+    )
+}
+
+/// The M5 convergence point (design §6): the historic four-arg decision
+/// plus the operator's per-capability routing declarations. Defaults
+/// reproduce the historic posture exactly (chat cloud-first, vision
+/// cloud-if-ready); `[models.chat] provider = "local"` flips a
+/// capability local-first without touching the code.
+pub fn route_chat_routed(
+    cloud_on: bool,
+    vision: bool,
+    cloud_vision_ready: bool,
+    vlm_active: bool,
+    routing: &streaming::model_route::RoutingConfig,
+) -> ChatRoute {
+    use streaming::model_route::Provider;
+    let chat_cloud = cloud_on && routing.effective("chat", cloud_on) == Provider::Cloud;
+    let vision_cloud =
+        cloud_on && cloud_vision_ready && routing.effective("vision", cloud_on) == Provider::Cloud;
+    if vision && vision_cloud {
+        return ChatRoute::CloudVision;
+    }
+    if chat_cloud && !vision {
+        return ChatRoute::CloudChat;
     }
     if vision && vlm_active {
         return ChatRoute::LocalVlm;
@@ -813,20 +835,50 @@ mod tests {
     #[test]
     fn chat_routing_truth_table() {
         use super::ChatRoute::*;
-        use super::route_chat;
-        // Cloud on, plain text → cloud chat model (SPEC §4.10).
-        assert_eq!(route_chat(true, false, false, false), CloudChat);
-        // Cloud on with a vision model → cloud vision.
-        assert_eq!(route_chat(true, true, true, false), CloudVision);
+        use super::route_chat_routed;
+        use streaming::model_route::{Provider, RouteSelection, RoutingConfig};
+        let def = RoutingConfig::default();
+        // Defaults (M5 privacy decision): chat cloud-first, vision
+        // local-first even when the cloud has a vision model.
+        assert_eq!(
+            route_chat_routed(true, false, false, false, &def),
+            CloudChat
+        );
+        assert_eq!(
+            route_chat_routed(true, true, true, true, &def),
+            LocalVlm,
+            "privacy surface stays local under defaults"
+        );
+        // Operator override flips vision cloud-first (historic posture).
+        let cloud_vision = RoutingConfig {
+            vision: RouteSelection {
+                provider: Provider::Cloud,
+                fallback: Provider::Local,
+            },
+            ..def.clone()
+        };
+        assert_eq!(
+            route_chat_routed(true, true, true, false, &cloud_vision),
+            CloudVision
+        );
         // Cloud on, vision but no vision_model configured → local VLM.
-        assert_eq!(route_chat(true, true, false, true), LocalVlm);
+        assert_eq!(route_chat_routed(true, true, false, true, &def), LocalVlm);
         // Cloud off, vision with local VLM → local VLM.
-        assert_eq!(route_chat(false, true, false, true), LocalVlm);
+        assert_eq!(route_chat_routed(false, true, false, true, &def), LocalVlm);
         // Vision but no VLM anywhere → grounded local LLM.
-        assert_eq!(route_chat(false, true, false, false), LocalLlm);
-        assert_eq!(route_chat(true, true, false, false), LocalLlm);
+        assert_eq!(route_chat_routed(false, true, false, false, &def), LocalLlm);
+        assert_eq!(route_chat_routed(true, true, false, false, &def), LocalLlm);
         // Plain text without cloud → local LLM.
-        assert_eq!(route_chat(false, false, false, true), LocalLlm);
+        assert_eq!(route_chat_routed(false, false, false, true, &def), LocalLlm);
+        // chat pinned local → cloud on still answers locally.
+        let local_chat = RoutingConfig {
+            chat: RouteSelection::LOCAL_ONLY,
+            ..def.clone()
+        };
+        assert_eq!(
+            route_chat_routed(true, false, false, true, &local_chat),
+            LocalLlm
+        );
     }
 
     #[test]

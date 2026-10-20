@@ -72,6 +72,9 @@ pub struct CapHandles {
     pub convlog: Arc<crate::conversations::ConversationLog>,
     pub agent: Arc<crate::agent::ToolRegistry>,
     pub agent_config: crate::agent::AgentConfig,
+    /// Plugin trigger engine state (SPEC appendix A #47): loaded manifest
+    /// count from the composition root (0 = no plugins configured).
+    pub plugins_loaded: usize,
     pub away: Arc<crate::away::AwayEngine>,
 }
 
@@ -96,6 +99,7 @@ pub async fn get_capabilities(
         convlog,
         agent,
         agent_config,
+        plugins_loaded,
         away,
     } = h;
     static CACHE: std::sync::OnceLock<CapabilitiesResponse> = std::sync::OnceLock::new();
@@ -160,6 +164,11 @@ pub async fn get_capabilities(
     }
     // Model download progress (SPEC §4.9 model_task) rides the bus.
     events.push("model_task");
+    // Plugin trigger invocations (SPEC appendix A #47) — only with
+    // manifests loaded; the trigger engine is not spawned otherwise.
+    if plugins_loaded > 0 {
+        events.push("plugin_invocation");
+    }
     // Real-time mic level for the voice waveform (SPEC §6 audio_level):
     // fires while any audio consumer keeps the monitor running.
     if voice.is_active() || audio_ai.is_active() || meeting.is_active() {
@@ -228,6 +237,7 @@ pub async fn get_capabilities(
         "telemetry": telemetry_document(
             voice.is_active() || audio_ai.is_active() || meeting.is_active(),
         ),
+        "plugins": plugins_document(plugins_loaded > 0, plugins_loaded),
         // Resource tier the LLM booted into (#30-E).
         "llm_tier": llm_tier.0.as_str(),
         // Boot-time feature admission snapshot (appendix A #40):
@@ -335,6 +345,11 @@ fn telemetry_document(audio: bool) -> serde_json::Value {
     serde_json::json!({ "audio": audio })
 }
 
+/// The `plugins` capability object (SPEC appendix A #47).
+fn plugins_document(enabled: bool, count: usize) -> serde_json::Value {
+    serde_json::json!({ "enabled": enabled, "count": count })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -422,6 +437,7 @@ mod tests {
                 )),
                 agent: crate::server::AppRouterState::agent_for_tests().0,
                 agent_config: crate::server::AppRouterState::agent_for_tests().1,
+                plugins_loaded: 0,
                 away: crate::server::AppRouterState::away_for_tests(),
             }),
             Extension(security::middleware::AuthenticatedUser("admin".to_string())),
@@ -713,6 +729,7 @@ mod tests {
                 )),
                 agent: crate::server::AppRouterState::agent_for_tests().0,
                 agent_config: crate::server::AppRouterState::agent_for_tests().1,
+                plugins_loaded: 0,
                 away: crate::server::AppRouterState::away_for_tests(),
             }),
             Extension(security::middleware::AuthenticatedUser("admin".to_string())),

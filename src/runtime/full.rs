@@ -996,6 +996,21 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         tokio::spawn(async move { warmup.warmup().await });
     }
 
+    // Plugin trigger engine (SPEC appendix A #47): declarative manifests
+    // over the device's own event sources, dispatching registered tools.
+    // Fail-open — an empty manifest map is a no-op.
+    if !config.plugins.is_empty() {
+        let engine = std::sync::Arc::new(crate::runtime::plugins::TriggerEngine::new(
+            config.plugins.clone(),
+            Arc::clone(&agent_registry),
+        ));
+        tracing::info!(
+            count = engine.loaded_count(),
+            "plugins: trigger engine started"
+        );
+        engine.spawn(Arc::clone(&event_tx));
+    }
+
     // Auto-start streams for cameras with DB status "running" (resume across restart).
     // This ensures the in-memory StreamManager state matches the persistent DB state.
     {
@@ -1188,6 +1203,8 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         conversations: conversations_log,
         agent: Arc::clone(&agent_registry),
         agent_config: config.agent.clone(),
+        models_routing: config.models.routing.clone(),
+        plugins_loaded: config.plugins.len(),
         away: Arc::clone(&away_engine),
     })
     .await?;
