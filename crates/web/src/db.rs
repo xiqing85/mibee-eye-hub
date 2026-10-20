@@ -2470,3 +2470,153 @@ mod tests {
         assert!(embedded.contains("012_conversations.sql"));
     }
 }
+
+#[cfg(test)]
+mod coverage_gap_tests {
+    use super::*;
+
+    async fn pool() -> SqlitePool {
+        let (pool, _auth) = crate::db::create_test_dbs().await;
+        crate::db::run_migrations(&pool).await.expect("migrations");
+        pool
+    }
+
+    fn cam(id: &str, device_index: i64, status: &str) -> CameraRow {
+        CameraRow {
+            id: id.into(),
+            name: format!("cam-{id}"),
+            camera_type: "usb".into(),
+            config: serde_json::json!({"device_index": device_index}),
+            status: status.into(),
+            created_at: chrono_epoch_secs(),
+            updated_at: chrono_epoch_secs(),
+            offline_since: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn faces_crud_roundtrip_preserves_embedding() {
+        let pool = pool().await;
+        let emb: Vec<f32> = (0..16).map(|i| i as f32 * 0.5 - 2.0).collect();
+        insert_face(&pool, "alice", 16, &emb).await.unwrap();
+        // Upsert replaces the template.
+        insert_face(&pool, "alice", 16, &[0.25_f32; 16])
+            .await
+            .unwrap();
+        insert_face(&pool, "bob", 16, &[0.75_f32; 16])
+            .await
+            .unwrap();
+
+        let listed = list_faces(&pool).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["alice", "bob"],
+            "ordered by name"
+        );
+
+        let templates = load_face_templates(&pool).await.unwrap();
+        assert_eq!(templates.len(), 2);
+        let alice = templates.iter().find(|t| t.name == "alice").unwrap();
+        assert_eq!(alice.embedding, vec![0.25_f32; 16], "upsert won");
+
+        assert!(delete_face(&pool, "alice").await.unwrap());
+        assert!(
+            !delete_face(&pool, "alice").await.unwrap(),
+            "second delete: none"
+        );
+        assert_eq!(load_face_templates(&pool).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn away_stats_and_since_window() {
+        let pool = pool().await;
+        let mut early = crate::away::AwayEventRecord {
+            id: 0,
+            camera_id: "0".into(),
+            kind: "person".into(),
+            started_ms: 100,
+            labels: "person×1".into(),
+            face_name: None,
+            description: None,
+            visitor_reply: None,
+            snapshot: None,
+            state: "answered".into(),
+        };
+        insert_away_event(&pool, &early).await.unwrap();
+        early.kind = "activity".into();
+        early.started_ms = 5_000;
+        insert_away_event(&pool, &early).await.unwrap();
+
+        let (total, persons) = away_stats(&pool).await.unwrap();
+        assert_eq!((total, persons), (2, 1));
+
+        let since = list_away_events_since(&pool, 1_000, 50).await.unwrap();
+        assert_eq!(since.len(), 1, "only the later event is inside the window");
+        assert_eq!(since[0].started_ms, 5_000);
+        // Clamp bounds: limit 0 or absurd still returns something sane.
+        let clamped = list_away_events_since(&pool, 0, 0).await.unwrap();
+        assert_eq!(clamped.len(), 1, "limit clamps to >= 1");
+    }
+
+    #[tokio::test]
+    async fn offline_mark_and_clear_by_device_index() {
+        let pool = pool().await;
+        create_camera(&pool, &cam("a", 0, "online")).await.unwrap();
+        create_camera(&pool, &cam("b", 1, "online")).await.unwrap();
+
+        // Marking an index nobody has is a no-op.
+        assert!(
+            mark_cameras_offline_by_device_index(&pool, 9)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let affected = mark_cameras_offline_by_device_index(&pool, 0)
+            .await
+            .unwrap();
+        assert_eq!(affected, vec!["a".to_string()]);
+        // Re-marking is idempotent (already offline → not re-reported).
+        assert!(
+            mark_cameras_offline_by_device_index(&pool, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Clearing re-online only the matching index.
+        let cleared = clear_offline_by_device_index(&pool, 0).await.unwrap();
+        assert_eq!(cleared, vec!["a".to_string()]);
+        let after = get_camera(&pool, "a").await.unwrap().unwrap();
+        // Clearing restores a live-capable status ("stopped"), not "offline".
+        assert_ne!(after.status, "offline");
+    }
+
+    #[tokio::test]
+    async fn protocol_config_list_and_emptiness() {
+        let pool = pool().await;
+        assert!(protocol_configs_is_empty(&pool).await.unwrap());
+        set_protocol_config(&pool, "rtmp_push", &serde_json::json!({"enabled": false}))
+            .await
+            .unwrap();
+        set_protocol_config(&pool, "gb28181", &serde_json::json!({"enabled": true}))
+            .await
+            .unwrap();
+        assert!(!protocol_configs_is_empty(&pool).await.unwrap());
+        let listed = list_protocol_configs(&pool).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["gb28181", "rtmp_push"]
+        );
+        assert_eq!(listed[1].1["enabled"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn auto_discovery_returns_count_without_error() {
+        // Whether devices exist is host-dependent (CI has none → the
+        // enumerate-error path returns 0); both paths must be graceful.
+        let pool = pool().await;
+        let n = auto_discover_cameras(&pool).await.unwrap();
+        assert!(n <= list_cameras(&pool).await.unwrap().len() as usize);
+    }
+}

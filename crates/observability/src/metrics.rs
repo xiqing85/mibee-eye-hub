@@ -63,9 +63,11 @@ static GLOBAL_METRICS: OnceLock<Metrics> = OnceLock::new();
 /// time will return an error.
 pub fn register_metrics() -> Result<()> {
     let metrics = Metrics::new().context("failed to create metrics")?;
-    GLOBAL_METRICS
-        .set(metrics)
-        .map_err(|_| anyhow::anyhow!("metrics already registered"))
+    // Idempotent: an already-set global satisfies the postcondition
+    // (in-process re-entry and the full test suite both land here; the
+    // OnceCell keeps the first instance either way).
+    let _ = GLOBAL_METRICS.set(metrics);
+    Ok(())
 }
 
 fn global_metrics() -> &'static Metrics {

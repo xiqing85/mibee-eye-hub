@@ -1231,6 +1231,128 @@ mod tests {
         crate::db::create_test_dbs().await
     }
 
+    fn futures_lite_helper(t: &tokio::task::JoinHandle<anyhow::Result<()>>) -> &'static str {
+        // The handle is unfinished whenever this is called; if it DID
+        // finish, try to surface the result in the panic message.
+        match t.is_finished() {
+            true => "task finished (see logs above for the error)",
+            false => "still running",
+        }
+    }
+
+    #[tokio::test]
+    async fn run_with_shutdown_serves_https_and_drains() {
+        // The full serving path: TLS bootstrap (self-signed generation
+        // included), router build, both listeners, graceful drain on the
+        // watch signal. TLS files land under ./tls relative to the crate —
+        // snapshot and restore so the working tree stays clean.
+        let tls_existed = std::path::Path::new("tls").exists();
+
+        let (pool, auth_db) = test_db().await;
+        crate::db::run_migrations(&pool).await.expect("migrations");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (restart_tx, _restart_rx) = watch::channel(false);
+        let event_tx = Arc::new(routes::events::new_event_bus());
+        let conversations = Arc::new(crate::conversations::ConversationLog::new(
+            pool.clone(),
+            event_tx.clone(),
+            true,
+        ));
+        let (models, cloud) = AppRouterState::models_cloud_for_tests();
+        let port: u16 = 18_443;
+        let serve = tokio::spawn(run_with_shutdown(
+            "127.0.0.1",
+            port,
+            0, // no plain-HTTP listener in the test
+            pool,
+            auth_db,
+            Arc::new(StreamManager::new()),
+            Arc::new(RtspServer::new(RtspServerConfig::default())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(ProtocolRuntime::new())),
+            shutdown_rx,
+            "localhost".into(),
+            event_tx,
+            Arc::new(streaming::ai::AiEngine::from_parts(
+                streaming::ai::AiConfig::default(),
+                None,
+            )),
+            Arc::new(streaming::audio_ai::AudioAiEngine::from_config(
+                &streaming::audio_ai::AudioAiConfig::default(),
+            )),
+            crate::zones::new_shared(),
+            Arc::new(streaming::ocr::OcrEngine::from_config(
+                &streaming::ocr::OcrConfig::default(),
+            )),
+            Arc::new(streaming::voice::VoiceEngine::from_config(
+                &streaming::voice::VoiceConfig::default(),
+            )),
+            Arc::new(streaming::face::FaceEngine::from_config(
+                &streaming::face::FaceConfig::default(),
+            )),
+            Arc::new(streaming::llm::ChatEngine::from_config(
+                &streaming::llm::LlmConfig::default(),
+            )),
+            Arc::new(streaming::vlm::VlmEngine::from_config(
+                &streaming::vlm::VlmConfig::default(),
+            )),
+            Arc::new(streaming::decision::DecisionEngine::from_config(
+                &streaming::decision::DecisionConfig::default(),
+            )),
+            Arc::new(streaming::meeting::MeetingEngine::from_config(
+                &streaming::meeting::MeetingConfig::default(),
+                &streaming::voice::VoiceConfig::default(),
+            )),
+            Arc::new(crate::grounding::GroundingState::new()),
+            Arc::new(std::sync::RwLock::new(
+                streaming::tools::ToolsConfig::default(),
+            )),
+            Arc::new(routes::capabilities::LlmTier("manual".into())),
+            Arc::new(streaming::feature_gate::ResourceProfile::unrestricted()),
+            Arc::new(routes::capabilities::WakeWord(
+                streaming::voice::DEFAULT_WAKE_WORD.into(),
+            )),
+            restart_tx,
+            models,
+            cloud,
+            conversations,
+            AppRouterState::agent_for_tests().0,
+            AppRouterState::agent_for_tests().1,
+            streaming::model_route::RoutingConfig::default(),
+            0,
+            AppRouterState::away_for_tests(),
+        ));
+
+        // Wait for the TLS listener to accept, then drain it via shutdown.
+        // The window is generous: under workspace-wide parallel tests the
+        // migrations + self-signed generation + bind chain can take tens
+        // of seconds on a loaded runner.
+        let mut connected = false;
+        for _ in 0..600 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                connected = true;
+                break;
+            }
+            assert!(
+                !serve.is_finished(),
+                "serve task exited before listening: {:?}",
+                futures_lite_helper(&serve)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(connected, "TLS listener never came up");
+        shutdown_tx.send(true).expect("send shutdown");
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), serve)
+            .await
+            .expect("server drains within the grace window")
+            .expect("join serve task");
+        assert!(outcome.is_ok(), "graceful shutdown returns Ok: {outcome:?}");
+
+        if !tls_existed {
+            let _ = std::fs::remove_dir_all("tls");
+        }
+    }
+
     /// Helper: build a test router with bare DBs (no migrations, no seed user).
     async fn test_router() -> Router {
         let (pool, auth_db) = test_db().await;
