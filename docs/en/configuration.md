@@ -1042,13 +1042,17 @@ egress = []               # outbound allowlist (informed-consent, as #44)
 
 **Field Reference:** the section is an arbitrary-key manifest map with
 nested trigger tables — see SPEC appendix A #47 for the full grammar.
-Trigger sources first-release live: `alarm` (`when` = ai/audio/zone,
-empty = any) and `away_state` (`when` = armed/disarmed, empty = both);
-`schedule` and `audio_level` parse and validate with their wiring in a
-following slice. Actions first-release: `tool` calls (15 s timeout);
-TTS/desktop-notify/push actions follow. Default cooldown 60 s. A
-manifest whose trigger sources are not in `permissions.events` is
-skipped at load with a warning.
+All four trigger sources are live: `alarm` (`when` = ai/audio/zone,
+empty = any), `away_state` (`when` = armed/disarmed, empty = both),
+`schedule` (`when` = "HH:MM" local daily boundary, 20 s tick, one fire
+per boundary minute via the cooldown), `audio_level` (`when` = numeric
+threshold, fires at level >= threshold, cooldown-gated against the
+10 Hz stream). Actions: `tool` (15 s timeout) | `speak` (TTS with the
+playback self-mute; inactive TTS reports `skipped:tts-inactive`) |
+`notify` (desktop toast; headless is an honest ok no-op). Default
+cooldown 60 s. Manifests whose trigger sources are not in
+`permissions.events`, or whose `schedule`/`audio_level` `when` is
+malformed, are skipped at load with a warning.
 
 ### [database] - SQLite Database
 

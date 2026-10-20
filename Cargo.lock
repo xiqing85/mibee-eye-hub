@@ -2921,6 +2921,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "capture",
+ "chrono",
  "clap",
  "dirs",
  "gb28181-rs",

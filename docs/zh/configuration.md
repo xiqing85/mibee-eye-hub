@@ -977,11 +977,14 @@ egress = []               # 外发白名单（知情原则，沿用 #44）
 ```
 
 **字段参考：**本节是任意键清单映射 + 嵌套触发表——完整语法见 SPEC 附录
-A #47。触发源首发已接线：`alarm`（`when` = ai/audio/zone 之一，空=任意）与
-`away_state`（`when` = armed/disarmed，空=两者）；`schedule` 与
-`audio_level` 可解析校验、接线随后续切片。动作首发：`tool` 调用（15s 超
-时）；TTS 播报/桌面通知/推送动作随后。冷却缺省 60s。触发源不在
-`permissions.events` 内的清单装载时告警跳过。
+A #47。四个触发源全部实接：`alarm`（`when` = ai/audio/zone 之一，空=任意）、
+`away_state`（`when` = armed/disarmed，空=两者）、`schedule`（`when` =
+"HH:MM" 本地每日边界分，20s 对时、经冷却每边界分只发一次）、
+`audio_level`（`when` = 数值阈值，level ≥ 阈值即触发，10Hz 流由冷却收
+口）。动作三类：`tool`（15s 超时）| `speak`（TTS 播报带播放自哑；TTS 不
+可用报 `skipped:tts-inactive`）| `notify`（桌面通知；无桌面会话=诚实 ok
+no-op）。冷却缺省 60s。触发源不在 `permissions.events` 内或
+schedule/audio_level 的 `when` 格式不合法的清单装载时告警跳过。
 
 ### [database] - SQLite 数据库
 
