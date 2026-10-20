@@ -1,4 +1,5 @@
-// Voiceprint hero waveform (SPEC §6 `audio_level` + `agent_step` states).
+// Voiceprint hero waveform (SPEC §6 `audio_level` + `agent_step` states +
+// appendix A #46 capture context: passive/active + whose voice).
 // A full-width scrolling oscilloscope in the Assistant hero card: the real
 // mic level (≤10 Hz, perceptually scaled −45…−5 dBFS → 0…1) is the energy
 // envelope; the display interpolates it to 60 fps and modulates it with
@@ -28,6 +29,7 @@ let curLevel = 0;                     // eased toward last audio_level sample
 let lastSampleAt = 0;
 let speakingUntil = 0;
 let state = 'idle';                   // idle | listening | thinking | answering
+let captureTag = { mode: null, source: null };  // SPEC #46 labels
 let thinkPhase = 0;                   // 0..1 position of the traveling pulse
 let rafId = null;
 let ctx = null;
@@ -74,6 +76,10 @@ export function updateWaveformVisibility() {
 export function handleAudioLevel(p) {
   const level = Math.max(0, Math.min(1, Number(p && p.level) || 0));
   lastSampleAt = performance.now();
+  // SPEC appendix A #46: capture context rides every sample (additive;
+  // older devices omit both — the tag then stays hidden).
+  captureTag.mode = p && (p.capture_mode === 'active' || p.capture_mode === 'passive') ? p.capture_mode : null;
+  captureTag.source = p && typeof p.source === 'string' ? p.source : null;
   if (state === 'idle' || state === 'listening') state = 'listening';
   if (level >= SPEAKING_LEVEL) speakingUntil = lastSampleAt + SPEAKING_HANG_MS;
 }
@@ -139,7 +145,13 @@ function draw(now) {
 
   const accent = cssVar('--accent', '#00c8a0');
   const speaking = now < speakingUntil || state === 'answering';
-  const tint = state === 'answering' ? cssVar('--warning', '#f0b45c') : accent;
+  // SPEC #46 visual semantics: active capture keeps the accent highlight;
+  // passive ambience desaturates to the faint tone; the device's own
+  // voice (self) renders in its dedicated channel.
+  const isSelf = captureTag.source === 'self';
+  let tint = state === 'answering' ? cssVar('--warning', '#f0b45c') : accent;
+  if (isSelf) tint = cssVar('--wave-self', '#b48cff');
+  else if (captureTag.mode === 'passive') tint = cssVar('--text-faint', '#5c6c80');
 
   for (let li = 0; li < LAYERS.length; li++) {
     const layer = LAYERS[li];
@@ -229,6 +241,7 @@ const STATE_LABEL_KEY = {
 function updateStateBadge(now) {
   const badgeEl = $('agent-state');
   if (!badgeEl) return;
+  updateCaptureTag();
   let eff = state;
   if (state === 'listening' && now < speakingUntil) eff = 'answering';
   if (badgeEl.dataset.state !== eff) {
@@ -243,6 +256,40 @@ function updateStateBadge(now) {
   }
 }
 
+const CAPTURE_KEY = {
+  passive: 'capturePassive', active: 'captureActive', self: 'captureSelf', others: 'captureOthers',
+};
+
+/// The capture-context tag (SPEC #46): passive/active + whose voice.
+/// `speaker:<name>` shows the enrolled name; anything unknown hides the
+/// tag (old devices without the fields never see it).
+function updateCaptureTag() {
+  const el = $('agent-capture');
+  const label = $('agent-capture-label');
+  if (!el || !label) return;
+  let text = null;
+  let cls = 'agent-capture';
+  if (captureTag.source === 'self') {
+    text = t('captureSelf'); cls += ' self active';
+  } else if (captureTag.mode === 'active') {
+    if (captureTag.source && captureTag.source.startsWith('speaker:')) {
+      text = captureTag.source.slice(8); cls += ' active';
+    } else if (captureTag.source === 'others') {
+      text = t('captureOthers'); cls += ' active';
+    } else {
+      text = t('captureActive'); cls += ' active';
+    }
+  } else if (captureTag.mode === 'passive') {
+    text = t('capturePassive');
+  }
+  if (text === null) {
+    el.classList.add('hidden');
+    return;
+  }
+  el.className = cls;
+  label.textContent = text;
+}
+
 /// Test hooks: reset state and expose the canvas for assertions.
 export function resetWaveformForTests() {
   env = new Float32Array(POINTS);
@@ -250,9 +297,16 @@ export function resetWaveformForTests() {
   lastSampleAt = 0;
   speakingUntil = 0;
   state = 'idle';
+  captureTag = { mode: null, source: null };
   thinkPhase = 0;
+  const el = $('agent-capture');
+  if (el) el.classList.add('hidden');
 }
 
 export function waveformStateForTests() {
   return state;
+}
+
+export function captureTagForTests() {
+  return { ...captureTag };
 }

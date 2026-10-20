@@ -7,7 +7,7 @@ import { t, applyLang } from './i18n.js';
 import { icon, initIcons } from './icons.js';
 import { initTheme } from './theme.js';
 import { AuthState, detectAuthState, setAuthMode, initAuth, handleLogout } from './auth.js';
-import { connectEvents, disconnectEvents } from './sse.js';
+import { connectEvents, disconnectEvents, dispatchTestEvent } from './sse.js';
 import { initLive, startLive, stopLive, refreshCameraSelect, renderDetections } from './live.js';
 import { initAi, handleModelChanged } from './ai.js';
 import { handleAlarmEvent, handleAlarmDescription, handleVoiceTranscript } from './alarm.js';
@@ -251,6 +251,11 @@ function initShell() {
 }
 
 // Surface any uncaught error on the page — invaluable on headless devices.
+// Test seam (SPEC appendix A #46 assertions inject SSE samples): the
+// waveform's capture-tag lanes are driven through the same dispatch the
+// live connection uses.
+window.sse = { dispatchTestEvent };
+
 window.addEventListener('error', (e) => {
   const box = document.createElement('div');
   box.style.cssText = 'position:fixed;bottom:44px;left:12px;z-index:9999;max-width:80%;'

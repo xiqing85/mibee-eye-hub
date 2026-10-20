@@ -59,6 +59,10 @@
   --accent-glow: 0 0 22px rgba(0, 200, 160, .22);
 
   --warning: #f0b040;
+  /* Waveform self channel (SPEC appendix A #46): the device's own voice
+     gets its own hue, distinct from the accent (human input) and the
+     warning (answering state). */
+  --wave-self: #b48cff;
   --warning-bg: rgba(240, 176, 64, .12);
   --warning-border: rgba(240, 176, 64, .35);
   --danger: #ff7070;
@@ -96,6 +100,7 @@
   --text-secondary: #5a6a7a;
   --text-faint: #93a1b0;
 
+  --wave-self: #7d5cd6;
   --accent: #009a7c;
   --accent-2: #0d90c8;
   --accent-grad: linear-gradient(135deg, #00a586, #1293bd);
@@ -2090,6 +2095,22 @@ input[type="range"]::-moz-range-thumb {
 }
 .agent-state.listening { color: var(--accent-text); border-color: var(--accent-border); background: color-mix(in srgb, var(--accent, #00c8a0) 10%, transparent); }
 .agent-state.listening .agent-dot { background: var(--accent); animation: live-pulse 1.6s infinite; }
+
+/* Capture-context tag (SPEC appendix A #46): names what the mic hears —
+   passive ambience vs an active capture window, and whose voice. */
+.agent-capture {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border-light); color: var(--text-faint);
+  background: transparent; white-space: nowrap;
+}
+.agent-capture.active {
+  color: var(--accent-text); border-color: var(--accent-border);
+  background: color-mix(in srgb, var(--accent, #00c8a0) 10%, transparent);
+}
+.agent-capture.self {
+  color: var(--wave-self); border-color: color-mix(in srgb, var(--wave-self) 45%, transparent);
+  background: color-mix(in srgb, var(--wave-self) 12%, transparent);
+}
 .agent-state.thinking { color: var(--accent-text); border-color: var(--accent-border); }
 .agent-state.thinking .agent-dot { background: var(--accent); animation: blink 1s infinite; }
 .agent-state.answering { color: var(--warning, #f0b45c); border-color: color-mix(in srgb, var(--warning, #f0b45c) 50%, transparent); background: color-mix(in srgb, var(--warning, #f0b45c) 10%, transparent); }
