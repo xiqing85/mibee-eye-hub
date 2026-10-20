@@ -790,10 +790,15 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         match opened {
             Some((monitor, rx)) => {
                 // Real-time voice waveform (SPEC §6 audio_level): a level
-                // tap next to the engine workers — smoothed RMS at ≤10 Hz.
+                // tap next to the engine workers — smoothed RMS at ≤10 Hz,
+                // tagged with the capture context (SPEC appendix A #46:
+                // passive/active + whose voice — the waveform pages read
+                // the labels for the visual semantics).
                 {
                     let mut level_rx = rx.resubscribe();
                     let events = event_tx.clone();
+                    let tagger = crate::runtime::telemetry::CaptureTagger::new(&voice_engine);
+                    tagger.spawn_observer(&voice_engine);
                     tokio::spawn(async move {
                         let mut meter = streaming::audio_level::LevelMeter::new();
                         loop {
@@ -809,9 +814,12 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
                                 .map(|d| d.as_millis() as u64)
                                 .unwrap_or(0);
                             if let Some(level) = meter.update(&chunk.samples, now) {
+                                let (capture_mode, source) = tagger.tag(now);
                                 let _ = events.send(web::routes::events::CameraEvent::AudioLevel {
                                     level,
                                     timestamp_ms: now,
+                                    capture_mode,
+                                    source,
                                 });
                             }
                         }
