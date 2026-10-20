@@ -189,6 +189,50 @@ sys.exit(0)
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
+# Waiver 3 — webpki-roots 0.26 / RUSTSEC-2026-0381 (build-only via ureq)
+# ════════════════════════════════════════════════════════════════════════════
+
+echo "check-audit-waiver: verifying the RUSTSEC-2026-0381 (webpki-roots 0.26) waiver"
+
+# ── 3c. Is the 0.26 line still in the lock at all? ─────────────────────────
+# (The 1.0.10 occurrence is patched and takes no waiver; only the 0.26 line
+# is waived. Its disappearance means ureq moved on — dead config, remove.)
+WPR_026="$(python3 - <<'PY'
+import re
+lock = open("Cargo.lock", encoding="utf-8").read()
+for block in lock.split("[[package]]"):
+    m = re.search(r'name = "([^"]+)"', block)
+    v = re.search(r'version = "([^"]+)"', block)
+    if m and v and m.group(1) == "webpki-roots" and v.group(1).startswith("0."):
+        print(v.group(1))
+        break
+PY
+)"
+
+if [[ -z "${WPR_026}" ]]; then
+    echo "check-audit-waiver: webpki-roots 0.26 is no longer in Cargo.lock." >&2
+    echo "  The waiver is dead config — remove RUSTSEC-2026-0381 from tools/audit.toml." >&2
+    fail=1
+else
+    echo "check-audit-waiver: webpki-roots ${WPR_026} present (build-only premise to verify)"
+fi
+
+# ── 3a. Does webpki-roots 0.26 reach a compiled surface for any target? ───
+WPR_NORMAL_DEV="$(cargo tree -i "webpki-roots@${WPR_026}" -e normal,dev --target all --features voice 2>/dev/null || true)"
+
+if [[ -n "${WPR_NORMAL_DEV//[[:space:]]/}" ]]; then
+    echo "check-audit-waiver: webpki-roots ${WPR_026} IS compiled for at least one target:" >&2
+    echo "${WPR_NORMAL_DEV}" >&2
+    echo >&2
+    echo "  The waiver only covers the build-time ureq download path. A" >&2
+    echo "  normal/dev edge is a LIVE vulnerability in the product's TLS" >&2
+    echo "  trust store. Fix the dependency — do not widen the ignore list." >&2
+    fail=1
+else
+    echo "check-audit-waiver: webpki-roots ${WPR_026} has no normal/dev edge (build-only, as the waiver assumes)"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
 
 if [[ "${fail}" -ne 0 ]]; then
     exit 1
