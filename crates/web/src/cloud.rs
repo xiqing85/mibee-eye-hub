@@ -668,6 +668,160 @@ mod tests {
         assert_eq!(reply, "echo:test/model-a:2");
     }
 
+    fn local_cloud() -> (CloudAi, &'static str) {
+        let cloud = CloudAi::new(CloudConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-test".into(),
+            chat_model: "test/agent".into(),
+            ..CloudConfig::default()
+        });
+        (cloud, "agent base")
+    }
+
+    #[tokio::test]
+    async fn agent_complete_parses_tool_calls_and_usage() {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(|body: axum::extract::Json<serde_json::Value>| async move {
+                // The tool table must ride the request when with_tools.
+                let saw_tools = body.get("tools").is_some();
+                axum::Json(json!({
+                    "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "weather.current",
+                                "arguments": "{\"city\":\"广州\"}"
+                            }
+                        }]
+                    }}],
+                    "usage": {"prompt_tokens": 41, "completion_tokens": 7},
+                    "saw_tools": saw_tools
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (cloud, _) = local_cloud();
+        cloud.set_base_url(&format!("http://{addr}/v1"));
+
+        let tools = vec![crate::agent::ToolSpec {
+            name: "weather.current".into(),
+            description: "weather".into(),
+            input_schema: json!({"type": "object"}),
+            source: "builtin".into(),
+        }];
+        let (text, calls, usage) = cloud
+            .agent_complete(
+                &[ChatTurn {
+                    role: "user".into(),
+                    content: "广州天气".into(),
+                }],
+                &tools,
+                true,
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(text, None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "weather.current");
+        assert_eq!(calls[0].arguments["city"], "广州");
+        assert_eq!(usage, Some((41, 7)));
+    }
+
+    #[tokio::test]
+    async fn agent_complete_without_tools_drops_the_table() {
+        use axum::routing::post;
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(None::<bool>));
+        let s2 = Arc::clone(&seen);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(
+                move |body: axum::extract::Json<serde_json::Value>| async move {
+                    *s2.lock() = Some(body.get("tools").is_some());
+                    axum::Json(json!({
+                        "choices": [{ "message": {
+                            "content": "plain answer", "role": "assistant" }}]
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (cloud, _) = local_cloud();
+        cloud.set_base_url(&format!("http://{addr}/v1"));
+        let (text, calls, usage) = cloud
+            .agent_complete(
+                &[ChatTurn {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                &[crate::agent::ToolSpec {
+                    name: "t".into(),
+                    description: "d".into(),
+                    input_schema: json!({}),
+                    source: "builtin".into(),
+                }],
+                false, // forced final text iteration
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(text.as_deref(), Some("plain answer"));
+        assert!(calls.is_empty());
+        assert_eq!(usage, None);
+        assert_eq!(
+            *seen.lock(),
+            Some(false),
+            "tools key absent with with_tools=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_complete_error_paths_before_any_request() {
+        // Off provider.
+        let off = CloudAi::new(CloudConfig {
+            provider: "off".into(),
+            ..CloudConfig::default()
+        });
+        assert!(matches!(
+            off.agent_complete(&[], &[], true, 5).await,
+            Err(CloudError::NotEnabled)
+        ));
+        // Key present but provider off still refuses.
+        let off_keyed = CloudAi::new(CloudConfig {
+            provider: "off".into(),
+            api_key: "sk-x".into(),
+            ..CloudConfig::default()
+        });
+        assert!(matches!(
+            off_keyed.agent_complete(&[], &[], true, 5).await,
+            Err(CloudError::NotEnabled)
+        ));
+        // No chat model configured.
+        let nomodel = CloudAi::new(CloudConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-x".into(),
+            chat_model: String::new(),
+            ..CloudConfig::default()
+        });
+        assert!(matches!(
+            nomodel.agent_complete(&[], &[], true, 5).await,
+            Err(CloudError::NoModel)
+        ));
+    }
+
     #[tokio::test]
     async fn image_rides_the_last_message_as_data_url() {
         use axum::routing::post;

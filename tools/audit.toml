@@ -13,6 +13,8 @@ ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    # webpki-roots 0.26 (build-only via ureq — see the third rationale below)
+    "RUSTSEC-2026-0381",
 ]
 
 # RUSTSEC-2023-0071 — `rsa`, Marvin Attack (timing side-channel key recovery).
@@ -54,3 +56,22 @@ ignore = [
 # normal/dev edge (a compiled, not merely build-time, surface), or if zip's
 # lockfile version moves past the patch line (waiver is now dead config and
 # these entries must be removed).
+
+# RUSTSEC-2026-0381 — `webpki-roots` <1.0.10 (bundled roots trust distrusted
+# emSign intermediates; published 2026-10-19).
+#
+# The only consumer of the vulnerable 0.26 line in this lockfile is `ureq`
+# 2.12.1, a BUILD dependency of `sherpa-onnx-sys` 1.13.8 (its build.rs
+# downloads prebuilt static libs when SHERPA_ONNX_LIB_DIR is unset). CI and
+# the documented local flow both provide the local static lib, so the
+# download path — and with it this TLS root bundle — is not even exercised.
+# The runtime TLS surface (rustls-webpki, webpki-roots 1.0.10) is PATCHED
+# and takes no waiver (upgraded the same day the advisory landed).
+# ureq 2.x pins webpki-roots ^0.26, so no fixed 0.x exists to upgrade to
+# within the consumer's requirement.
+#
+# This waiver is CONDITIONAL. `tools/check-audit-waiver.sh` re-derives the
+# justification on every CI run and fails the job if webpki-roots 0.26
+# acquires a normal/dev edge (compiled, product-reachable surface), or if
+# the 0.26 line disappears from the lockfile (dead config — remove this
+# entry).

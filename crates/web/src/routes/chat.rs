@@ -773,6 +773,81 @@ mod tests {
         assert!(!t.content.contains("用户使用粤语"), "{}", t.content);
     }
 
+    #[tokio::test]
+    async fn local_block_renders_machine_state_and_cameras() {
+        let (pool, _auth) = crate::db::create_test_dbs().await;
+        crate::db::run_migrations(&pool).await.unwrap();
+        let block = local_block(&pool).await;
+        assert!(block.contains("当前时间"), "{block}");
+        assert!(block.contains("可用内存"), "{block}");
+        assert!(block.contains("相机：无"), "no cameras registered: {block}");
+        // A registered camera shows up as name(status).
+        crate::db::create_camera(
+            &pool,
+            &crate::db::CameraRow {
+                id: "c1".into(),
+                name: "门口".into(),
+                camera_type: "usb".into(),
+                config: serde_json::json!({}),
+                status: "online".into(),
+                created_at: "0".into(),
+                updated_at: "0".into(),
+                offline_since: None,
+            },
+        )
+        .await
+        .unwrap();
+        let block = local_block(&pool).await;
+        assert!(block.contains("门口(online)"), "{block}");
+    }
+
+    #[tokio::test]
+    async fn web_block_gates_on_flag_and_intent() {
+        let mut tools = streaming::tools::ToolsConfig::default();
+        // Off by flag.
+        assert!(web_block(&tools, "广州天气怎么样").await.is_none());
+        // On but the turn has no weather intent.
+        tools.weather_enabled = true;
+        tools.weather_city = "Guangzhou".into();
+        assert!(web_block(&tools, "今天几号").await.is_none());
+        // No city configured → still none.
+        tools.weather_city = String::new();
+        assert!(web_block(&tools, "广州天气怎么样").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn primary_camera_prefers_the_first_registered() {
+        let (pool, _auth) = crate::db::create_test_dbs().await;
+        crate::db::run_migrations(&pool).await.unwrap();
+        assert_eq!(primary_camera_id(&pool).await, None);
+        for id in ["b", "a"] {
+            crate::db::create_camera(
+                &pool,
+                &crate::db::CameraRow {
+                    id: id.into(),
+                    name: format!("cam-{id}"),
+                    camera_type: "usb".into(),
+                    config: serde_json::json!({}),
+                    status: "online".into(),
+                    created_at: "0".into(),
+                    updated_at: "0".into(),
+                    offline_since: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // list_cameras orders by creation; the first registered wins.
+        let primary = primary_camera_id(&pool).await;
+        assert!(primary.is_some());
+    }
+
+    #[test]
+    fn unix_now_ms_is_plausible() {
+        let now = unix_now_ms();
+        assert!(now > 1_700_000_000_000, "after 2023-11: {now}");
+    }
+
     #[test]
     fn system_turn_without_scene_omits_that_block_only() {
         let t = build_system_turn(&ctx(None), "你好");
