@@ -999,9 +999,9 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     // Plugin trigger engine (SPEC appendix A #47): declarative manifests
     // over the device's own event sources, dispatching registered tools.
     // Fail-open — an empty manifest map is a no-op.
-    if !config.plugins.is_empty() {
+    if !config.plugin.is_empty() {
         let engine = std::sync::Arc::new(crate::runtime::plugins::TriggerEngine::new(
-            config.plugins.clone(),
+            config.plugin.clone(),
             Arc::clone(&agent_registry),
         ));
         tracing::info!(
@@ -1204,7 +1204,7 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         agent: Arc::clone(&agent_registry),
         agent_config: config.agent.clone(),
         models_routing: config.models.routing.clone(),
-        plugins_loaded: config.plugins.len(),
+        plugins_loaded: config.plugin.len(),
         away: Arc::clone(&away_engine),
     })
     .await?;

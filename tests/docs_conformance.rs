@@ -361,7 +361,7 @@ const SECTION_STRUCTS: &[(&str, &[&str])] = &[
     ("resources", &["ResourcesConfig"]),
     ("conversations", &["ConversationsConfig"]),
     ("agent", &["AgentConfig"]),
-    ("plugins", &["PluginManifest"]),
+    ("plugin", &["PluginManifest"]),
     ("away", &["AwayConfig"]),
     ("desktop", &["DesktopConfig"]),
     ("observability", &["ObservabilityConfig", "RemoteLogConfig"]),
@@ -398,7 +398,7 @@ const EXEMPT_FIELDS: &[(&str, &[&str])] = &[
     ("models", &["chat", "vision", "asr", "tts", "routing"]),
     // M6 plugin manifests: [plugin.<id>] arbitrary-key map + nested
     // trigger tables — no flat field table applies (SPEC appendix A #47).
-    ("plugins", &["version", "tools", "triggers", "permissions"]),
+    ("plugin", &["version", "tools", "triggers", "permissions"]),
 ];
 
 #[test]
