@@ -19,6 +19,62 @@ pub const SETTING_TIER: &str = "elastic.llm_tier";
 /// The LLM tier ladder (down = rightward).
 pub const LADDER: [&str; 3] = ["full", "mid", "lite"];
 
+/// L2 live-swap seam: swap the running LLM to a tier's model file. Wired
+/// to `ChatEngine::swap_model` (via `llm::ladder_path`) in production;
+/// tests install fakes. `None` = decisions persist for next boot only.
+pub type LiveSwapFn = Arc<
+    dyn Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// `[elastic]` configuration section — policy knobs so hosts with big
+/// models on small memory can tune the bands (and a kill switch).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ElasticConfig {
+    /// Master switch (default on): off = no controller, no scale events.
+    pub enabled: bool,
+    /// Sustained-available below this → downgrade one tier.
+    pub enter_low_mib: u64,
+    /// Sustained-available above this → allow one upgrade.
+    pub exit_low_mib: u64,
+    /// Critical: recommend the minimal form (advice only).
+    pub critical_mib: u64,
+    /// Seconds between any two applied actions.
+    pub cooldown_secs: u64,
+    /// Consecutive samples inside a band before it counts (debounce).
+    pub sustain_samples: u32,
+}
+
+impl Default for ElasticConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            enter_low_mib: 1024,
+            exit_low_mib: 2560,
+            critical_mib: 320,
+            cooldown_secs: 180,
+            sustain_samples: 3,
+        }
+    }
+}
+
+impl From<&ElasticConfig> for ElasticPolicy {
+    fn from(cfg: &ElasticConfig) -> Self {
+        Self {
+            enter_low_mib: cfg.enter_low_mib,
+            exit_low_mib: cfg.exit_low_mib,
+            critical_mib: cfg.critical_mib,
+            cooldown_secs: cfg.cooldown_secs,
+            sustain_samples: cfg.sustain_samples.max(1),
+        }
+    }
+}
+
 /// Runtime signals (sampled; see [`sample`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ElasticSignals {
@@ -30,7 +86,7 @@ pub struct ElasticSignals {
 /// PC-freeze happened around ~500 MiB available with swap exhausted, so
 /// the enter band sits well above it; recovery demands real headroom to
 /// avoid unload/reload flapping (design §10: 缩容有动作、扩容保守).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ElasticPolicy {
     /// Sustained-available below this → downgrade one tier.
     pub enter_low_mib: u64,
@@ -226,11 +282,14 @@ pub fn sample() -> ElasticSignals {
 
 /// The wired controller: ticks, decides, persists tier decisions to the
 /// settings bag (the boot path consumes `elastic.llm_tier`) and reports
-/// every action on the SSE bus.
+/// every action on the SSE bus. With a live-swap seam installed (L2),
+/// tier decisions also hot-swap the running model — the persistence
+/// stays as the cross-boot floor either way.
 pub struct ElasticController {
     pool: sqlx::SqlitePool,
     state: Mutex<ElasticState>,
     policy: ElasticPolicy,
+    swap: Option<LiveSwapFn>,
 }
 
 impl ElasticController {
@@ -240,7 +299,23 @@ impl ElasticController {
             pool,
             state: Mutex::new(ElasticState::new(initial_tier)),
             policy: ElasticPolicy::default(),
+            swap: None,
         }
+    }
+
+    /// Tune the policy bands from `[elastic]` config.
+    #[must_use]
+    pub fn with_policy(mut self, policy: ElasticPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Install the L2 live-swap seam (no-op without it: decisions only
+    /// persist for the next boot).
+    #[must_use]
+    pub fn with_live_swap(mut self, swap: LiveSwapFn) -> Self {
+        self.swap = Some(swap);
+        self
     }
 
     /// Spawn the 30-second tick.
@@ -268,7 +343,10 @@ impl ElasticController {
         });
     }
 
-    /// Persist tier decisions and emit the `scale` event (SPEC #48).
+    /// Persist tier decisions, attempt the L2 live swap, and emit the
+    /// `scale` event (SPEC #48). The live swap is best-effort: a failed
+    /// swap never cancels the decision — the persisted tier still applies
+    /// at the next boot.
     pub async fn apply_and_report(&self, action: ElasticAction, now_ms: u64, event_tx: &EventBus) {
         let reason = match &action {
             ElasticAction::TierDown { .. } => "memory_low",
@@ -281,9 +359,23 @@ impl ElasticController {
         | ElasticAction::TierUp { to, .. }
         | ElasticAction::BatteryPin { to, .. } = &action
         {
+            // L2 first (the running process benefits immediately); the
+            // same-path no-op inside the swap keeps repeated decisions
+            // cheap. A failure falls through to persistence — next boot
+            // still lands on the decided tier.
+            if let Some(swap) = &self.swap {
+                match swap(to.clone()).await {
+                    Ok(()) => {
+                        tracing::info!(tier = %to, reason, "elastic: LLM live-swapped (no restart)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, tier = %to, "elastic: live swap failed — decision persists for next boot");
+                    }
+                }
+            }
             if let Err(e) = web::db::set_setting(&self.pool, SETTING_TIER, to).await {
                 tracing::warn!(error = %e, "elastic: tier persist failed (decision stands in-memory)");
-            } else {
+            } else if self.swap.is_none() {
                 tracing::info!(tier = %to, reason, "elastic: tier decision persisted (applies at next boot)");
             }
         } else if matches!(action, ElasticAction::RecommendMinimalForm) {
@@ -507,5 +599,124 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ── L2 wiring: live swap + persistence + scale event ─────────────
+
+    async fn mem_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(":memory:")
+            .await
+            .expect("test pool");
+        sqlx::query(
+            "CREATE TABLE settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("settings table");
+        pool
+    }
+
+    fn recording_swap(seen: Arc<Mutex<Vec<String>>>) -> LiveSwapFn {
+        Arc::new(move |tier| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                seen.lock().expect("swap recorder").push(tier);
+                Ok(())
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn tier_down_live_swaps_persists_and_emits_scale() {
+        let pool = mem_pool().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let ctrl = ElasticController::new(pool.clone(), "full")
+            .with_live_swap(recording_swap(Arc::clone(&seen)));
+        let bus = web::routes::events::new_event_bus();
+        let mut rx = bus.subscribe();
+        ctrl.apply_and_report(
+            ElasticAction::TierDown {
+                from: "full".into(),
+                to: "mid".into(),
+            },
+            123_456,
+            &bus,
+        )
+        .await;
+        assert_eq!(*seen.lock().expect("seen"), vec!["mid".to_string()]);
+        assert_eq!(
+            web::db::get_setting(&pool, SETTING_TIER).await.unwrap(),
+            Some("mid".into())
+        );
+        match rx.try_recv() {
+            Ok(web::routes::events::CameraEvent::Scale {
+                action,
+                from,
+                to,
+                reason,
+                timestamp_ms,
+            }) => {
+                assert_eq!(action, "tier_down");
+                assert_eq!(from, "full");
+                assert_eq!(to, "mid");
+                assert_eq!(reason, "memory_low");
+                assert_eq!(timestamp_ms, 123_456);
+            }
+            other => panic!("expected scale event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_live_swap_still_persists_the_decision() {
+        let pool = mem_pool().await;
+        let failing: LiveSwapFn =
+            Arc::new(|_| Box::pin(async { anyhow::bail!("no ladder path configured") }));
+        let ctrl = ElasticController::new(pool.clone(), "full").with_live_swap(failing);
+        let bus = web::routes::events::new_event_bus();
+        ctrl.apply_and_report(
+            ElasticAction::BatteryPin {
+                from: "full".into(),
+                to: "lite".into(),
+            },
+            1,
+            &bus,
+        )
+        .await;
+        assert_eq!(
+            web::db::get_setting(&pool, SETTING_TIER).await.unwrap(),
+            Some("lite".into())
+        );
+    }
+
+    #[test]
+    fn elastic_config_defaults_and_policy_projection() {
+        let cfg = ElasticConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(ElasticPolicy::from(&cfg), ElasticPolicy::default());
+        let tuned = ElasticConfig {
+            enter_low_mib: 9000,
+            sustain_samples: 0,
+            ..Default::default()
+        };
+        let pol = ElasticPolicy::from(&tuned);
+        assert_eq!(pol.enter_low_mib, 9000);
+        assert_eq!(pol.sustain_samples, 1, "zero sustain clamps to 1");
+    }
+
+    #[test]
+    fn elastic_config_parses_toml_with_defaults() {
+        // Section-body shape (the [elastic] header is consumed by
+        // AppConfig; serde(default) fills whatever the body omits).
+        let cfg: ElasticConfig =
+            toml::from_str("enabled = false\nenter_low_mib = 9000\n").expect("parse");
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.enter_low_mib, 9000);
+        assert_eq!(cfg.exit_low_mib, 2560, "unspecified keeps default");
     }
 }

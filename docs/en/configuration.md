@@ -191,6 +191,38 @@ The admission table surfaces as `capabilities.resource` (status page
 | `feature_gate` | String | `"auto"` | `"auto"` admits enabled features against the boot memory budget; `"all"` boots everything regardless of memory |
 | `reserve_mib` | u64 | `512` | MiB of headroom kept out of the admission budget (MemAvailable already includes reclaimable cache) |
 
+### [elastic] - Runtime Hardware Elasticity Controller
+
+30-second sampling (MemAvailable + battery power) drives LLM tier decisions
+(SPEC appendix A #48, the systematic fix behind #3): sustained low water →
+one tier down, **live-swapping the model without a restart** (a failed swap
+falls back to persist-only, applying at next boot); sustained recovery →
+one tier up; battery power pins lite immediately; critical water only
+recommends the minimal form (never an automatic restart). Every decision
+emits the SPEC §6 `scale` event (shown live on the status page resource
+card). Bands are tunable per host:
+
+```toml
+[elastic]
+enabled = true        # master switch (false = no sampling, no scale events)
+enter_low_mib = 1024  # sustained available below this → tier down
+exit_low_mib = 2560   # sustained above this → allow tier up (hysteresis)
+critical_mib = 320    # sustained below this → recommend the minimal form
+cooldown_secs = 180   # minimum spacing between two applied actions
+sustain_samples = 3   # consecutive in-band samples before it counts
+```
+
+**Field reference:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Controller master switch |
+| `enter_low_mib` | u64 | `1024` | Tier-down enter threshold (MiB) |
+| `exit_low_mib` | u64 | `2560` | Tier-up recovery threshold (MiB, hysteresis) |
+| `critical_mib` | u64 | `320` | Minimal-form advice threshold (MiB) |
+| `cooldown_secs` | u64 | `180` | Action cooldown (seconds) |
+| `sustain_samples` | u32 | `3` | In-band debounce samples (minimum 1) |
+
 ### [conversations] - Dialogue turn records (SPEC §3.4)
 
 Master switch for the human-readable dialogue log: every turn (voice or
@@ -595,8 +627,8 @@ enabled = false
 | `model` | String | `"nanodet-plus-m-320"` | Registry id of the startup model (SPEC §4.6); a non-default `model_path` overrides it |
 | `allow_upload` | bool | `false` | Allow runtime model uploads (SPEC §4.6 capability `ai_upload`; model files are untrusted input) |
 | `model_path` | String | `"models/nanodet-m.onnx"` | NanoDet-Plus ONNX path (cwd-relative or absolute) |
-| `confidence_threshold` | f32 | `0.5` | Minimum confidence for a detection to be reported (0..=1) |
-| `interval_ms` | u64 | `1000` | Minimum spacing between inferences per camera |
+| `confidence_threshold` | f32 | `0.5` | Minimum confidence for a detection to be reported (0..=1). **Hot key**: changes via `PUT /api/config` apply immediately (running sampling workers read the new value from the next frame) |
+| `interval_ms` | u64 | `1000` | Minimum spacing between inferences per camera. **Hot key**: same — applies immediately |
 
 ### [audio_ai] - Sound-Event Detection
 

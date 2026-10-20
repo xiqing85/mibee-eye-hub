@@ -751,14 +751,34 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
 
     // Elastic controller (SPEC appendix A #48): runtime signals → tier
     // decisions with hysteresis; spawns when the heavy features it
-    // governs are present. Initial tier = what this boot admitted.
-    if chat_engine.is_active() || vlm_engine.is_active() {
-        let ctrl = std::sync::Arc::new(crate::runtime::elastic::ElasticController::new(
-            pool.clone(),
-            llm_tier,
-        ));
+    // governs are present. Initial tier = what this boot admitted. With
+    // `[elastic] enabled` (default) and an active chat engine, tier
+    // decisions also live-swap the running model (L2) — persistence
+    // stays as the cross-boot floor.
+    if (chat_engine.is_active() || vlm_engine.is_active()) && config.elastic.enabled {
+        let mut ctrl = crate::runtime::elastic::ElasticController::new(pool.clone(), llm_tier)
+            .with_policy(crate::runtime::elastic::ElasticPolicy::from(
+                &config.elastic,
+            ));
+        if chat_engine.is_active() {
+            let swap_cfg = config.llm.clone();
+            let swap_engine = Arc::clone(&chat_engine);
+            ctrl = ctrl.with_live_swap(Arc::new(move |tier| {
+                let Some(path) = streaming::llm::ladder_path(&tier, &swap_cfg) else {
+                    let tier = tier.clone();
+                    return Box::pin(async move {
+                        anyhow::bail!("elastic: tier {tier} resolves to no model path")
+                    });
+                };
+                let engine = Arc::clone(&swap_engine);
+                Box::pin(async move { engine.swap_model(&path).await })
+            }));
+        }
+        let ctrl = std::sync::Arc::new(ctrl);
         ctrl.spawn(Arc::clone(&event_tx));
         tracing::info!(initial_tier = %llm_tier, "elastic: controller started (30s tick)");
+    } else if !config.elastic.enabled {
+        tracing::info!("elastic: controller disabled by [elastic] config");
     }
     let tts_engine = Arc::new(streaming::tts::TtsEngine::from_config(&config.tts));
     if !tts_engine.is_active() {

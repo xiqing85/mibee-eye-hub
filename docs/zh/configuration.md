@@ -190,6 +190,35 @@ gauge 输出。重启时按届时水位重算。
 | `feature_gate` | String | `"auto"` | `"auto"` 按启动内存预算贪心准入；`"all"` 无视内存全量启动 |
 | `reserve_mib` | u64 | `512` | 从准入预算中保留的余量（MiB；MemAvailable 本已含可回收缓存） |
 
+### [elastic] - 运行期硬件弹性控制器
+
+30s 采样（MemAvailable + 电池供电）驱动 LLM 档位决策（SPEC 附录 A #48，#3 的
+系统性解法）：低水位持续 → 档位降一级，**运行中热换模型**（无需重启；换芯失败
+回落为仅持久化、下次启动生效）；恢复水位持续 → 升一级；电池供电立即钉 lite；
+临界水位只建议切换 minimal 形态（绝不自动重启）。每次决策发 SPEC §6 `scale`
+事件（状态页"资源档位"卡实时显示）。阈值带可按主机调：
+
+```toml
+[elastic]
+enabled = true        # 总开关（false = 不采样、不发 scale 事件）
+enter_low_mib = 1024  # 可用内存持续低于此值 → 降档
+exit_low_mib = 2560   # 持续高于此值 → 允许升档（滞回防抖动）
+critical_mib = 320    # 持续低于此值 → 建议 minimal 形态（仅告警）
+cooldown_secs = 180   # 两个动作之间的最小间隔
+sustain_samples = 3   # 进带持续采样数（去抖）
+```
+
+**字段参考：**
+
+| 字段 | 类型 | 默认值 | 描述 |
+|------|------|---------|------|
+| `enabled` | bool | `true` | 控制器总开关 |
+| `enter_low_mib` | u64 | `1024` | 降档进入阈值（MiB） |
+| `exit_low_mib` | u64 | `2560` | 升档恢复阈值（MiB，滞回） |
+| `critical_mib` | u64 | `320` | minimal 形态建议阈值（MiB） |
+| `cooldown_secs` | u64 | `180` | 动作冷却（秒） |
+| `sustain_samples` | u32 | `3` | 进带去抖采样数（最小 1） |
+
 ### [conversations] - 对话记录（规范 §3.4）
 
 人读对话日志总开关：每轮对话（语音或网页）落 SQLite——听到/输入文本、内部"思考"条目（决策/云端/VLM/本地 LLM/TTS，含失败回落腿）与 AI 回复及引擎——经 `GET /api/conversations` 查询、SSE `conversation` 事件实时推送（助手页"对话记录"卡）。FIFO 封顶 1000 轮；写失败绝不影响对话管线。`enabled = false` 不记录且隐藏卡片（隐私开关）。
@@ -555,8 +584,8 @@ enabled = false
 | `model` | String | `"nanodet-plus-m-320"` | 启动模型注册表 id（SPEC §4.6）；非缺省 `model_path` 覆盖它 |
 | `allow_upload` | bool | `false` | 允许运行时上传模型（SPEC §4.6 能力 `ai_upload`；模型文件属不可信输入） |
 | `model_path` | String | `"models/nanodet-m.onnx"` | NanoDet-Plus ONNX 路径（相对工作目录或绝对） |
-| `confidence_threshold` | f32 | `0.5` | 检测上报的最小置信度（0..=1） |
-| `interval_ms` | u64 | `1000` | 每相机两次推理的最小间隔 |
+| `confidence_threshold` | f32 | `0.5` | 检测上报的最小置信度（0..=1）。**热键**：`PUT /api/config` 改动即刻生效（运行中的采样工作器下一帧起读取新值） |
+| `interval_ms` | u64 | `1000` | 每相机两次推理的最小间隔。**热键**：同上，改动即刻生效 |
 
 ### [audio_ai] - 声音事件检测
 
