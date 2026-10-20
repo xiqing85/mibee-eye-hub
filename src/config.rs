@@ -362,6 +362,10 @@ pub struct AppConfig {
     /// cadence, cooldowns, greetings, listen window, snapshot dir.
     #[serde(default)]
     pub away: web::away::AwayConfig,
+    /// Hardware elasticity (SPEC appendix A #48): policy bands for the
+    /// runtime tier controller + the master switch.
+    #[serde(default)]
+    pub elastic: crate::runtime::elastic::ElasticConfig,
 }
 
 /// `[models]` — the download root for the model manager (SPEC §4.9).
@@ -1284,6 +1288,26 @@ device_id = ""
         // Other fields keep defaults
         assert_eq!(cfg.gb28181.platform_sip_port, 5060);
         assert_eq!(cfg.gb28181.register_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_elastic_section_parses_with_defaults() {
+        let toml_str = r#"
+[elastic]
+enabled = false
+enter_low_mib = 9000
+"#;
+        let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.elastic.enabled);
+        assert_eq!(cfg.elastic.enter_low_mib, 9000);
+        assert_eq!(cfg.elastic.exit_low_mib, 2560, "unspecified keeps default");
+    }
+
+    #[test]
+    fn test_elastic_section_absent_means_defaults() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert!(cfg.elastic.enabled, "controller on by default");
+        assert_eq!(cfg.elastic.cooldown_secs, 180);
     }
 
     #[test]

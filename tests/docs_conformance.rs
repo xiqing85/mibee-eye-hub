@@ -363,6 +363,7 @@ const SECTION_STRUCTS: &[(&str, &[&str])] = &[
     ("agent", &["AgentConfig"]),
     ("plugin", &["PluginManifest"]),
     ("away", &["AwayConfig"]),
+    ("elastic", &["ElasticConfig"]),
     ("desktop", &["DesktopConfig"]),
     ("observability", &["ObservabilityConfig", "RemoteLogConfig"]),
     ("onvif", &["OnvifConfig"]),

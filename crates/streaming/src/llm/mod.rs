@@ -60,13 +60,27 @@ pub struct ChatTurn {
 
 /// Local LLM engine (fail-open: missing model or a build without the
 /// `llm` feature leaves it inactive).
+///
+/// The loaded model lives in an interior-mutable slot so the elasticity
+/// controller can hot-swap tiers (L2) without a restart: completions
+/// clone the `Arc` out per call, an in-flight generation finishes on the
+/// model it started with, and the swap itself only waits for the
+/// momentary read-guard release.
 pub struct ChatEngine {
     #[cfg_attr(not(feature = "llm"), allow(dead_code))]
     config: LlmConfig,
-    active: bool,
-    inactive_reason: String,
+    slot: parking_lot::RwLock<ChatSlot>,
+}
+
+struct ChatSlot {
     #[cfg(feature = "llm")]
     model: Option<std::sync::Arc<llama_cpp_2::model::LlamaModel>>,
+    active: bool,
+    inactive_reason: String,
+    /// The model file currently loaded — `config.model_path` at boot, the
+    /// live-swap target afterwards.
+    #[cfg_attr(not(feature = "llm"), allow(dead_code))]
+    model_path: String,
 }
 
 impl ChatEngine {
@@ -79,9 +93,12 @@ impl ChatEngine {
                 tracing::info!(model = %config.model_path, "llm: chat engine loaded");
                 Self {
                     config: config.clone(),
-                    active: true,
-                    inactive_reason: String::new(),
-                    model: Some(std::sync::Arc::new(model)),
+                    slot: parking_lot::RwLock::new(ChatSlot {
+                        model: Some(std::sync::Arc::new(model)),
+                        active: true,
+                        inactive_reason: String::new(),
+                        model_path: config.model_path.clone(),
+                    }),
                 }
             }
             #[cfg(not(feature = "llm"))]
@@ -90,10 +107,13 @@ impl ChatEngine {
                 tracing::info!(%reason, "llm: disabled");
                 Self {
                     config: config.clone(),
-                    active: false,
-                    inactive_reason: format!("{reason:#}"),
-                    #[cfg(feature = "llm")]
-                    model: None,
+                    slot: parking_lot::RwLock::new(ChatSlot {
+                        #[cfg(feature = "llm")]
+                        model: None,
+                        active: false,
+                        inactive_reason: format!("{reason:#}"),
+                        model_path: config.model_path.clone(),
+                    }),
                 }
             }
         }
@@ -101,34 +121,11 @@ impl ChatEngine {
 
     #[cfg(feature = "llm")]
     fn load(config: &LlmConfig) -> anyhow::Result<llama_cpp_2::model::LlamaModel> {
-        use llama_cpp_2::model::LlamaModel;
-        use llama_cpp_2::model::params::LlamaModelParams;
         if !config.enabled {
             anyhow::bail!("disabled by configuration");
         }
-        if !std::path::Path::new(&config.model_path).exists() {
-            anyhow::bail!("llm.model_path: file not found: {}", config.model_path);
-        }
-        // Memory guardrail: refuse to load a model larger than 2/3 of
-        // available memory — hosts without swap get OOM-killed otherwise
-        // (fail-open keeps chat off instead of taking the process down).
-        let model_bytes = std::fs::metadata(&config.model_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        if let Some(avail) = available_memory_bytes()
-            && model_bytes > avail * 2 / 3
-        {
-            anyhow::bail!(
-                "llm.model_path: model {} MiB exceeds 2/3 of available memory ({} MiB) — refusing to load",
-                model_bytes / 1_048_576,
-                avail / 1_048_576
-            );
-        }
-        // Process-wide backend (shared with run_completion via backend()).
-        let backend = backend_shared();
-        let params = LlamaModelParams::default();
-        LlamaModel::load_from_file(backend, std::path::Path::new(&config.model_path), &params)
-            .map_err(|e| anyhow::anyhow!("load {}: {e}", config.model_path))
+        ensure_model_fits_memory(&config.model_path)?;
+        Self::load_model_file(&config.model_path)
     }
 
     #[cfg(not(feature = "llm"))]
@@ -139,16 +136,81 @@ impl ChatEngine {
         anyhow::bail!("built without the `llm` feature")
     }
 
+    /// Load a GGUF file with default model params (no per-tier tuning —
+    /// context/threads come from the boot config at completion time).
+    #[cfg(feature = "llm")]
+    fn load_model_file(path: &str) -> anyhow::Result<llama_cpp_2::model::LlamaModel> {
+        use llama_cpp_2::model::LlamaModel;
+        use llama_cpp_2::model::params::LlamaModelParams;
+        if !std::path::Path::new(path).exists() {
+            anyhow::bail!("model file not found: {path}");
+        }
+        // Process-wide backend (shared with run_completion via backend()).
+        let backend = backend_shared();
+        let params = LlamaModelParams::default();
+        LlamaModel::load_from_file(backend, std::path::Path::new(path), &params)
+            .map_err(|e| anyhow::anyhow!("load {path}: {e}"))
+    }
+
+    /// The model file currently loaded (boot path or live-swap target).
+    #[must_use]
+    pub fn loaded_model_path(&self) -> String {
+        self.slot.read().model_path.clone()
+    }
+
+    /// L2 elasticity: live-swap the model file without a restart.
+    ///
+    /// The new model loads on a blocking thread; only then does the slot
+    /// flip — a load failure leaves the current model untouched (fail
+    /// closed). In-flight completions finish on the model they started
+    /// with. Swapping in the currently loaded path is a no-op `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// Missing file, the available-memory guardrail, or a load failure.
+    pub async fn swap_model(&self, new_path: &str) -> anyhow::Result<()> {
+        // Same-path short-circuit regardless of build features: a tier that
+        // resolves to the loaded model needs no swap at all.
+        if new_path == self.loaded_model_path() {
+            return Ok(());
+        }
+        #[cfg(feature = "llm")]
+        {
+            if !std::path::Path::new(new_path).exists() {
+                anyhow::bail!("llm swap: file not found: {new_path}");
+            }
+            ensure_model_fits_memory(new_path)?;
+            let path = new_path.to_string();
+            let loaded = tokio::task::spawn_blocking(move || Self::load_model_file(&path))
+                .await
+                .map_err(|e| anyhow::anyhow!("llm swap: load task failed: {e}"))??;
+            let mut slot = self.slot.write();
+            let from = slot.model_path.clone();
+            slot.model = Some(std::sync::Arc::new(loaded));
+            slot.active = true;
+            slot.inactive_reason.clear();
+            slot.model_path = new_path.to_string();
+            drop(slot);
+            tracing::info!(from = %from, to = %new_path, "llm: live model swap applied");
+            Ok(())
+        }
+        #[cfg(not(feature = "llm"))]
+        {
+            let _ = new_path;
+            anyhow::bail!("llm swap: built without the `llm` feature")
+        }
+    }
+
     /// Whether dialogue is available.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.active
+        self.slot.read().active
     }
 
     /// Why the engine is inactive (empty string when active).
     #[must_use]
-    pub fn inactive_reason(&self) -> &str {
-        &self.inactive_reason
+    pub fn inactive_reason(&self) -> String {
+        self.slot.read().inactive_reason.clone()
     }
 
     /// One deterministic (greedy) chat completion over the conversation.
@@ -182,11 +244,19 @@ impl ChatEngine {
     ) -> anyhow::Result<(String, u64, u64)> {
         #[cfg(feature = "llm")]
         {
-            let Some(model) = &self.model else {
-                anyhow::bail!("llm inactive: {}", self.inactive_reason);
+            // Clone the Arc out and drop the read guard before the
+            // (seconds-long) generation: a concurrent live swap only waits
+            // for the guard release, and this generation finishes on the
+            // model it started with (L2 swap semantics).
+            let (model, reason) = {
+                let slot = self.slot.read();
+                (slot.model.clone(), slot.inactive_reason.clone())
+            };
+            let Some(model) = model else {
+                anyhow::bail!("llm inactive: {reason}");
             };
             let call = observability::model_call("llm", &self.model_variant());
-            match self.run_completion(model, turns, on_delta) {
+            match self.run_completion(&model, turns, on_delta) {
                 Ok((reply, prompt_tokens, completion_tokens)) => {
                     call.finish_ok(Some(prompt_tokens), Some(completion_tokens));
                     Ok((reply, prompt_tokens, completion_tokens))
@@ -200,16 +270,18 @@ impl ChatEngine {
         #[cfg(not(feature = "llm"))]
         {
             let _ = (turns, on_delta);
-            anyhow::bail!("llm inactive: {}", self.inactive_reason)
+            anyhow::bail!("llm inactive: {}", self.inactive_reason())
         }
     }
 
     /// Per-model metric variant label: the loaded GGUF file stem (SPEC
     /// appendix A #39 — variant = concrete model). Public so product
-    /// layers can label conversation-trace spans identically.
+    /// layers can label conversation-trace spans identically. Reflects
+    /// live swaps (the slot path, not the boot config).
     #[must_use]
     pub fn model_variant(&self) -> String {
-        std::path::Path::new(&self.config.model_path)
+        let path = self.loaded_model_path();
+        std::path::Path::new(&path)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
@@ -311,6 +383,28 @@ impl ChatEngine {
     }
 }
 
+/// The model file a rung of the LLM ladder (`full`/`mid`/`lite`) resolves
+/// to, mirroring [`crate::tools::resolve_llm_tier`]'s fallback (an empty
+/// mid/lite slot reuses `model_path`). Unknown tiers resolve to
+/// `None` — callers treat that as "no live swap".
+#[must_use]
+pub fn ladder_path(tier: &str, config: &LlmConfig) -> Option<String> {
+    match tier {
+        "full" => Some(config.model_path.clone()),
+        "mid" => Some(if config.model_path_mid.is_empty() {
+            config.model_path.clone()
+        } else {
+            config.model_path_mid.clone()
+        }),
+        "lite" => Some(if config.model_path_lite.is_empty() {
+            config.model_path.clone()
+        } else {
+            config.model_path_lite.clone()
+        }),
+        _ => None,
+    }
+}
+
 /// Strip `<think>…</think>` sections (Qwen3's `/no_think` still emits an
 /// empty block). Shared with the VLM description path.
 #[cfg_attr(not(feature = "llm"), allow(dead_code))]
@@ -392,6 +486,24 @@ pub fn available_memory_bytes() -> Option<u64> {
     Some(kb * 1024)
 }
 
+/// Memory guardrail shared by boot load and live swap: refuse a model
+/// larger than 2/3 of available memory — hosts without swap get
+/// OOM-killed otherwise (fail-open keeps chat on the current model).
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
+fn ensure_model_fits_memory(path: &str) -> anyhow::Result<()> {
+    let model_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if let Some(avail) = available_memory_bytes()
+        && model_bytes > avail * 2 / 3
+    {
+        anyhow::bail!(
+            "model {} MiB exceeds 2/3 of available memory ({} MiB) — refusing to load",
+            model_bytes / 1_048_576,
+            avail / 1_048_576,
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +542,47 @@ mod tests {
             ..LlmConfig::default()
         });
         assert!(!e.is_active(), "missing model must not fake activity");
+    }
+
+    #[test]
+    fn ladder_path_mirrors_tier_fallbacks() {
+        let cfg = LlmConfig {
+            model_path: "a.gguf".into(),
+            model_path_mid: "b.gguf".into(),
+            model_path_lite: String::new(),
+            ..LlmConfig::default()
+        };
+        assert_eq!(ladder_path("full", &cfg).as_deref(), Some("a.gguf"));
+        assert_eq!(ladder_path("mid", &cfg).as_deref(), Some("b.gguf"));
+        // Empty lite slot falls back to the full-tier model (no swap).
+        assert_eq!(ladder_path("lite", &cfg).as_deref(), Some("a.gguf"));
+        assert_eq!(ladder_path("bogus", &cfg), None);
+    }
+
+    #[tokio::test]
+    async fn swap_missing_file_fails_closed_and_keeps_current() {
+        let e = ChatEngine::from_config(&LlmConfig {
+            enabled: true,
+            model_path: "definitely-not-here.gguf".into(),
+            ..LlmConfig::default()
+        });
+        assert!(!e.is_active());
+        assert_eq!(e.loaded_model_path(), "definitely-not-here.gguf");
+        let _err = e.swap_model("also-not-here.gguf").await.unwrap_err();
+        #[cfg(feature = "llm")]
+        assert!(_err.to_string().contains("not found"), "{_err}");
+        // Fail-closed: slot untouched after the failed swap.
+        assert!(!e.is_active());
+        assert_eq!(e.loaded_model_path(), "definitely-not-here.gguf");
+    }
+
+    #[tokio::test]
+    async fn swap_to_current_path_is_a_no_op() {
+        let e = ChatEngine::from_config(&LlmConfig::default());
+        // Even an inactive engine short-circuits on the same path.
+        e.swap_model(&LlmConfig::default().model_path)
+            .await
+            .expect("same-path swap is a no-op");
+        assert!(!e.is_active());
     }
 }
