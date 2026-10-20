@@ -275,6 +275,8 @@ const DICT = {
     // Agent hero + thinking panel + tools (SPEC §3.5 / §6 agent_step)
     agentStateIdle: '待命', agentStateListening: '聆听中', agentStateThinking: '思考中',
     agentStateAnswering: '回答中',
+    capturePassive: '被动监听', captureActive: '主动采集', captureSelf: '设备自声',
+    captureOthers: '人声',
     agentActivityThink: '正在思考…', agentActivityTool: '正在调用 {name}…',
     chatAvatarAi: '蜂', chatAvatarMe: '我', chatHeardBadge: '听到', chatInterrupted: '已打断', chatInterruptedTitle: '该轮回答被您的插话打断，仅显示实际播出的部分',
     chatTurns: '{n} 轮',
@@ -595,6 +597,8 @@ const DICT = {
     // Agent hero + thinking panel + tools (SPEC §3.5 / §6 agent_step)
     agentStateIdle: 'Standby', agentStateListening: 'Listening', agentStateThinking: 'Thinking',
     agentStateAnswering: 'Answering',
+    capturePassive: 'Passive', captureActive: 'Active capture', captureSelf: 'Device voice',
+    captureOthers: 'Voice',
     agentActivityThink: 'Thinking…', agentActivityTool: 'Calling {name}…',
     chatAvatarAi: 'AI', chatAvatarMe: 'Me', chatHeardBadge: 'Heard', chatInterrupted: 'Interrupted', chatInterruptedTitle: 'This reply was cut short by your interruption; only the spoken prefix is shown',
     chatTurns: '{n} turns',
