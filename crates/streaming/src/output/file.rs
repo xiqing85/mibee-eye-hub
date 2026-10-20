@@ -438,6 +438,145 @@ fn format_local_timestamp(epoch_secs: u64) -> String {
 mod tests {
     use super::*;
 
+    // ── Integration: start → send_frame → rotation/slot/pause/prune ────
+
+    fn video_frame(keyframe: bool, ts_ms: u64) -> MediaFrame {
+        // muxide validates that the first keyframe of a segment carries
+        // parameter sets, so keyframes embed SPS + PPS as an in-band Annex B
+        // pair (the prepended start code plus the embedded ones give the
+        // muxer's NAL scanner three units); non-key frames are a plain
+        // slice NAL.
+        let data = if keyframe {
+            let mut v = vec![0x67, 0x42, 0x00, 0x0a, 0xf8, 0x41, 0xa2];
+            v.extend_from_slice(&[0x00, 0x00, 0x01]);
+            v.extend_from_slice(&[0x68, 0xeb, 0xec, 0xb2, 0x20]);
+            v
+        } else {
+            vec![0x65, 0x88, 0x84, 0x00, 0x1f, 0xff, 0xd7]
+        };
+        MediaFrame::Video {
+            keyframe,
+            data,
+            timestamp: ts_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn segments_open_on_keyframes_and_publish_the_slot() {
+        let dir = std::env::temp_dir().join(format!("mibee-fileout-{:?}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let slot = SegmentSlot::default();
+        let mut out = FileOutput::new(
+            dir.to_str().unwrap(),
+            "cam-int",
+            // Rotate on every keyframe boundary for the test.
+            0,
+            0,
+        )
+        .with_segment_slot(slot.clone());
+        out.start().await.expect("start");
+        out.send_frame(&video_frame(true, 0)).await.expect("f1");
+        out.send_frame(&video_frame(false, 33)).await.expect("f2");
+        // Segment filenames are second-resolution timestamps: two rotations
+        // in the same wall-clock second would collide into one file.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        out.send_frame(&video_frame(true, 66)).await.expect("f3");
+        out.stop().await.expect("stop");
+
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "mp4"))
+            .collect();
+        assert_eq!(
+            files.len(),
+            2,
+            "two rotated segments: keyframe-opened + rotated"
+        );
+        let (path, _start_ms) = slot.lock().clone().expect("slot published");
+        assert!(path.contains("cam-int"), "{path}");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "slot path is real: {path}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pause_gate_closes_and_holds_without_new_files() {
+        let dir =
+            std::env::temp_dir().join(format!("mibee-fileout-pause-{:?}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut out =
+            FileOutput::new(dir.to_str().unwrap(), "cam-p", 60, 0).with_pause_flag(flag.clone());
+        out.start().await.expect("start");
+        // Paused from the very first frame: nothing opens, nothing errors.
+        out.send_frame(&video_frame(true, 0))
+            .await
+            .expect("paused frame ok");
+        out.send_frame(&video_frame(true, 33))
+            .await
+            .expect("still ok");
+        let n_files = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(n_files, 0, "pause holds: no segment files");
+        // Unpause: the next keyframe opens a segment via the lazy path.
+        flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        out.send_frame(&video_frame(true, 66))
+            .await
+            .expect("unpaused");
+        let n_files = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(n_files, 1, "fresh segment after unpause");
+        out.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn dimensions_handle_overrides_constructor_values() {
+        let dir = std::env::temp_dir().join(format!("mibee-fileout-dims-{:?}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let handle = Arc::new(Mutex::new(Some(StreamDimensions {
+            width: 640,
+            height: 360,
+            fps: 15.0,
+        })));
+        let mut out = FileOutput::new(dir.to_str().unwrap(), "cam-d", 60, 0)
+            .with_dimensions(1920, 1080, 60.0)
+            .with_dimensions_handle(handle);
+        out.start().await.expect("start");
+        out.send_frame(&video_frame(true, 0)).await.expect("f");
+        assert_eq!((out.width, out.height, out.fps as u32), (640, 360, 15));
+        out.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn audio_frames_are_dropped_cleanly() {
+        let dir = std::env::temp_dir().join(format!("mibee-fileout-aud-{:?}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut out = FileOutput::new(dir.to_str().unwrap(), "cam-a", 60, 0);
+        out.start().await.expect("start");
+        out.send_frame(&MediaFrame::Audio {
+            data: vec![0u8; 160],
+            timestamp: 0,
+        })
+        .await
+        .expect("audio dropped without error");
+        assert!(out.active.is_none(), "no segment opened for audio");
+        out.stop().await.expect("stop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn frame_before_start_errors_honestly() {
+        let mut out = FileOutput::new("/tmp/mibee-fileout-never", "cam-x", 60, 0);
+        let err = out
+            .send_frame(&video_frame(true, 0))
+            .await
+            .expect_err("not started");
+        assert!(err.to_string().contains("not started"), "{err}");
+    }
+
     #[test]
     fn timestamp_format_is_14_digits() {
         // Unix epoch 0 = 1970-01-01 00:00:00 UTC.
