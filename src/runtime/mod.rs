@@ -7,6 +7,7 @@
 
 pub mod ai_bridge;
 pub mod bootstrap;
+pub mod elastic;
 pub mod forms;
 pub mod full;
 pub mod hotplug;

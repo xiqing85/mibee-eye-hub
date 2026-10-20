@@ -227,6 +227,27 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
             )
         }
     };
+    // Elasticity (M7, SPEC #48): a persisted runtime tier decision from
+    // the elastic controller overrides the configured tier — the
+    // systematic memory-low-water action behind issue #3. Scoped pool:
+    // the main pool initializes further down.
+    {
+        let db_str = args.db_path.to_string_lossy().into_owned();
+        if let Ok(scope) = web::db::init_pool(&db_str).await
+            && let Ok(Some(tier)) =
+                web::db::get_setting(&scope, crate::runtime::elastic::SETTING_TIER).await
+            && streaming::feature_gate::Tier::from_name(&tier).is_some()
+            && tier != config.resources.tier
+        {
+            tracing::info!(
+                from = %config.resources.tier,
+                to = %tier,
+                "elastic: persisted tier decision applies (runtime downgrade)"
+            );
+            config.resources.tier = tier;
+        }
+    }
+
     let (llm_model, llm_tier) = streaming::tools::resolve_llm_tier(
         &config.llm.model_path,
         &config.llm.model_path_mid,
@@ -711,6 +732,18 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     let chat_engine = Arc::new(streaming::llm::ChatEngine::from_config(&config.llm));
     if !chat_engine.is_active() {
         tracing::info!(reason = %chat_engine.inactive_reason(), "llm: chat disabled");
+    }
+
+    // Elastic controller (SPEC appendix A #48): runtime signals → tier
+    // decisions with hysteresis; spawns when the heavy features it
+    // governs are present. Initial tier = what this boot admitted.
+    if chat_engine.is_active() || vlm_engine.is_active() {
+        let ctrl = std::sync::Arc::new(crate::runtime::elastic::ElasticController::new(
+            pool.clone(),
+            llm_tier,
+        ));
+        ctrl.spawn(Arc::clone(&event_tx));
+        tracing::info!(initial_tier = %llm_tier, "elastic: controller started (30s tick)");
     }
     let tts_engine = Arc::new(streaming::tts::TtsEngine::from_config(&config.tts));
     if !tts_engine.is_active() {

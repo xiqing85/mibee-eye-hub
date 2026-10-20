@@ -169,6 +169,11 @@ pub async fn get_capabilities(
     if plugins_loaded > 0 {
         events.push("plugin_invocation");
     }
+    // Elasticity decisions (SPEC appendix A #48) — the controller spawns
+    // with the heavy features it governs.
+    if chat.is_active() || vlm.is_active() {
+        events.push("scale");
+    }
     // Real-time mic level for the voice waveform (SPEC §6 audio_level):
     // fires while any audio consumer keeps the monitor running.
     if voice.is_active() || audio_ai.is_active() || meeting.is_active() {
