@@ -164,10 +164,15 @@ mod tests {
         }
         let entries = newest_first(usize::MAX, 0);
         assert!(entries.len() >= 25);
-        assert_eq!(entries[0].message, "m24", "newest first");
+        // Relative order only: parallel tests share the global ring and can
+        // interleave pushes after m24 (CI flake 2026-10-20: "filter-in" from
+        // level_filter_and_ranking landed first) — absolute head assertions
+        // violate this test's own sharing rule.
         let pos24 = entries.iter().position(|e| e.message == "m24").unwrap();
         let pos23 = entries.iter().position(|e| e.message == "m23").unwrap();
+        let pos0 = entries.iter().position(|e| e.message == "m0").unwrap();
         assert!(pos24 < pos23, "newer entries come first");
+        assert!(pos23 < pos0, "oldest of the batch comes last");
     }
 
     #[test]
