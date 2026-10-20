@@ -354,9 +354,10 @@ pub struct AppConfig {
     /// tool-calling loop + MCP stdio plugin servers.
     #[serde(default)]
     pub agent: web::agent::AgentConfig,
-    /// Plugin manifests (`[plugin.<id>]`, SPEC appendix A #47).
+    /// Plugin manifests (`[plugin.<id>]`, SPEC appendix A #47) — the
+    /// singular table name carries the manifest id as the key.
     #[serde(default)]
-    pub plugins: std::collections::HashMap<String, crate::runtime::plugins::PluginManifest>,
+    pub plugin: std::collections::HashMap<String, crate::runtime::plugins::PluginManifest>,
     /// Away mode (SPEC §3.6 / appendix A #44): the armed watch loop —
     /// cadence, cooldowns, greetings, listen window, snapshot dir.
     #[serde(default)]

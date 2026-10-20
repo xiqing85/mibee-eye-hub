@@ -957,7 +957,7 @@ bitrate}`，SPEC 附录 A #20）：低分辨率 H.264 副码流，经 `stream.su
 RTSP `/live/{id}/sub` 挂载点与 ONVIF `sub` profile 暴露。在下次流
 （重）启动时生效。
 
-### [plugins] - 插件触发器框架（SPEC 附录 A #47）
+### [plugin] - 插件触发器框架（SPEC 附录 A #47）
 
 插件 = 按 id 声明的清单（`[plugin.<id>]`）：对设备自身事件源的触发规则，调
 用已注册工具（内置 + MCP stdio 服务器）。每次执行经 SSE `plugin_invocation`

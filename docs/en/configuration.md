@@ -1020,7 +1020,7 @@ low-resolution secondary H.264 stream exposed as `stream.sub.mse`, the RTSP
 `/live/{id}/sub` mount and the ONVIF `sub` profile. Applies on the next
 stream (re)start.
 
-### [plugins] - Plugin Trigger Framework (SPEC appendix A #47)
+### [plugin] - Plugin Trigger Framework (SPEC appendix A #47)
 
 Plugins are declarative manifests keyed by id (`[plugin.<id>]`): trigger
 rules over the device's own event sources dispatching registered tools
