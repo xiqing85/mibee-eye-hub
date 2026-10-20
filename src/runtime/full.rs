@@ -1003,6 +1003,8 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         let engine = std::sync::Arc::new(crate::runtime::plugins::TriggerEngine::new(
             config.plugin.clone(),
             Arc::clone(&agent_registry),
+            Arc::clone(&tts_engine),
+            Arc::clone(&desktop),
         ));
         tracing::info!(
             count = engine.loaded_count(),

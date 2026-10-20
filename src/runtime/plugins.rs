@@ -2,11 +2,12 @@
 //! declarative manifests — trigger rules over the device's own event
 //! sources, dispatching registered tools (built-ins and MCP stdio).
 //!
-//! First slice: the `alarm` and `away_state` sources are live (the
-//! engine subscribes the SSE bus); `schedule` and `audio_level` are
-//! parsed and validated but their wiring lands with the next slice.
-//! Actions are tool calls; TTS/desktop/push actions follow. Everything
-//! is fail-open: a failing plugin never touches the trigger source.
+//! All four first-release sources are live: `alarm` and `away_state`
+//! ride the SSE bus; `schedule` gets a 20-second boundary-minute tick;
+//! `audio_level` matches a numeric threshold against the level stream
+//! (cooldown-gated). Actions: `tool` calls through the registry, `speak`
+//! via TTS (self-mute held), `notify` via the desktop integration.
+//! Everything is fail-open: a failing plugin never touches the source.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use web::agent::ToolRegistry;
 use web::routes::events::{CameraEvent, EventBus};
+
+use crate::desktop::Desktop;
 
 /// One trigger source (SPEC #47 first-release set).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,22 +30,24 @@ pub enum TriggerSource {
     AudioLevel,
 }
 
-impl TriggerSource {
-    /// The sources whose event wiring is live in this slice.
-    #[must_use]
-    pub fn wired(&self) -> bool {
-        matches!(self, Self::Alarm | Self::AwayState)
-    }
-}
+impl TriggerSource {}
 
-/// One action to run when a rule fires. First-release: tool calls.
+/// One action to run when a rule fires (SPEC #47 amendment): exactly one
+/// of `tool` / `speak` / `notify` per action object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Action {
     /// Registered tool name (built-in or `mcp:<server>` namespace).
-    pub tool: String,
-    /// Arguments object forwarded verbatim.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// Arguments object forwarded verbatim with `tool`.
     #[serde(default)]
     pub args: serde_json::Value,
+    /// TTS utterance (self-mute held for the playback).
+    #[serde(default)]
+    pub speak: Option<String>,
+    /// Desktop notification title (headless = ok no-op).
+    #[serde(default)]
+    pub notify: Option<String>,
 }
 
 /// One trigger rule (SPEC #47).
@@ -112,10 +117,54 @@ pub struct Trigger {
 }
 
 /// Pure rule matching (unit-pinned): does this rule fire for this
-/// trigger? `when` empty matches everything for the source.
+/// trigger? Per-source `when` semantics: alarm/away_state compare the
+/// discriminator (empty = any); schedule compares "HH:MM"; audio_level
+/// parses `when` as a numeric threshold and fires at level >= it.
 #[must_use]
 pub fn rule_fires(rule: &TriggerRule, trigger: &Trigger) -> bool {
-    rule.on == trigger.source && (rule.when.is_empty() || rule.when == trigger.discriminator)
+    if rule.on != trigger.source {
+        return false;
+    }
+    match rule.on {
+        TriggerSource::AudioLevel => {
+            let Ok(threshold) = rule.when.trim().parse::<f32>() else {
+                return false; // non-numeric when never fires (load warns)
+            };
+            let Ok(level) = trigger.discriminator.parse::<f32>() else {
+                return false;
+            };
+            level >= threshold
+        }
+        // Schedule requires the exact boundary minute — empty when is
+        // rejected at load and never fires here either.
+        TriggerSource::Schedule => !rule.when.is_empty() && rule.when == trigger.discriminator,
+        _ => rule.when.is_empty() || rule.when == trigger.discriminator,
+    }
+}
+
+/// A valid schedule `when` is "HH:MM" (00:00–23:59, local time).
+#[must_use]
+pub fn valid_schedule_when(when: &str) -> bool {
+    let Some((h, m)) = when.split_once(':') else {
+        return false;
+    };
+    h.len() == 2
+        && m.len() == 2
+        && h.chars().all(|c| c.is_ascii_digit())
+        && m.chars().all(|c| c.is_ascii_digit())
+        && h.parse::<u32>().is_ok_and(|v| v < 24)
+        && m.parse::<u32>().is_ok_and(|v| v < 60)
+}
+
+/// The current local "HH:MM" for the schedule tick (chrono, same clock
+/// the away scheduler uses for its boundary edges).
+#[must_use]
+pub fn local_hhmm(unix_secs: i64) -> String {
+    chrono::DateTime::<chrono::Local>::from(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs.max(0) as u64),
+    )
+    .format("%H:%M")
+    .to_string()
 }
 
 /// Cooldown bookkeeping: last fire per (plugin, rule index).
@@ -160,23 +209,32 @@ pub struct InvocationRecord {
 pub struct TriggerEngine {
     plugins: HashMap<String, PluginManifest>,
     registry: Arc<ToolRegistry>,
+    tts: Arc<streaming::tts::TtsEngine>,
+    desktop: Arc<Desktop>,
     cooldowns: Mutex<Cooldowns>,
 }
 
 impl TriggerEngine {
     #[must_use]
-    pub fn new(plugins: HashMap<String, PluginManifest>, registry: Arc<ToolRegistry>) -> Self {
+    pub fn new(
+        plugins: HashMap<String, PluginManifest>,
+        registry: Arc<ToolRegistry>,
+        tts: Arc<streaming::tts::TtsEngine>,
+        desktop: Arc<Desktop>,
+    ) -> Self {
         let mut plugins = plugins;
         plugins.retain(|id, m| {
             let ok = m.consistent();
             if !ok {
-                tracing::warn!(plugin = %id, "plugin: manifest inconsistent (trigger source not in permissions.events) — skipped");
+                tracing::warn!(plugin = %id, "plugin: manifest inconsistent (source not allowed or invalid when) — skipped");
             }
             ok
         });
         Self {
             plugins,
             registry,
+            tts,
+            desktop,
             cooldowns: Mutex::new(Cooldowns::default()),
         }
     }
@@ -211,9 +269,6 @@ impl TriggerEngine {
         let now = trigger.at_ms;
         for (plugin_id, manifest) in &self.plugins {
             for (idx, rule) in manifest.triggers.iter().enumerate() {
-                if !rule.on.wired() {
-                    continue;
-                }
                 if !rule_fires(rule, &trigger) {
                     continue;
                 }
@@ -238,20 +293,13 @@ impl TriggerEngine {
                     continue;
                 }
                 for action in &rule.run {
-                    let outcome = match self
-                        .registry
-                        .call(&action.tool, action.args.clone(), Duration::from_secs(15))
-                        .await
-                    {
-                        Ok(_) => "ok".to_string(),
-                        Err(e) => format!("error:{e}"),
-                    };
+                    let (name, outcome) = self.run_action(action).await;
                     emit(
                         event_tx,
                         &InvocationRecord {
                             plugin: plugin_id.clone(),
                             rule: idx,
-                            action: action.tool.clone(),
+                            action: name,
                             outcome,
                             timestamp_ms: now,
                         },
@@ -259,6 +307,45 @@ impl TriggerEngine {
                 }
             }
         }
+    }
+}
+
+impl TriggerEngine {
+    /// Run one action (tool | speak | notify) and report (name, outcome).
+    async fn run_action(&self, action: &Action) -> (String, String) {
+        if let Some(tool) = &action.tool {
+            let outcome = match self
+                .registry
+                .call(tool, action.args.clone(), Duration::from_secs(15))
+                .await
+            {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("error:{e}"),
+            };
+            return (tool.clone(), outcome);
+        }
+        if let Some(text) = &action.speak {
+            if !self.tts.is_active() {
+                return ("speak".into(), "skipped:tts-inactive".into());
+            }
+            // Playback self-mute held for the utterance (the #45
+            // self-talk line — plugin speech must not wake the device).
+            let tts = Arc::clone(&self.tts);
+            let text = text.clone();
+            let outcome = match tokio::task::spawn_blocking(move || tts.speak(&text)).await {
+                Ok(Ok(_)) => "ok".to_string(),
+                Ok(Err(e)) => format!("error:{e}"),
+                Err(e) => format!("error:{e}"),
+            };
+            return ("speak".into(), outcome);
+        }
+        if let Some(title) = &action.notify {
+            // Headless hosts have no session bus — the desktop layer is a
+            // documented no-op there, so this honestly reports ok.
+            self.desktop.notify_alarm("plugin", 1, Some(title));
+            return ("notify".into(), "ok".into());
+        }
+        ("empty".into(), "skipped:no-action".into())
     }
 }
 
@@ -294,6 +381,15 @@ fn trigger_from_event(ev: &CameraEvent) -> Option<Trigger> {
                 "disarmed".into()
             },
             at_ms: since_ms.unwrap_or_else(|| 0),
+        }),
+        CameraEvent::AudioLevel {
+            level,
+            timestamp_ms,
+            ..
+        } => Some(Trigger {
+            source: TriggerSource::AudioLevel,
+            discriminator: format!("{level}"),
+            at_ms: *timestamp_ms,
         }),
         _ => None,
     }
@@ -405,14 +501,9 @@ egress = []
         assert_eq!(m.triggers.len(), 1);
         assert_eq!(m.triggers[0].when, "armed");
         assert_eq!(m.triggers[0].cooldown_secs, 120);
-        assert_eq!(m.triggers[0].run[0].tool, "lamp.switch");
+        assert_eq!(m.triggers[0].run[0].tool.as_deref(), Some("lamp.switch"));
         assert_eq!(m.triggers[0].run[0].args["room"], "客厅");
         assert!(m.consistent());
-        assert!(m.triggers[0].on.wired());
-        assert!(
-            !TriggerSource::Schedule.wired(),
-            "schedule wired next slice"
-        );
     }
 
     #[tokio::test]
@@ -436,8 +527,10 @@ egress = []
                     when: "armed".into(),
                     cooldown_secs: 60,
                     run: vec![Action {
-                        tool: "time.now".into(),
+                        tool: Some("time.now".into()),
                         args: serde_json::json!({}),
+                        speak: None,
+                        notify: None,
                     }],
                 }],
                 permissions: PluginPermissions {
@@ -446,7 +539,15 @@ egress = []
                 },
             },
         );
-        let engine = TriggerEngine::new(plugins, Arc::clone(&registry));
+        // Player pinned empty — no test ever spawns a real player.
+        let tts = Arc::new(streaming::tts::TtsEngine::from_config(
+            &streaming::tts::TtsConfig {
+                player: String::new(),
+                ..Default::default()
+            },
+        ));
+        let desktop = crate::desktop::Desktop::new(&crate::config::DesktopConfig::default());
+        let engine = TriggerEngine::new(plugins, Arc::clone(&registry), tts, desktop);
         assert_eq!(engine.loaded_count(), 1);
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
         engine
@@ -473,5 +574,96 @@ egress = []
             }
             other => panic!("unexpected event {other:?}"),
         }
+    }
+
+    #[test]
+    fn schedule_when_validation() {
+        assert!(valid_schedule_when("00:00"));
+        assert!(valid_schedule_when("23:59"));
+        assert!(!valid_schedule_when("24:00"), "hour overflow");
+        assert!(!valid_schedule_when("12:60"), "minute overflow");
+        assert!(!valid_schedule_when("9:05"), "two-digit required");
+        assert!(!valid_schedule_when("1200"), "missing colon");
+        assert!(!valid_schedule_when(""), "empty");
+    }
+
+    #[test]
+    fn audio_level_threshold_matching() {
+        let loud = rule(TriggerSource::AudioLevel, "0.5", 60);
+        assert!(rule_fires(
+            &loud,
+            &trigger(TriggerSource::AudioLevel, "0.62", 1)
+        ));
+        assert!(!rule_fires(
+            &loud,
+            &trigger(TriggerSource::AudioLevel, "0.3", 1)
+        ));
+        // Non-numeric when never fires (manifests skip at load, but the
+        // matcher stays total and safe).
+        let bad = rule(TriggerSource::AudioLevel, "loud", 0);
+        assert!(!rule_fires(
+            &bad,
+            &trigger(TriggerSource::AudioLevel, "0.9", 1)
+        ));
+    }
+
+    #[test]
+    fn schedule_rules_fire_on_the_boundary_minute() {
+        let at = rule(TriggerSource::Schedule, "09:00", 0);
+        assert!(rule_fires(
+            &at,
+            &trigger(TriggerSource::Schedule, "09:00", 1)
+        ));
+        assert!(!rule_fires(
+            &at,
+            &trigger(TriggerSource::Schedule, "09:01", 1)
+        ));
+        // The away-scheduler convention: empty when would be any-minute —
+        // rejected at load; the matcher treats it as never-firing.
+        let any = rule(TriggerSource::Schedule, "", 0);
+        assert!(!rule_fires(
+            &any,
+            &trigger(TriggerSource::Schedule, "09:00", 1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn speak_on_inactive_tts_reports_skipped() {
+        let tools: web::server::SharedTools = Arc::new(std::sync::RwLock::new(
+            streaming::tools::ToolsConfig::default(),
+        ));
+        let registry = Arc::new(ToolRegistry::new(
+            tools,
+            &web::agent::AgentConfig::default(),
+        ));
+        let tts = Arc::new(streaming::tts::TtsEngine::from_config(
+            &streaming::tts::TtsConfig {
+                player: String::new(),
+                ..Default::default()
+            },
+        )); // inactive
+        let desktop = crate::desktop::Desktop::new(&crate::config::DesktopConfig::default());
+        let engine = TriggerEngine::new(HashMap::new(), registry, tts, desktop);
+        let (name, outcome) = engine
+            .run_action(&Action {
+                tool: None,
+                args: serde_json::json!({}),
+                speak: Some("你好".into()),
+                notify: None,
+            })
+            .await;
+        assert_eq!(
+            (name.as_str(), outcome.as_str()),
+            ("speak", "skipped:tts-inactive")
+        );
+    }
+
+    #[test]
+    fn local_hhmm_formats_two_digits() {
+        let s = local_hhmm(0);
+        assert_eq!(s.len(), 5);
+        assert_eq!(s.as_bytes()[2], b':');
+        assert!(s[..2].chars().all(|c| c.is_ascii_digit()));
+        assert!(s[3..].chars().all(|c| c.is_ascii_digit()));
     }
 }

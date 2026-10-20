@@ -101,6 +101,8 @@ vlm = ["streaming/vlm"]
 [dependencies]
 # web-server deps struct names the auth connection type (security keeps it private).
 rusqlite.workspace = true
+# plugin schedule tick local-time edges (same clock as the away scheduler).
+chrono.workspace = true
 tokio.workspace = true
 clap.workspace = true
 toml.workspace = true
