@@ -225,6 +225,9 @@ pub async fn get_capabilities(
         // `available` = armable (AI detection active), `voice` = the
         // greet-and-ask legs can run.
         "away": away_document(away.is_available(), away.voice_capable()),
+        "telemetry": telemetry_document(
+            voice.is_active() || audio_ai.is_active() || meeting.is_active(),
+        ),
         // Resource tier the LLM booted into (#30-E).
         "llm_tier": llm_tier.0.as_str(),
         // Boot-time feature admission snapshot (appendix A #40):
@@ -324,6 +327,12 @@ fn tools_document(enabled: bool, count: usize) -> serde_json::Value {
 /// [`observability_document`].
 fn away_document(available: bool, voice: bool) -> serde_json::Value {
     serde_json::json!({ "available": available, "voice": voice })
+}
+
+/// The `telemetry` capability object (SPEC appendix A #46): `audio` is
+/// true while the level tap runs — any audio consumer active.
+fn telemetry_document(audio: bool) -> serde_json::Value {
+    serde_json::json!({ "audio": audio })
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +456,11 @@ mod tests {
         // voice legs off, no away SSE events advertised.
         assert_eq!(json["away"]["available"], serde_json::json!(false));
         assert_eq!(json["away"]["voice"], serde_json::json!(false));
+        assert_eq!(
+            json["telemetry"]["audio"],
+            serde_json::json!(false),
+            "SPEC #46 key"
+        );
         assert!(
             !json["events"]
                 .as_array()

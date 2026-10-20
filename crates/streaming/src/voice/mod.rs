@@ -549,6 +549,15 @@ impl VoiceEngine {
         Arc::clone(&self.playback_mute_until_ms)
     }
 
+    /// Shared handle to the no-wake listening deadline — wake windows,
+    /// follow-up windows, one-shot listen windows and interrupt rounds
+    /// all arm this. The audio telemetry tap reads it to distinguish
+    /// active capture from passive ambience (SPEC appendix A #46).
+    #[must_use]
+    pub fn listen_deadline_share(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.follow_until_ms)
+    }
+
     pub fn subscribe_events(&self) -> broadcast::Receiver<VoiceEvent> {
         self.event_tx.subscribe()
     }

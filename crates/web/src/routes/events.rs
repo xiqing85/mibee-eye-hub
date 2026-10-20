@@ -105,7 +105,15 @@ pub enum CameraEvent {
     /// Microphone level for the real-time voice waveform (SPEC §6
     /// `audio_level`, notebook dialect #36): smoothed RMS 0..1 at ≤10 Hz
     /// while the audio monitor runs. Zero = idle floor.
-    AudioLevel { level: f32, timestamp_ms: u64 },
+    AudioLevel {
+        level: f32,
+        timestamp_ms: u64,
+        /// SPEC appendix A #46: passive (ambience) vs active (functional
+        /// capture window). Additive — old consumers ignore it.
+        capture_mode: String,
+        /// SPEC #46: "self" | "speaker:<name>" | "others" | "ambient".
+        source: String,
+    },
     /// A model download task changed state (SPEC §4.9 `model_task`):
     /// progress ticks (throttled ≥0.5s) and terminal statuses, forwarded
     /// from the download manager by main.rs.
@@ -336,11 +344,15 @@ fn event_wire(event: &CameraEvent) -> (&'static str, String) {
         CameraEvent::AudioLevel {
             level,
             timestamp_ms,
+            capture_mode,
+            source,
         } => (
             "audio_level",
             serde_json::json!({
                 "level": level,
                 "timestamp": timestamp_ms,
+                "capture_mode": capture_mode,
+                "source": source,
             })
             .to_string(),
         ),
@@ -700,10 +712,14 @@ mod wire_tests {
         let (n, j) = wire(CameraEvent::AudioLevel {
             level: 0.42,
             timestamp_ms: 13,
+            capture_mode: "active".into(),
+            source: "speaker:alice".into(),
         });
         assert_eq!(n, "audio_level");
         assert_eq!(j["level"].as_f64().unwrap() as f32, 0.42);
         assert_eq!(j["timestamp"], 13);
+        assert_eq!(j["capture_mode"], "active", "SPEC #46 additive field");
+        assert_eq!(j["source"], "speaker:alice");
 
         let (n, j) = wire(CameraEvent::MeetingState {
             camera_id: "0".into(),
