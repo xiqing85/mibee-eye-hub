@@ -37,6 +37,12 @@ pub struct Args {
     #[arg(long)]
     reset_password: bool,
 
+    /// Merge missing sections/keys from the shipped config defaults into
+    /// the local config file (config drift migration, issue #4): existing
+    /// values always win, one .bak is written, nothing starts.
+    #[arg(long)]
+    migrate_config: bool,
+
     /// Run the audio-event pipeline on a WAV file and print the JSON
     /// result (deterministic deployment verification; no server started).
     #[arg(long)]
@@ -77,6 +83,34 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     // Handle --reset-password before starting the server
     if args.reset_password {
         return reset_password_cli(&args).await;
+    }
+    if args.migrate_config {
+        let defaults = std::path::PathBuf::from("config.toml");
+        let local = args.config.clone();
+        match crate::config_migrate::migrate_local_config(&defaults, &local) {
+            Ok(report) => {
+                if report.added.is_empty() {
+                    println!(
+                        "config already current: nothing to migrate in {}",
+                        local.display()
+                    );
+                } else {
+                    println!(
+                        "migrated {} keys into {}:",
+                        report.added.len(),
+                        local.display()
+                    );
+                    for key in &report.added {
+                        println!("  + {key}");
+                    }
+                    if let Some(bak) = &report.backup {
+                        println!("backup: {bak}");
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
     }
     if let Some(path) = &args.selftest_audio {
         return selftest_cli("audio", || {

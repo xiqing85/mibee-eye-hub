@@ -54,8 +54,10 @@ scp -q "$OUT_DIR/mibee-eye" "$HOST:$REMOTE_DIR/mibee-eye.new"
 echo "  Copying migrations..."
 scp -q -r "$OUT_DIR/migrations/"* "$HOST:$REMOTE_DIR/migrations/"
 
-echo "  Copying config (as config.local.toml — local override)..."
-scp -q "$OUT_DIR/config.toml" "$HOST:$REMOTE_DIR/config.local.toml"
+echo "  Config (seed-only-if-absent — never clobbers the operator's config.local.toml)..."
+ssh "$HOST" "test -f $REMOTE_DIR/config.local.toml" 2>/dev/null \
+  || scp -q "$OUT_DIR/config.toml" "$HOST:$REMOTE_DIR/config.local.toml"
+echo "  Tip: on the device, \`$REMOTE_DIR/mibee-eye --migrate-config\` merges new default keys."
 
 # ── 4. Atomic swap + backup rotation ─────────────────────────────────────────
 # Move the new binary into place atomically. If the service is running, the
