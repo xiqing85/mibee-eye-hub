@@ -218,6 +218,53 @@ function renderResourceProfile() {
   }
 }
 
+// ─── Elastic scaling decisions (SPEC appendix A #48) ────────────────
+// Live feed of runtime `scale` events — the boot snapshot above stays
+// static; this list is the real-time complement (tier decisions take
+// effect on next boot, so both views coexist honestly). Newest first,
+// capped at 5; hidden until the first decision arrives.
+
+const SCALE_ACTIONS = {
+  tier_down: 'scaleTierDown',
+  tier_up: 'scaleTierUp',
+  battery_pin: 'scaleBatteryPin',
+  recommend_minimal_form: 'scaleAdvice',
+};
+const SCALE_REASONS = {
+  memory_low: 'scaleMemLow',
+  memory_recovered: 'scaleMemRec',
+  battery_powered: 'scaleBattery',
+  memory_critical: 'scaleMemCrit',
+};
+let scaleDecisions = [];
+
+export function handleScaleEvent(p) {
+  if (!p || !p.action) return;
+  scaleDecisions.unshift(p);
+  scaleDecisions = scaleDecisions.slice(0, 5);
+  renderScaleDecisions();
+}
+
+function renderScaleDecisions() {
+  const list = $('res-scale');
+  if (!list) return;
+  list.classList.toggle('hidden', scaleDecisions.length === 0);
+  list.innerHTML = scaleDecisions.map((d) => {
+    const actKey = SCALE_ACTIONS[d.action];
+    const act = actKey ? t(actKey) : String(d.action);
+    const reasonKey = SCALE_REASONS[d.reason];
+    const reason = reasonKey ? t(reasonKey) : '';
+    // Advice actions carry no from/to; tier moves render as "full → lite".
+    const move = (d.from || d.to) ? '<span class="res-scale-move mono">' +
+      esc(String(d.from || '') + ' → ' + String(d.to || '')) + '</span>' : '';
+    return '<li class="res-scale-row ' + esc(String(d.action || '')) + '">' +
+      '<span class="res-scale-act">' + esc(act) + '</span>' + move +
+      (reason ? '<span class="res-scale-reason">' + esc(reason) + '</span>' : '') +
+      '<span class="res-scale-time mono">' + esc(fmtClock((Number(d.timestamp) || 0) / 1000)) + '</span>' +
+      '</li>';
+  }).join('');
+}
+
 function fmtClock(ts) {
   const d = new Date((Number(ts) || 0) * 1000);
   if (isNaN(d.getTime())) return '-';

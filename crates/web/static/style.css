@@ -2167,6 +2167,16 @@ input[type="range"]::-moz-range-thumb {
 .res-cost { font-size: 11.5px; color: var(--text-faint); flex: none; }
 .res-reason { font-size: 11px; color: var(--text-faint); flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .res-row-off .res-name { color: var(--text-faint); }
+/* Live elasticity decisions (SPEC appendix A #48) */
+.res-scale { list-style: none; margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border, rgba(148,163,184,.25)); display: flex; flex-direction: column; gap: 4px; }
+.res-scale-row { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12.5px; }
+.res-scale-act { flex: none; font-weight: 600; font-size: 12px; padding: 1px 9px; border-radius: 999px; }
+.res-scale-row.tier_down .res-scale-act, .res-scale-row.battery_pin .res-scale-act { background: rgba(245,158,11,.16); color: #d97706; }
+.res-scale-row.tier_up .res-scale-act { background: rgba(34,197,94,.16); color: #16a34a; }
+.res-scale-row.recommend_minimal_form .res-scale-act { background: rgba(239,68,68,.16); color: #dc2626; }
+.res-scale-move { color: var(--text-dim, #cbd5e1); flex: none; }
+.res-scale-reason { color: var(--text-faint); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.res-scale-time { color: var(--text-faint); flex: none; }
 
 /* ─── Tool-call cards + thinking drawer + panels (SPEC §3.4/§3.5) ──── */
 .chat-tools { display: flex; flex-direction: column; gap: 5px; }

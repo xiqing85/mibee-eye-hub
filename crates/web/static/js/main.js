@@ -20,7 +20,7 @@ import { initPtz, fetchPtz, updatePtzVisibility, handlePtzEvent } from './ptz.js
 import { initImaging, handleParamChanged } from './imaging.js';
 import { refreshCameras, renderCameras, initCameras, stopCameras, announceRecording } from './cameras.js';
 import { loadConfig, initSettings } from './settings.js';
-import { checkApi, refreshStatus, initStatus, startStatusPolling } from './status.js';
+import { checkApi, refreshStatus, initStatus, startStatusPolling, handleScaleEvent } from './status.js';
 import { initModelMetrics, startModelMetricsPolling } from './modelmetrics.js';
 import { initTraces, startTracesPolling, refreshTraces, tracesCap } from './traces.js';
 import { renderDevices, initDevices } from './devices.js';
@@ -156,6 +156,7 @@ async function enterApp() {
     agent_step: handleAgentStep,
     away_event: handleAwayEvent,
     away_state: handleAwayState,
+    scale: handleScaleEvent,
     zone_event: () => { /* zone events ride the alarm/toast path */ },
     param_changed: handleParamChanged,
     recording: (p) => {
