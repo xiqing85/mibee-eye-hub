@@ -1282,6 +1282,205 @@ async fn speak_pending_sentence(
 mod tests {
     use super::*;
 
+    /// Integration harness: the real bridge loop with fail-open (inactive)
+    /// engines and an in-memory database, fed real [`VoiceEvent`]s through
+    /// a broadcast channel. Covers the record/SSE/session/away-command
+    /// paths that the spawn-time wiring owns — the answer pipeline's
+    /// active-engine branches stay to the live rig.
+    struct Harness {
+        tx: broadcast::Sender<VoiceEvent>,
+        #[allow(dead_code)]
+        bus_tx: Arc<EventBus>,
+        bus_rx: broadcast::Receiver<web::routes::events::CameraEvent>,
+        pool: sqlx::SqlitePool,
+    }
+
+    async fn harness() -> Harness {
+        // A temp-file pool: init_pool runs the real migrations and sizes
+        // the pool for concurrency (an in-memory DB would give every
+        // connection its own empty database).
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "mibee-voice-bridge-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let pool = web::db::init_pool(path.to_str().unwrap())
+            .await
+            .expect("test pool + migrations");
+        let bus_tx = Arc::new(web::routes::events::new_event_bus());
+        let (tx, events_rx) = broadcast::channel(64);
+        // An available away engine: arming is gated on an active AI
+        // detector, so the harness injects a fake one (the real models are
+        // deployment assets CI does not have).
+        struct FakeDetector;
+        impl streaming::ai::AiDetector for FakeDetector {
+            fn detect(&self, _jpeg: &[u8]) -> anyhow::Result<Vec<streaming::ai::Detection>> {
+                Ok(vec![])
+            }
+            fn model_name(&self) -> &str {
+                "fake"
+            }
+        }
+        let away = Arc::new(web::away::AwayEngine::new(
+            web::away::AwayConfig::default(),
+            Arc::new(streaming::ai::AiEngine::from_parts(
+                streaming::ai::AiConfig::default(),
+                Some(Arc::new(FakeDetector)),
+            )),
+            false,
+        ));
+        VoiceBridge {
+            events: events_rx,
+            bridge_tx: Arc::clone(&bus_tx),
+            chat: Arc::new(ChatEngine::from_config(
+                &streaming::llm::LlmConfig::default(),
+            )),
+            cloud: Arc::new(CloudAi::new(web::cloud::CloudConfig::default())),
+            decision: Arc::new(DecisionEngine::from_config(
+                &streaming::decision::DecisionConfig::default(),
+            )),
+            convlog: Arc::new(web::conversations::ConversationLog::new(
+                pool.clone(),
+                Arc::clone(&bus_tx),
+                true,
+            )),
+            desktop: crate::desktop::Desktop::new(&crate::config::DesktopConfig::default()),
+            grounding: Arc::new(web::grounding::GroundingState::new()),
+            streams: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tools: Arc::new(std::sync::RwLock::new(
+                streaming::tools::ToolsConfig::default(),
+            )),
+            agent_registry: web::server::AppRouterState::agent_for_tests().0,
+            agent_config: web::agent::AgentConfig::default(),
+            wake_word: streaming::voice::DEFAULT_WAKE_WORD.to_string(),
+            voice_engine: Arc::new(VoiceEngine::from_config(
+                &streaming::voice::VoiceConfig::default(),
+            )),
+            away: Arc::clone(&away),
+            tts: Arc::new(TtsEngine::from_config(&streaming::tts::TtsConfig::default())),
+            pool: pool.clone(),
+            interrupt_enabled: true,
+            interrupt_confidence: 0.6,
+        }
+        .spawn();
+        let bus_rx = bus_tx.subscribe();
+        Harness {
+            tx,
+            bus_tx,
+            bus_rx,
+            pool,
+        }
+    }
+
+    fn transcript_event(text: &str) -> VoiceEvent {
+        VoiceEvent {
+            keyword: streaming::voice::DEFAULT_WAKE_WORD.to_string(),
+            transcript: text.to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            speaker: "米基".to_string(),
+            follow_up: false,
+        }
+    }
+
+    async fn drain_until<T>(
+        rx: &mut broadcast::Receiver<web::routes::events::CameraEvent>,
+        deadline_ms: u64,
+        pred: impl Fn(&web::routes::events::CameraEvent) -> Option<T>,
+    ) -> Option<T> {
+        let start = std::time::Instant::now();
+        loop {
+            if start.elapsed().as_millis() as u64 > deadline_ms {
+                return None;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(deadline_ms), rx.recv())
+                .await
+            {
+                Ok(Ok(ev)) => {
+                    if let Some(v) = pred(&ev) {
+                        return Some(v);
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_persists_hearing_record_and_broadcasts_sse() {
+        let mut h = harness().await;
+        h.tx.send(transcript_event("现在几点了")).expect("send");
+
+        // SSE: the transcript reaches the wire with keyword + speaker.
+        let seen = drain_until(&mut h.bus_rx, 5_000, |ev| match ev {
+            web::routes::events::CameraEvent::VoiceTranscript {
+                transcript,
+                speaker,
+                ..
+            } if transcript == "现在几点了" => Some(speaker.clone()),
+            _ => None,
+        })
+        .await;
+        assert_eq!(seen.as_deref(), Some("米基"));
+
+        // DB: the hearing record landed with kind=voice and the text.
+        let mut rows = None;
+        for _ in 0..50 {
+            rows = web::db::list_hearing_records(&h.pool, 5, Some("voice"))
+                .await
+                .ok();
+            if rows.as_ref().is_some_and(|r| !r.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let rows = rows.expect("query ok");
+        assert!(
+            rows.iter()
+                .any(|r| r.text == "现在几点了" && r.keyword == "小蜜蜂"),
+            "{rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_without_engines_still_records_the_turn() {
+        let h = harness().await;
+        h.tx.send(transcript_event("随便聊聊")).expect("send");
+        // The no-engine path finishes the draft (user text, no reply) —
+        // the honest "why nothing answered" record.
+        let mut turns = Vec::new();
+        for _ in 0..60 {
+            if let Ok(t) = web::db::list_conversation_turns(&h.pool, 10).await
+                && !t.is_empty()
+            {
+                turns = t;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            turns
+                .iter()
+                .any(|t| t.user_text.as_deref() == Some("随便聊聊")),
+            "{turns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn away_voice_command_arms_and_answers_by_voice() {
+        let mut h = harness().await;
+        h.tx.send(transcript_event("我要出门了")).expect("send");
+
+        // The away engine flips to armed and announces the state change.
+        let armed = drain_until(&mut h.bus_rx, 5_000, |ev| match ev {
+            web::routes::events::CameraEvent::AwayState { active, .. } => Some(*active),
+            _ => None,
+        })
+        .await;
+        assert_eq!(armed, Some(true), "voice arm/disarm path fired");
+    }
+
     #[test]
     fn unix_now_ms_is_monotonic_nonzero() {
         let a = unix_now_ms();
