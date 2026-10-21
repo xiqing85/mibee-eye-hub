@@ -801,6 +801,7 @@ mod tests {
         assert!(props.contains_key("device_id"));
         assert!(props.contains_key("register_interval_secs"));
         assert!(props.contains_key("talkback_playback"));
+        assert!(props.contains_key("talkback_upstream"));
     }
 
     #[test]

@@ -149,6 +149,10 @@ pub struct Gb28181Config {
     /// refused with 488.
     #[serde(default = "default_gb28181_talkback_playback")]
     pub talkback_playback: bool,
+    /// Send microphone audio upstream during talkback/pickup sessions
+    /// (GB/T 28181-2022 §9.2 send half). Off = receive-only intercom.
+    #[serde(default)]
+    pub talkback_upstream: bool,
     #[serde(default)]
     pub gb35114: Gb35114Config,
 }
@@ -218,6 +222,7 @@ fn default_gb28181_talkback_playback() -> bool {
 impl Default for Gb28181Config {
     fn default() -> Self {
         Self {
+            talkback_upstream: false,
             enabled: false,
             platform_sip_address: "192.168.1.100".into(),
             platform_sip_port: 5060,
