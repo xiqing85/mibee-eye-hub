@@ -732,6 +732,38 @@ impl Metrics {
 mod tests {
     use super::*;
 
+    /// The whole public helper family through the registered global:
+    /// every counter/gauge must accept its call without panicking and
+    /// land on the Prometheus surface.
+    #[test]
+    fn helper_family_registers_and_renders() {
+        register_metrics().expect("register");
+        increment_bytes_received("cam0", 1024);
+        increment_capture_errors("cam0");
+        increment_rtsp_sessions("start");
+        increment_rtsp_bytes_sent(2048);
+        increment_rtmp_push_bytes(512);
+        increment_rtmp_push_errors();
+        increment_onvif_discovery_requests();
+        increment_gb28181_register_status("ok");
+        set_active_streams(2);
+        set_audio_level("cam0", 0.42);
+        increment_http_requests("GET", "/api/health", 200);
+        increment_auth_failures("login");
+        set_recording_active(1);
+        increment_frame_drops();
+        increment_ai_inferences();
+        register_metrics().expect("idempotent re-register");
+
+        let families = global_metrics().registry.gather();
+        let text = prometheus::TextEncoder::new()
+            .encode_to_string(&families)
+            .expect("encode");
+        assert!(text.contains("mibee_eye_bytes_received"), "{text}");
+        assert!(text.contains("mibee_ai_inferences_total"), "{text}");
+        assert!(text.contains("mibee_eye_streams_active 2"), "{text}");
+    }
+
     #[test]
     fn test_metrics_create_and_render() {
         let m = Metrics::new().expect("metrics creation should succeed");
