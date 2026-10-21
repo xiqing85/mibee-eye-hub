@@ -566,6 +566,122 @@ pub async fn record_audio_event(
 mod tests {
     use super::*;
 
+    /// End-to-end through the real watch loop: a fake-detector AI worker
+    /// fed one JPEG emits a real DetectionEvent, the armed away engine
+    /// dispatches the visitor flow, and the record + snapshot + SSE land.
+    /// (The voice-answer leg needs the voice engine's internal sender —
+    /// no send seam exists — and stays to its direct unit tests.)
+    #[tokio::test]
+    async fn watch_loop_visitor_flow_from_a_real_detection_event() {
+        let tmp = std::env::temp_dir().join(format!(
+            "mibee-away-watch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut dbfile = std::env::temp_dir();
+        dbfile.push(format!(
+            "mibee-away-watch-db-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&dbfile);
+        let pool = web::db::init_pool(dbfile.to_str().unwrap())
+            .await
+            .expect("pool + migrations");
+        let bus = Arc::new(web::routes::events::new_event_bus());
+        let mut bus_rx = bus.subscribe();
+
+        struct PersonDetector;
+        impl streaming::ai::AiDetector for PersonDetector {
+            fn detect(&self, _jpeg: &[u8]) -> anyhow::Result<Vec<streaming::ai::Detection>> {
+                Ok(vec![streaming::ai::Detection {
+                    label: "person".into(),
+                    confidence: 0.9,
+                    bbox: [8, 8, 120, 160],
+                }])
+            }
+            fn model_name(&self) -> &str {
+                "fake"
+            }
+        }
+        let ai = Arc::new(streaming::ai::AiEngine::from_parts(
+            streaming::ai::AiConfig {
+                interval_ms: 1,
+                confidence_threshold: 0.5,
+                ..streaming::ai::AiConfig::default()
+            },
+            Some(Arc::new(PersonDetector)),
+        ));
+        // Feed the worker real JPEG bytes through a broadcast channel.
+        let (jpeg_tx, jpeg_rx) = tokio::sync::broadcast::channel(8);
+        ai.spawn_worker("cam-aw".to_string(), jpeg_rx);
+
+        let away = Arc::new(web::away::AwayEngine::new(
+            web::away::AwayConfig {
+                snapshot_dir: tmp.to_str().unwrap().to_string(),
+                person_gap_secs: 3600, // one visitor per test
+                ..web::away::AwayConfig::default()
+            },
+            Arc::clone(&ai) as Arc<streaming::ai::AiEngine>,
+            false,
+        ));
+        // Arm through the real setter (persist + AwayState SSE).
+        web::away::set_active(&away, &pool, &bus, true, None)
+            .await
+            .expect("arm");
+
+        spawn(AwayMonitor {
+            away: Arc::clone(&away),
+            ai,
+            voice: Arc::new(streaming::voice::VoiceEngine::from_config(
+                &streaming::voice::VoiceConfig::default(),
+            )),
+            tts: Arc::new(streaming::tts::TtsEngine::from_config(
+                &streaming::tts::TtsConfig::default(),
+            )),
+            face: Arc::new(streaming::face::FaceEngine::from_config(
+                &streaming::face::FaceConfig::default(),
+            )),
+            vlm: Arc::new(streaming::vlm::VlmEngine::from_config(
+                &streaming::vlm::VlmConfig::default(),
+            )),
+            desktop: crate::desktop::Desktop::new(&crate::config::DesktopConfig::default()),
+            pool: pool.clone(),
+            event_tx: Arc::clone(&bus),
+        });
+
+        // One minimal JPEG (a 1x1 black pixel) through the tap.
+        let jpeg: Arc<[u8]> = Arc::from(include_bytes!("testdata/tiny.jpg").as_slice());
+        jpeg_tx.send(jpeg).expect("jpeg to worker");
+
+        // The visitor event reaches the wire (away_event upsert).
+        let mut got_state = None;
+        let start = std::time::Instant::now();
+        while start.elapsed().as_secs() < 8 && got_state.is_none() {
+            match tokio::time::timeout(std::time::Duration::from_millis(1_000), bus_rx.recv()).await
+            {
+                Ok(Ok(web::routes::events::CameraEvent::AwayEvent { event, .. })) => {
+                    assert_eq!(event.kind, "person");
+                    got_state = Some(event.state.clone());
+                }
+                _ => continue,
+            }
+        }
+        assert!(got_state.is_some(), "away_event on the SSE bus");
+        // No voice capability on this harness: the listen window is skipped
+        // and the record lands in its terminal no_voice state directly.
+        assert_eq!(got_state.as_deref(), Some("no_voice"));
+
+        // The record persisted.
+        let rows = web::db::list_away_events(&pool, 5).await.unwrap();
+        assert!(rows.iter().any(|r| r.kind == "person"), "{rows:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn greeting_text_known_vs_unknown() {
         let cfg = AwayConfig::default();

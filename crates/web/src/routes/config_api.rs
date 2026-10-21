@@ -720,7 +720,7 @@ pub fn restore_secrets(submitted: &mut serde_json::Value, stored: &serde_json::V
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -821,7 +821,7 @@ mod tests {
         assert_eq!(submitted["password"], serde_json::json!(REDACTED));
     }
 
-    async fn test_db() -> (sqlx::SqlitePool, Arc<Mutex<Connection>>) {
+    pub(crate) async fn test_db() -> (sqlx::SqlitePool, Arc<Mutex<Connection>>) {
         let (pool, auth_db) = crate::db::create_test_dbs().await;
         crate::db::run_migrations(&pool).await.unwrap();
         {
@@ -839,7 +839,7 @@ mod tests {
         (pool, auth_db)
     }
 
-    fn build_state_with_ai(
+    pub(crate) fn build_state_with_ai(
         db: sqlx::SqlitePool,
         auth_db: Arc<Mutex<Connection>>,
     ) -> (crate::server::AppRouterState, Arc<streaming::ai::AiEngine>) {

@@ -293,6 +293,10 @@ pub fn extract_gb28181_config(db_config: &serde_json::Value) -> Gb28181RuntimeCo
             .get("talkback_upstream")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        ptz_onvif_endpoint: get_str("ptz_onvif_endpoint", ""),
+        ptz_profile_token: get_str("ptz_profile_token", "Profile_1"),
+        ptz_username: get_str("ptz_username", ""),
+        ptz_password: get_str("ptz_password", ""),
         device_name: get_str("device_name", "mibee-eye"),
         manufacturer: get_str("manufacturer", "MiBee"),
         model: get_str("model", "Rec-01"),
@@ -365,6 +369,13 @@ pub struct Gb28181RuntimeConfig {
     /// (GB/T 28181-2022 §9.2). Fail-open: off, or no usable output
     /// device, → no sink registered → talkback INVITEs answered 488.
     pub talkback_playback: bool,
+    /// External ONVIF PTZ head endpoint (roadmap M4-a): when non-empty,
+    /// GB PTZCmd dispatches to the PtzProxy steering that head. Empty =
+    /// the hub has no motors and PTZ stays a no-op ack.
+    pub ptz_onvif_endpoint: String,
+    pub ptz_profile_token: String,
+    pub ptz_username: String,
+    pub ptz_password: String,
     /// Send microphone audio to the platform during talkback sessions
     /// (§9.2 send half). Fail-open: off, or no usable input device, → no
     /// source registered → recvonly offers answered 488. A-law encoded
@@ -1229,6 +1240,33 @@ impl ProtocolRuntime {
             latitude: config.position_latitude.clone(),
         };
 
+        // External ONVIF PTZ head (M4-a): the GB platform steers it
+        // through this hub. Fail-open — an unbuildable endpoint logs and
+        // PTZ stays the no-op ack.
+        let ptz_proxy = if config.ptz_onvif_endpoint.is_empty() {
+            None
+        } else {
+            match crate::ptz_proxy::PtzProxy::start(&crate::ptz_proxy::PtzConfig {
+                enabled: true,
+                onvif_endpoint: config.ptz_onvif_endpoint.clone(),
+                profile_token: config.ptz_profile_token.clone(),
+                username: config.ptz_username.clone(),
+                password: config.ptz_password.clone(),
+            }) {
+                Ok(p) => {
+                    tracing::info!(
+                        endpoint = %config.ptz_onvif_endpoint,
+                        profile = %config.ptz_profile_token,
+                        "gb28181: PTZ proxy attached to external ONVIF head"
+                    );
+                    Some(p)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "gb28181: PTZ proxy failed to start — PTZ stays no-op");
+                    None
+                }
+            }
+        };
         let mut server_builder =
             gb28181_rs::server::Gb28181Server::with_recording_index(lib_config, source, None)
                 .with_register_authenticator(authenticator)
@@ -1236,7 +1274,8 @@ impl ProtocolRuntime {
                     crate::gb28181_control::Gb28181ControlHandler::new(
                         Arc::clone(&self.recording_paused),
                         Arc::clone(&self.force_idr),
-                    ),
+                    )
+                    .with_ptz_proxy(ptz_proxy),
                 )))
                 .with_config_handler(Some(Arc::new(
                     crate::gb28181_control::DeviceConfigGlue::new(

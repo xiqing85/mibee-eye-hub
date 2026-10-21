@@ -598,7 +598,7 @@ mod tests {
     use super::*;
     use crate::output::RtspOutput;
     use crate::output::tests::MockOutput;
-    use crate::source::tests::MockSource;
+    use crate::source::testing::MockSource;
     use std::time::Duration;
     use tokio::sync::broadcast;
 

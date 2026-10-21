@@ -25,6 +25,9 @@ pub struct Gb28181ControlHandler {
     /// Shared with the camera encode loops (OpenH264): setting this makes
     /// the next encoded frame an IDR (platform IFrameCmd).
     force_idr: Arc<AtomicBool>,
+    /// External ONVIF head (M4-a): GB PTZCmd forwards here; `None` keeps
+    /// the historical no-op ack.
+    ptz_proxy: Option<Arc<crate::ptz_proxy::PtzProxy>>,
 }
 
 impl Gb28181ControlHandler {
@@ -32,7 +35,15 @@ impl Gb28181ControlHandler {
         Self {
             recording_paused,
             force_idr,
+            ptz_proxy: None,
         }
+    }
+
+    /// Attach the external-head PTZ proxy (M4-a).
+    #[must_use]
+    pub fn with_ptz_proxy(mut self, proxy: Option<Arc<crate::ptz_proxy::PtzProxy>>) -> Self {
+        self.ptz_proxy = proxy;
+        self
     }
 
     /// Snapshot of the pause gate (mirrors the shared flag).
@@ -54,6 +65,12 @@ impl DeviceControlHandler for Gb28181ControlHandler {
                 record = start,
                 "DeviceControl RecordCmd: local recording gate updated"
             );
+        }
+    }
+
+    fn on_ptz(&self, cmd: &gb28181_rs::manscdp::PtzCommand) {
+        if let Some(proxy) = &self.ptz_proxy {
+            proxy.dispatch(cmd);
         }
     }
 
