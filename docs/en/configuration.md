@@ -509,6 +509,10 @@ register_interval_secs = 60
 | `heartbeat_interval_secs` | u64 | `60` | Keepalive interval in seconds |
 | `heartbeat_timeout_count` | u32 | `3` | Missed keepalives before reconnect |
 | `talkback_playback` | bool | `true` | Play platform voice talkback on the local output device (fail-open 488 when unavailable) |
+| `ptz_onvif_endpoint` | String | `""` | External ONVIF head endpoint (M4-a PTZ proxy): `http://host:port/onvif/device_service`; empty = no head, PTZ stays a no-op ack |
+| `ptz_profile_token` | String | `"Profile_1"` | Media profile token the PTZ commands address |
+| `ptz_username` | String | `""` | ONVIF WS-UsernameToken username (empty = anonymous) |
+| `ptz_password` | String | `""` | ONVIF auth password |
 | `alarm_notify_enabled` | bool | `true` | Initial AI alarm NOTIFY gate (platform DeviceConfig AlarmReport overrides at runtime) |
 | `alarm_cooldown_secs` | u64 | `30` | Rising-edge alarm cooldown in seconds (SPEC §6 `alarm` + NOTIFY) |
 | `position_longitude` | String | `""` | Static MobilePosition longitude (empty = no position reporting) |
@@ -906,6 +910,7 @@ num_threads = 4
 | `tokens` | String | `"models/voice/melo/tokens.txt"` | TTS tokens file |
 | `dict_dir` | String | `"models/voice/melo/dict"` | Jieba dictionary directory |
 | `num_threads` | u32 | `2` | TTS synthesis threads |
+| `voice_change` | String | `"off"` | Voice character (M4-b first release): `"high"`/`"low"` shift pitch and tempo by resampling; `"off"` keeps the original voice (typos fall back to off) |
 | `yue_model` | String | `""` | Cantonese voice model (empty = Cantonese unavailable) |
 | `yue_lexicon` | String | `""` | Cantonese lexicon |
 | `yue_dict_dir` | String | `""` | Cantonese dictionary directory |

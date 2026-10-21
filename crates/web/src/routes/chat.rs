@@ -755,6 +755,150 @@ mod tests {
         }
     }
 
+    /// End-to-end through the real handler: a cloud-configured chat turn
+    /// runs the agent tool loop against a local OpenAI-compatible fake —
+    /// first iteration answers with a tool_call (time.now executes for
+    /// real through the registry), the forced final iteration answers in
+    /// text. Exercises the agent_step SSE arms, the draft's tool thinking
+    /// entries and the tool_calls response surface.
+    #[tokio::test]
+    async fn chat_handler_runs_the_cloud_agent_loop_end_to_end() {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::clone(&calls);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            post(
+                move |body: axum::extract::Json<serde_json::Value>| async move {
+                    let n = c2.fetch_add(1, Ordering::SeqCst);
+                    let with_tools = body.get("tools").is_some();
+                    if n == 0 && with_tools {
+                        axum::Json(json!({
+                            "choices": [{ "message": {
+                                "role": "assistant", "content": null,
+                                "tool_calls": [{
+                                    "id": "c1", "type": "function",
+                                    "function": {"name": "time.now", "arguments": "{}"}
+                                }]
+                            }}]
+                        }))
+                    } else {
+                        axum::Json(json!({
+                            "choices": [{ "message": {
+                                "role": "assistant", "content": "现在 12:00（假服务器）"
+                            }}]
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (pool, auth_db) = crate::routes::config_api::tests::test_db().await;
+        // Seeded admin + session in the state's own auth DB (the shared
+        // fixture), or the setup gate answers 503.
+        let token = {
+            let c = auth_db.lock().await;
+            security::auth::create_session(&c, "admin").unwrap()
+        };
+        let (mut state, _ai) =
+            crate::routes::config_api::tests::build_state_with_ai(pool.clone(), auth_db);
+        let cloud = crate::cloud::CloudAi::new(crate::cloud::CloudConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-test".into(),
+            chat_model: "fake/model".into(),
+            ..crate::cloud::CloudConfig::default()
+        });
+        cloud.set_base_url(&format!("http://{addr}/v1"));
+        state.cloud = Arc::new(cloud);
+        let mut bus_rx = state.event_tx.subscribe();
+
+        let app = crate::server::build_app_with_state(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/chat")
+            .method("POST")
+            .header("cookie", format!("session={token}; csrf-token=t"))
+            .header("x-csrf-token", "t")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&json!({"text": "现在几点了"})).unwrap(),
+            ))
+            .unwrap();
+        use tower::ServiceExt;
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "chat handler error: {body}"
+        );
+        let data = &body["data"];
+        assert_eq!(data["engine"], "cloud", "{body}");
+        assert_eq!(
+            data["reply"].as_str().map(str::to_string),
+            Some("现在 12:00（假服务器）".into()),
+            "{body}"
+        );
+        let tool_calls = data["tool_calls"].as_array().cloned().unwrap_or_default();
+        assert_eq!(tool_calls.len(), 1, "{body}");
+        assert_eq!(tool_calls[0]["name"], "time.now");
+
+        // The SSE arms fired: thinking → tool running → tool done →
+        // answering, in order, on the real bus.
+        let mut states: Vec<(&'static str, &'static str)> = Vec::new();
+        for _ in 0..16 {
+            match tokio::time::timeout(std::time::Duration::from_millis(2_000), bus_rx.recv()).await
+            {
+                Ok(Ok(crate::routes::events::CameraEvent::AgentStep { kind, state, .. })) => {
+                    states.push((kind.clone().leak(), state.clone().leak()));
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            states.contains(&("phase", "thinking")),
+            "agent phases on the wire: {states:?}"
+        );
+        assert!(
+            states.contains(&("tool", "running")) && states.contains(&("tool", "done")),
+            "tool lifecycle on the wire: {states:?}"
+        );
+        assert!(
+            states.contains(&("phase", "answering")),
+            "agent phases on the wire: {states:?}"
+        );
+
+        // The conversation record carries the tool thinking entry.
+        let mut turns = Vec::new();
+        for _ in 0..40 {
+            if let Ok(t) = crate::db::list_conversation_turns(&pool, 5).await
+                && !t.is_empty()
+            {
+                turns = t;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            turns
+                .iter()
+                .any(|t| t.user_text.as_deref() == Some("现在几点了")),
+            "{turns:?}"
+        );
+    }
+
     #[test]
     fn system_turn_carries_language_scene_and_local() {
         let t = build_system_turn(&ctx(Some("实时检测：2×person")), "你看到几个人");

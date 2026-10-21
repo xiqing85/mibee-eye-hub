@@ -471,6 +471,10 @@ register_interval_secs = 60
 | `heartbeat_interval_secs` | u64 | `60` | 心跳间隔（秒） |
 | `heartbeat_timeout_count` | u32 | `3` | 判定重连前允许丢失的心跳次数 |
 | `talkback_playback` | bool | `true` | 在本机输出设备播放平台语音对讲（不可用时 fail-open 488） |
+| `ptz_onvif_endpoint` | String | `""` | 外接云台 ONVIF 端点（M4-a PTZ 代理）：`http://host:port/onvif/device_service`；空 = 无云台，PTZ 指令保持 no-op 应答 |
+| `ptz_profile_token` | String | `"Profile_1"` | PTZ 命令面向的媒体 profile token |
+| `ptz_username` | String | `""` | ONVIF WS-UsernameToken 认证用户名（空 = 匿名） |
+| `ptz_password` | String | `""` | ONVIF 认证密码 |
 | `alarm_notify_enabled` | bool | `true` | AI 告警 NOTIFY 初始门控（平台 DeviceConfig AlarmReport 可运行时覆盖） |
 | `alarm_cooldown_secs` | u64 | `30` | 告警上升沿冷却（秒）（SPEC §6 `alarm` + NOTIFY） |
 | `position_longitude` | String | `""` | 静态 MobilePosition 经度（空 = 不上报位置） |
@@ -847,6 +851,7 @@ num_threads = 4
 | `tokens` | String | `"models/voice/melo/tokens.txt"` | TTS tokens 文件 |
 | `dict_dir` | String | `"models/voice/melo/dict"` | jieba 词典目录 |
 | `num_threads` | u32 | `2` | TTS 合成线程数 |
+| `voice_change` | String | `"off"` | 变声（M4-b 首发）：`"high"`/`"low"` 经重采样升降音高与语速，`"off"` 原声（拼错值按 off 处理） |
 | `yue_model` | String | `""` | 粤语语音模型（空 = 粤语不可用） |
 | `yue_lexicon` | String | `""` | 粤语词典 |
 | `yue_dict_dir` | String | `""` | 粤语词典目录 |

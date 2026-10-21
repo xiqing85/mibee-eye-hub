@@ -27,3 +27,9 @@
 # 流入 run loop——hearing 落库/SSE 转发/会话记录 no-engine 收尾/away 语音布防；
 # 本地 81.49，保守取 79.0）。
 79.0
+
+# 2026-10-21 三批：79.0 → 80.0（chat 处理器假云端 agent 全链 / ai_bridge 检测
+# harness / away_monitor watch-loop 全链（FakeDetector worker 喂真帧）/
+# MockSource 公开测试缝 + stream_manager "test" 形态源管线生命周期）。
+# 本地 82.18，保守取 80.0。
+80.0

@@ -298,6 +298,95 @@ fn face_label_text(hits: &[FaceHit]) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Integration harness: the real bridge loop with inactive VLM/face
+    /// engines, fed real DetectionEvents over broadcast — mirrors the
+    /// voice-bridge harness. Grounding records, AiDetection/Alarm SSE and
+    /// the alarm cooldown are all observable without any model.
+    #[tokio::test]
+    async fn detection_events_ground_scene_and_alarm_with_cooldown() {
+        let (tx, events_rx) = tokio::sync::broadcast::channel(16);
+        let bus_tx = Arc::new(web::routes::events::new_event_bus());
+        let mut bus_rx = bus_tx.subscribe();
+        let grounding = Arc::new(web::grounding::GroundingState::new());
+        AiBridge {
+            events: events_rx,
+            vlm: Arc::new(streaming::vlm::VlmEngine::from_config(
+                &streaming::vlm::VlmConfig::default(),
+            )),
+            grounding: Arc::clone(&grounding),
+            face: Arc::new(streaming::face::FaceEngine::from_config(
+                &streaming::face::FaceConfig::default(),
+            )),
+            bridge_tx: Arc::clone(&bus_tx),
+            alarm_cooldown_secs: 60,
+            notifier_slot: Arc::new(std::sync::Mutex::new(None)),
+            alarm_notify_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            onvif_events_slot: Arc::new(std::sync::Mutex::new(None)),
+            desktop: crate::desktop::Desktop::new(&crate::config::DesktopConfig::default()),
+        }
+        .spawn();
+
+        let det = |label: &str, conf: f32| streaming::ai::Detection {
+            label: label.to_string(),
+            confidence: conf,
+            bbox: [10, 10, 100, 100],
+        };
+        let ev = |dets: Vec<streaming::ai::Detection>| streaming::ai::DetectionEvent {
+            camera_id: "cam0".into(),
+            detections: dets,
+            frame_number: 1,
+            jpeg: None,
+        };
+
+        // Rising edge: one person → AiDetection + Alarm on the wire.
+        tx.send(ev(vec![det("person", 0.9)])).expect("send");
+        let mut saw_detect = false;
+        let mut alarms = 0;
+        let start = std::time::Instant::now();
+        while start.elapsed().as_secs() < 5 {
+            match tokio::time::timeout(std::time::Duration::from_millis(1_000), bus_rx.recv()).await
+            {
+                Ok(Ok(web::routes::events::CameraEvent::AiDetection { .. })) => {
+                    saw_detect = true;
+                }
+                Ok(Ok(web::routes::events::CameraEvent::Alarm {
+                    targets, source, ..
+                })) => {
+                    assert_eq!(targets, 1);
+                    assert_eq!(source, "ai");
+                    alarms += 1;
+                }
+                _ => break,
+            }
+        }
+        assert!(saw_detect, "AiDetection mirrored on the SSE bus");
+        assert_eq!(alarms, 1, "one alarm on the rising edge");
+
+        // Inside the cooldown: more detections, no second alarm.
+        tx.send(ev(vec![det("person", 0.8), det("dog", 0.7)]))
+            .expect("send 2");
+        // Drain briefly: AiDetection mirrors may arrive; an Alarm inside
+        // the cooldown window must not.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let wait = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(wait, bus_rx.recv()).await {
+                Ok(Ok(web::routes::events::CameraEvent::AiDetection { .. })) => {}
+                Ok(Ok(web::routes::events::CameraEvent::Alarm { .. })) => {
+                    panic!("alarm inside the cooldown window")
+                }
+                _ => break,
+            }
+        }
+
+        // Grounding recorded the detections for scene summaries.
+        let scene = grounding.scene_summary("cam0", 0);
+        assert!(
+            scene.as_deref().is_some_and(|s| s.contains("person")),
+            "{scene:?}"
+        );
+    }
+
     fn hit(name: Option<&str>) -> FaceHit {
         FaceHit {
             name: name.map(String::from),

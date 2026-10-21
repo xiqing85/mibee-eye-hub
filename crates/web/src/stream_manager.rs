@@ -368,6 +368,42 @@ impl StreamManager {
         // around for handle extraction, then box it.
         let (source, latest_jpeg, dimensions, jpeg_tx, sub_frames, sub_settings): SourceBundle =
             match camera_type {
+                // Test seam (2026-10-21): a scripted source for the
+                // pipeline tests below — same discipline as the fake AI
+                // detector. Never selected by real device configs.
+                "test" => {
+                    let n = config
+                        .get("n_frames")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(3)
+                        .clamp(1, 16);
+                    let mut frames = Vec::with_capacity(n as usize);
+                    for i in 0..n {
+                        let data: Vec<u8> = if i % 2 == 0 {
+                            // Keyframe: in-band SPS + PPS (muxide validates
+                            // parameter sets on the first keyframe).
+                            let mut v = vec![0x67, 0x42, 0x00, 0x0a, 0xf8, 0x41, 0xa2];
+                            v.extend_from_slice(&[0x00, 0x00, 0x01]);
+                            v.extend_from_slice(&[0x68, 0xeb, 0xec, 0xb2, 0x20]);
+                            v
+                        } else {
+                            vec![0x65, 0x88, 0x84, 0x00, 0x1f, 0xff, 0xd7]
+                        };
+                        frames.push(streaming::source::MediaFrame::Video {
+                            keyframe: i % 2 == 0,
+                            data,
+                            timestamp: i * 33,
+                        });
+                    }
+                    (
+                        Box::new(streaming::source::testing::MockSource::new(frames)),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }
                 "usb" => {
                     let device_index = config
                         .get("device_index")
@@ -1271,6 +1307,66 @@ mod segment_slot_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// End-to-end through the real pipeline: the "test" camera type runs
+    /// the same mount/forward/permit machinery a USB camera does, with a
+    /// scripted MockSource no hardware is needed for.
+    #[tokio::test]
+    async fn test_camera_type_runs_the_full_pipeline_lifecycle() {
+        let sm = StreamManager::with_host("127.0.0.1".into());
+        let rtsp = Arc::new(protocols::rtsp_server::RtspServer::new(
+            protocols::rtsp_server::RtspServerConfig::default(),
+        ));
+
+        let info = sm
+            .create_stream(
+                "t-cam".into(),
+                "test",
+                &serde_json::json!({"n_frames": 4}),
+                Some(&rtsp),
+            )
+            .await
+            .expect("create");
+        assert_eq!(info.camera_id, "t-cam");
+        // A duplicate id is refused.
+        assert!(
+            sm.create_stream("t-cam".into(), "test", &serde_json::json!({}), Some(&rtsp),)
+                .await
+                .is_err()
+        );
+
+        // Give the pipeline a moment to drain the scripted frames, then
+        // stop and verify the slot is reusable.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let stopped = sm.stop_stream("t-cam").await.expect("stop");
+        assert_eq!(stopped.camera_id, "t-cam");
+        assert!(sm.stop_stream("t-cam").await.is_err(), "double stop errors");
+
+        // Permit freed: a new stream with the same id works.
+        sm.create_stream(
+            "t-cam".into(),
+            "test",
+            &serde_json::json!({"n_frames": 1}),
+            None,
+        )
+        .await
+        .expect("recreate after stop");
+    }
+
+    #[tokio::test]
+    async fn unsupported_camera_type_is_an_honest_error() {
+        let sm = StreamManager::with_host("127.0.0.1".into());
+        let err = sm
+            .create_stream("bad".into(), "wled", &serde_json::json!({}), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unsupported camera type"), "{err}");
+        // (Permit exhaustion cannot be pinned through the "test" type: the
+        // scripted source exhausts immediately and the pipeline releases
+        // its permit, so a second create is legitimately admitted.)
+    }
+
     #[test]
     fn parse_substream_config_absent_and_disabled() {
         let cfg = serde_json::json!({"device_index": 0});
@@ -1304,8 +1400,6 @@ mod tests {
             assert!(parse_substream_config(&bad).is_err(), "must reject {bad}");
         }
     }
-
-    use super::*;
 
     #[tokio::test]
     async fn test_stream_manager_new() {

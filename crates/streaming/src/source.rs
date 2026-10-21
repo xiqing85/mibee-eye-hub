@@ -76,12 +76,20 @@ pub trait Source: Send + 'static {
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
+/// Test seam (2026-10-21): a scripted [`Source`] for integration tests in
+/// dependent crates — the stream manager's pipeline tests feed it canned
+/// frames the way the AI/voice engines take fake detectors. Compiled
+/// always: it is a few dozen lines, and feature-gating a test double
+/// costs more surface than the double itself. Production config never
+/// selects it; see stream_manager's `"test"` camera type.
+#[doc(hidden)]
+pub mod testing {
+    use super::{MediaFrame, Result, Source};
+    use std::future::Future;
+    use std::pin::Pin;
 
-    // Helper: a mock source that yields predefined frames.
-    pub(crate) struct MockSource {
+    /// A source that yields predefined frames, then reports exhaustion.
+    pub struct MockSource {
         frames: Vec<MediaFrame>,
         started: bool,
         index: usize,
@@ -130,6 +138,12 @@ pub(crate) mod tests {
             })
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::MockSource;
+    use super::*;
 
     // ── MediaFrame tests ─────────────────────────────────────────────────────────
 

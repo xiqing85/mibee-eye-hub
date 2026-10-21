@@ -25,6 +25,11 @@ pub struct TtsConfig {
     pub rule_fsts: String,
     /// Playback command (`aplay -q`); empty = synthesize only.
     pub player: String,
+    /// Voice character (M4-b first release): `"off"` (default) plays the
+    /// synthesized voice as-is; `"high"` / `"low"` shift pitch+tempo by
+    /// resampling (chipmunk / deep). Applied in synthesis, so every
+    /// consumer (speak, pipeline, playback) hears the same character.
+    pub voice_change: String,
     /// sherpa-onnx-offline-tts `--num-threads`. The 2 default
     /// under-uses ≥4-core hosts (a 5 s utterance synthesized in ~16 s);
     /// 4 halves it. Decode is the bottleneck, not the player.
@@ -44,6 +49,7 @@ pub struct TtsConfig {
 impl Default for TtsConfig {
     fn default() -> Self {
         Self {
+            voice_change: "off".into(),
             enabled: false,
             binary: "tmp/sherpa-libs/tools-bin/bin/sherpa-onnx-offline-tts".into(),
             model: "models/voice/melo/model.onnx".into(),
@@ -240,6 +246,16 @@ impl TtsEngine {
             }
             Ok(out)
         })();
+        // Voice character (M4-b): resample in place — a failure of the
+        // transform is fail-open (the original voice plays).
+        if let Ok(path) = &result {
+            let factor = voice_change_factor(&self.config.voice_change);
+            if factor != 1.0
+                && let Err(e) = rewrite_wav_pitch(path, factor)
+            {
+                tracing::warn!(error = %e, "tts: voice-change resample failed — original voice");
+            }
+        }
         match &result {
             Ok(_) => call.finish_ok(None, None),
             Err(_) => call.finish_err(),
@@ -400,6 +416,90 @@ pub fn selftest_tts(text: &str) -> anyhow::Result<serde_json::Value> {
         "bytes": size,
         "elapsed_s": (started.elapsed().as_secs_f64() * 100.0).round() / 100.0,
     }))
+}
+
+/// Voice-change factor for a `[tts] voice_change` value (M4-b).
+/// Unknown values are `"off"` — a typo must not transpose the voice.
+#[must_use]
+pub fn voice_change_factor(setting: &str) -> f32 {
+    match setting {
+        "high" => 1.22,
+        "low" => 0.82,
+        _ => 1.0,
+    }
+}
+
+/// Resample 16-bit PCM WAV samples by `factor` (>1 = more samples =
+/// higher pitch+tempo at the header's unchanged sample rate). Pure:
+/// parses RIFF chunks, only rewrites the `data` payload and sizes —
+/// unknown layouts return `Ok(())` untouched (fail-open).
+fn resample_wav_bytes(wav: &[u8], factor: f32) -> Vec<u8> {
+    if !(0.5..=2.0).contains(&factor) || wav.len() < 44 || &wav[0..4] != b"RIFF" {
+        return wav.to_vec();
+    }
+    // Walk chunks: 12-byte RIFF header, then (id, size, payload) triples.
+    let mut out = wav[..12].to_vec();
+    let mut pos = 12;
+    while pos + 8 <= wav.len() {
+        let id = &wav[pos..pos + 4];
+        let size =
+            u32::from_le_bytes([wav[pos + 4], wav[pos + 5], wav[pos + 6], wav[pos + 7]]) as usize;
+        let end = (pos + 8 + size).min(wav.len());
+        let payload = &wav[pos + 8..end];
+        if id == b"data" && !payload.is_empty() && payload.len().is_multiple_of(2) {
+            let samples: Vec<i16> = payload
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let resampled = resample_i16(&samples, factor);
+            let bytes: Vec<u8> = resampled.iter().flat_map(|s| s.to_le_bytes()).collect();
+            out.extend_from_slice(id);
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        } else {
+            out.extend_from_slice(&wav[pos..end]);
+        }
+        pos = end + (size & 1); // chunk padding (odd sizes get a pad byte)
+        if size == 0 {
+            break;
+        }
+    }
+    // Fix RIFF size.
+    let total = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&total.to_le_bytes());
+    out
+}
+
+/// Linear-interpolation resample of mono/stereo interleaved i16 frames.
+fn resample_i16(samples: &[i16], factor: f32) -> Vec<i16> {
+    let n = samples.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let out_len = ((n as f32) * factor).round().max(1.0) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src = i as f32 / factor;
+        let i0 = src.floor() as usize;
+        let i1 = (i0 + 1).min(n - 1);
+        let frac = src - i0 as f32;
+        let v = f32::from(samples[i0]) * (1.0 - frac) + f32::from(samples[i1]) * frac;
+        out.push(v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+    }
+    out
+}
+
+/// Rewrite a WAV file's samples in place.
+fn rewrite_wav_pitch(path: &std::path::Path, factor: f32) -> anyhow::Result<()> {
+    let wav = std::fs::read(path)?;
+    let shifted = resample_wav_bytes(&wav, factor);
+    if shifted.len() != wav.len() {
+        // Sizes moved: the data chunk genuinely changed — write it.
+        std::fs::write(path, shifted)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -607,5 +707,84 @@ mod player_process_tests {
     #[allow(dead_code)]
     fn _assert_write_is_used(mut w: impl Write) {
         let _ = w.write_all(b"");
+    }
+}
+
+#[cfg(test)]
+mod voice_change_tests {
+    use super::*;
+
+    /// A minimal canonical 44-byte PCM WAV: RIFF + fmt(16) + data(n).
+    fn wav(samples: &[i16], rate: u32) -> Vec<u8> {
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        b.extend_from_slice(&1u16.to_le_bytes()); // mono
+        b.extend_from_slice(&rate.to_le_bytes());
+        b.extend_from_slice(&(rate * 2).to_le_bytes()); // byte rate
+        b.extend_from_slice(&2u16.to_le_bytes()); // block align
+        b.extend_from_slice(&16u16.to_le_bytes()); // bits
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        b.extend_from_slice(&data);
+        b
+    }
+
+    fn data_samples(w: &[u8]) -> Vec<i16> {
+        let pos = w.windows(4).position(|c| c == b"data").expect("data chunk");
+        let size = u32::from_le_bytes([w[pos + 4], w[pos + 5], w[pos + 6], w[pos + 7]]) as usize;
+        w[pos + 8..pos + 8 + size]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    #[test]
+    fn factor_table_and_fail_open_typos() {
+        assert_eq!(voice_change_factor("off"), 1.0);
+        assert!(voice_change_factor("high") > 1.0);
+        assert!(voice_change_factor("low") < 1.0);
+        assert_eq!(voice_change_factor("HIGH"), 1.0, "typo stays off");
+        assert_eq!(voice_change_factor(""), 1.0);
+    }
+
+    #[test]
+    fn resample_grows_and_shrinks_sample_count() {
+        let samples: Vec<i16> = (0..1000)
+            .map(|i| ((i as f32 * 0.1).sin() * 8000.0) as i16)
+            .collect();
+        let w = wav(&samples, 16_000);
+        let up = resample_wav_bytes(&w, 1.22);
+        let down = resample_wav_bytes(&w, 0.82);
+        assert_eq!(data_samples(&up).len(), 1220, "22% more samples");
+        assert_eq!(data_samples(&down).len(), 820, "18% fewer");
+        assert_eq!(&up[0..4], b"RIFF");
+        let riff = u32::from_le_bytes([up[4], up[5], up[6], up[7]]) as usize;
+        assert_eq!(riff + 8, up.len());
+        assert_eq!(up[24..28], w[24..28], "sample rate unchanged");
+    }
+
+    #[test]
+    fn non_wav_input_passes_through_untouched() {
+        let garbage = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        assert_eq!(resample_wav_bytes(&garbage, 1.22), garbage);
+        let w = wav(&[100, -100, 50], 8000);
+        assert_eq!(resample_wav_bytes(&w, 3.0), w);
+    }
+
+    #[test]
+    fn resampled_waveform_tracks_the_source() {
+        // A constant-DC source resamples to itself regardless of factor.
+        let w = wav(&[1234; 512], 8000);
+        let up = resample_wav_bytes(&w, 1.5);
+        let s = data_samples(&up);
+        assert!(s.iter().all(|v| (v - 1234).abs() <= 1), "{s:?}");
     }
 }

@@ -25,6 +25,7 @@ pub mod grounding;
 pub mod observe;
 pub mod onvif_alarm;
 pub mod protocol_runtime;
+pub mod ptz_proxy;
 pub mod routes;
 pub mod server;
 pub mod stream_manager;
