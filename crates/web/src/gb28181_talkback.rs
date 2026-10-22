@@ -244,6 +244,22 @@ pub fn open_sink(enabled: bool) -> Result<Option<(Arc<dyn AudioTalkbackSink>, cp
 /// GB28181 voice is 8 kHz mono; the library expects 20 ms G.711 frames
 /// (160 bytes) pushed at real-time cadence.
 const UPSTREAM_FRAME_BYTES: usize = 160;
+/// Upstream capture buffer: ~100 ms of frames per callback. With
+/// `BufferSize::Default` the Sandy Bridge talk unit xrun'ed ~2×/s
+/// (cpal default period is a few ms — any scheduler hiccup drops a
+/// chunk); 100 ms rides out jitter for ~100 ms of extra upstream
+/// latency, clamped to whatever the device actually supports.
+#[must_use]
+pub fn upstream_buffer_frames(rate: u32, min: Option<u32>, max: Option<u32>) -> u32 {
+    let want = (rate / 10).max(UPSTREAM_FRAME_BYTES as u32);
+    match (min, max) {
+        (Some(lo), Some(hi)) => want.clamp(lo.max(1), hi.max(lo.max(1))),
+        (Some(lo), None) => want.max(lo),
+        (None, Some(hi)) => want.min(hi),
+        (None, None) => want,
+    }
+}
+
 /// Bounded pre-session backlog (~1 s of audio). The library only drains
 /// the channel while a talkback session is up; a longer backlog would
 /// both leak memory and replay stale mic audio on connect.
@@ -398,8 +414,16 @@ pub fn open_upstream(enabled: bool) -> anyhow::Result<Option<UpstreamHandle>> {
         Some(c) => c,
         None => device.default_input_config()?,
     };
-    let rate = config.sample_rate() as f64;
-    let channels = config.channels();
+    let mut fixed_config = config.config();
+    let (min_buf, max_buf) = match config.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => (Some(*min), Some(*max)),
+        cpal::SupportedBufferSize::Unknown => (None, None),
+    };
+    fixed_config.buffer_size = cpal::BufferSize::Fixed(upstream_buffer_frames(
+        fixed_config.sample_rate,
+        min_buf,
+        max_buf,
+    ));
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(UPSTREAM_BACKLOG_FRAMES);
     let chunker = Arc::new(parking_lot::Mutex::new(G711Chunker::new()));
@@ -407,15 +431,66 @@ pub fn open_upstream(enabled: bool) -> anyhow::Result<Option<UpstreamHandle>> {
     // TalkbackSource handle after handing the channel to the builder;
     // until then (and per default) the encoder uses PCMA.
     let law_slot = Arc::new(std::sync::OnceLock::new());
-    let err_fn = |e| tracing::warn!(error = %e, "talkback upstream capture error");
 
-    let stream = match config.sample_format() {
+    // Prefer the larger Fixed period (jitter headroom); when the host
+    // rejects it — observed: dsnoop advertising a hard 170..=171 frame
+    // range @8 kHz, and Unknown ranges that the device still enforces —
+    // retry with the device default rather than failing open to 488.
+    let stream = match build_upstream_stream(
+        &device,
+        &fixed_config,
+        config.sample_format(),
+        &tx,
+        &chunker,
+        &law_slot,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "fixed-buffer upstream capture rejected — retrying with device default"
+            );
+            build_upstream_stream(
+                &device,
+                &config.config(),
+                config.sample_format(),
+                &tx,
+                &chunker,
+                &law_slot,
+            )?
+        }
+    };
+    stream
+        .play()
+        .context("failed to start talkback upstream capture")?;
+    Ok(Some(UpstreamHandle {
+        frames: rx,
+        stream,
+        law_slot,
+    }))
+}
+
+/// Build the upstream input stream for one config, cloning the shared
+/// send-side state so the caller can retry with a fallback config.
+fn build_upstream_stream(
+    device: &cpal::Device,
+    cfg: &cpal::StreamConfig,
+    fmt: cpal::SampleFormat,
+    tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    chunker: &Arc<parking_lot::Mutex<G711Chunker>>,
+    law_slot: &Arc<UpstreamLawSlot>,
+) -> anyhow::Result<cpal::Stream> {
+    use cpal::traits::DeviceTrait;
+    let err_fn = |e| tracing::warn!(error = %e, "talkback upstream capture error");
+    let rate = cfg.sample_rate as f64;
+    let channels = cfg.channels;
+    match fmt {
         cpal::SampleFormat::I16 => {
             let tx = tx.clone();
-            let chunker = Arc::clone(&chunker);
-            let law_slot = Arc::clone(&law_slot);
-            device.build_input_stream(
-                config.config(),
+            let chunker = Arc::clone(chunker);
+            let law_slot = Arc::clone(law_slot);
+            Ok(device.build_input_stream(
+                *cfg,
                 move |data: &[i16], _| {
                     push_frames(
                         &tx,
@@ -428,14 +503,14 @@ pub fn open_upstream(enabled: bool) -> anyhow::Result<Option<UpstreamHandle>> {
                 },
                 err_fn,
                 None,
-            )?
+            )?)
         }
         cpal::SampleFormat::F32 => {
             let tx = tx.clone();
-            let chunker = Arc::clone(&chunker);
-            let law_slot = Arc::clone(&law_slot);
-            device.build_input_stream(
-                config.config(),
+            let chunker = Arc::clone(chunker);
+            let law_slot = Arc::clone(law_slot);
+            Ok(device.build_input_stream(
+                *cfg,
                 move |data: &[f32], _| {
                     let pcm: Vec<i16> = data
                         .iter()
@@ -452,18 +527,10 @@ pub fn open_upstream(enabled: bool) -> anyhow::Result<Option<UpstreamHandle>> {
                 },
                 err_fn,
                 None,
-            )?
+            )?)
         }
         fmt => anyhow::bail!("unsupported input sample format: {fmt:?}"),
-    };
-    stream
-        .play()
-        .context("failed to start talkback upstream capture")?;
-    Ok(Some(UpstreamHandle {
-        frames: rx,
-        stream,
-        law_slot,
-    }))
+    }
 }
 
 #[cfg(test)]
@@ -569,6 +636,21 @@ mod tests {
             out.0.lock().unwrap().as_slice(),
             [mulaw_to_pcm(0xFF), mulaw_to_pcm(0x7F)]
         );
+    }
+
+    #[test]
+    fn upstream_buffer_targets_100ms_and_clamps() {
+        // 8 kHz → 800 frames (100 ms); 48 kHz → 4800.
+        assert_eq!(upstream_buffer_frames(8000, None, None), 800);
+        assert_eq!(upstream_buffer_frames(48_000, None, None), 4800);
+        // Never below one 20 ms G.711 frame even on odd rates.
+        assert_eq!(upstream_buffer_frames(1000, None, None), 160);
+        // Clamped into the device's supported range.
+        assert_eq!(upstream_buffer_frames(8000, Some(1024), None), 1024);
+        assert_eq!(upstream_buffer_frames(8000, None, Some(512)), 512);
+        assert_eq!(upstream_buffer_frames(8000, Some(64), Some(512)), 512);
+        // Degenerate hi < lo must not panic — lo wins.
+        assert_eq!(upstream_buffer_frames(8000, Some(1024), Some(512)), 1024);
     }
 
     #[test]
