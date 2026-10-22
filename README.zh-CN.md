@@ -17,9 +17,14 @@
 
 ## 功能特性
 
+- **一份代码、四种形态（roadmap M2）** — `mibee-eye`（全功能）、`mibee-cam`（视觉 AI + 推流）、`mibee-mic`（拾音）、`mibee-talk`（对讲：麦克上行 + 扬声器播放）。形态门控在引擎构建前强制关闭形态外的配置族——同一二进制家族适配 PC、闲置笔记本与无头机器，无需裁配置
 - **本地采集** — 摄像头通过 V4L2（Linux）/ MSMF（Windows），麦克风通过 ALSA / WASAPI
 - **对外协议** — RTSP 服务端（客户端拉流）、RTMP 推流、ONVIF 设备端点、GB/T 28181 设备注册（全部默认关闭，通过 Web 界面启用）
 - **GB/T 28181-2022 设备面** — 告警事件（SSE `alarm` + Alarm NOTIFY，AI 上升沿 + 冷却）、DeviceControl（IFrameCmd 强制关键帧、RecordCmd 录像门）、优雅注销（REGISTER Expires: 0）、静态 MobilePosition 上报、DeviceConfig FrameMirror 运行时镜像、SIP-Date 校时观察——全部随共享库 gb28181-rs 提供
+- **国标拾音通道（136 类型）** — 以 136 类型通道号注册即被平台自动收编为网络拾音器：自动 INVITE `m=audio recvonly` → 20ms G.711 上行（`talkback_upstream`），平台语音对讲在本地扬声器播放（`talkback_playback`）；双向均经跨团队真机联测验证（注册→会话 <0.5s、满帧节拍、零丢包）
+- **GB35114 A 级（SM2）注册认证** — 证书握手（Unidirection/Bidirection）、握手后全部请求带 keyed-SM3 Note 完整性摘要（±5 分钟防重放窗）；身份缺失 fail-closed，TOFU cnonce 公告可选（`gb28181.gb35114.*`）
+- **PTZ 代理** — GB `PTZCmd` 翻译到外接 ONVIF 云台（ContinuousMove/Stop、预置位），经 `gb28181.ptz_onvif_endpoint` 配置；未配置头之前保持无操作应答
+- **TTS 变声** — `[tts] voice_change = off|high|low` 合成播放变调
 - **端侧智能（全部故障开放、主动开启）** — 视觉目标检测（NanoDet）实时叠加框；声音事件检测（YAMNet）发出 `source: "audio"` 告警（投票平滑 + 逐类冷却）；用户绘制入侵/越线区域 + ByteTrack 子集跟踪（`zone_event` SSE）；OCR（PP-OCR v4/v5，`POST /api/ocr`）——SPEC 附录 A #21
 - **语音交互** — 唤醒词小蜜蜂（sherpa-onnx zipformer KWS）→ 离线 paraformer 三语转写 → 本地 LLM 回复（llama.cpp + Qwen3 GGUF）→ 按回复语言选音色的 TTS 播报（粤/英/普通话；sherpa-onnx CLI 子进程，GPL 隔离）；跟问窗口内免唤醒连续对话（`follow_up_window_secs`）；对话面板实时麦克风波形条（`audio_level` SSE）——SPEC 附录 A #22/#30/#36
 - **接地对话（SPEC 附录 A #29/#35）** — 每轮回答都知道相机当前看到什么（实时检测 + VLM 告警描述）、本地时钟与系统状态，可选注入天气；`vision:true` 把新鲜帧交给端侧 VLM 看图直答；配置云端后对话云优先、失败回落本地（`engine` 披露实际路径）
@@ -33,6 +38,8 @@
 - **桌面集成（规范附录 A #42）** — 有桌面会话的主机上提供托盘图标 + 桌面通知（ksni StatusNotifierItem + org.freedesktop.Notifications，纯 Rust D-Bus）；告警上升沿通知、左键打开 Web 界面；headless 服务器完全 fail-open
 - **可观测性** — 结构化日志、OpenTelemetry 追踪（132+ 仪器化 span）、Prometheus 指标（14+ 计数器/仪表）、可选的 Loki 远程日志发送
 - **资源自适应** — 启动时按可用内存对 AI 功能做预算制准入（`[resources] feature_gate`），小内存主机自动裁掉重模型尾部；准入表经状态页"资源档位"卡与 `capabilities.resource` 暴露
+- **弹性运行时（M7）** — 启动门控之外，运行期可用内存进入警戒带时自动卸载重型模型、不停机跨档热切 LLM（L1/L2；L3 仅建议）
+- **插件框架（SPEC #47）** — 告警/声音/区域/定时四类触发源驱动 webhook、TTS 播报、录像门三类动作，运行时可配
 - **安全性** — 速率限制与指数退避、CSRF（双提交 cookie）、CSP 头、TLS 仅
 - **动态管理** — 通过 Web 界面协议热切换（无需重启）、热插拔摄像头检测（udev）、SSE 实时事件
 - **低资源占用** — 目标 <5% CPU 空闲占用、<200 MB 内存；尽可能零拷贝
@@ -117,7 +124,7 @@ mibee-eye/
 | **ONVIF 设备** | WS-Discovery + SOAP 设备服务 | [`onvif-device-rs`](https://github.com/mickeyzzc/onvif-rs)（当 `onvif.enabled=true` 时启动） | ✅ 已实现并连接 |
 | **GB/T 28181 设备** | SIP REGISTER (Digest) + INVITE + RTP 推送 | [`gb28181-rs`](https://github.com/mickeyzzc/gb28181-rs)（含 GB35114 认证；`Gb28181Output` 在 INVITE 时动态连接，BYE 时断开） | ✅ 已实现并连接 |
 | **GB28181 告警管线** | AI 检测上升沿 → `alarm` SSE + Alarm NOTIFY | `AlarmBridge`（冷却门控）+ gb28181-rs `notifier()`；优先级 4 / 方法 5 / 类型 2（2022 标准表） | ✅ 已实现并连接 |
-| **GB28181 DeviceControl** | IFrameCmd / RecordCmd / GuardCmd / TeleBoot / PTZ | gb28181-rs 控制接缝：OpenH264 强制关键帧、RecordCmd 门控本地录制、无执行器命令 ack-only | ✅ 已实现并连接 |
+| **GB28181 DeviceControl** | IFrameCmd / RecordCmd / GuardCmd / TeleBoot / PTZ | gb28181-rs 控制接缝：OpenH264 强制关键帧、RecordCmd 门控本地录制、PTZ 在配置了云台头时转发 ONVIF 代理（`ptz_onvif_endpoint`），其余无执行器命令 ack-only | ✅ 已实现并连接 |
 | **GB28181 优雅注销** | SIGTERM / 协议停止时发 REGISTER `Expires: 0` | gb28181-rs `shutdown_with_deregister`（401 全套舞步、2s 超时、超时兜底 abort） | ✅ 已实现并连接 |
 | **GB28181 DeviceConfig FrameMirror** | 运行时镜像模式 0-3（A.2.1.22） | 共享原子翻转标志，与静态安装翻转 XOR 复合，烧入编码/快照/AI（BasicParam 维持拒绝，与树莓派版一致） | ✅ 已实现并连接 |
 | **GB28181 SIP-Date 校时观察** | REGISTER `Date` 头的平台时钟漂移（§9.10.2） | 漂移>5s WARN（每次再偏 5s 才重复告警）；绝不改系统时钟 | ✅ 已实现并连接 |
