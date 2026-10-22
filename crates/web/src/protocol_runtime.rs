@@ -276,6 +276,10 @@ pub fn extract_gb28181_config(db_config: &serde_json::Value) -> Gb28181RuntimeCo
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                include_device_cert: g
+                    .get("include_device_cert")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             })
             .unwrap_or_default(),
         heartbeat_timeout_count: db_config
@@ -405,6 +409,7 @@ pub struct Gb35114RuntimeConfig {
     pub device_key_file: String,
     pub platform_cert_file: String,
     pub server_id: String,
+    pub include_device_cert: bool,
 }
 
 /// Builds the GB35114 A-level REGISTER authenticator from the sub-config.
@@ -432,6 +437,7 @@ pub fn build_gb35114_authenticator(
         .context("gb35114 platform certificate invalid")?;
     let mut opts = Options::new(device, device_id.to_string(), cfg.server_id.clone());
     opts.platform_cert = Some(platform_cert);
+    opts.include_device_cert = cfg.include_device_cert;
     let auth = Authenticator::new(opts).context("gb35114 authenticator options invalid")?;
     Ok(Some(Arc::new(auth)))
 }
@@ -1969,6 +1975,7 @@ mod tests {
             device_key_file: format!("{dir}/device_key.pem"),
             platform_cert_file: format!("{dir}/platform_cert.pem"),
             server_id: "34020000002000000001".to_string(),
+            include_device_cert: false,
         };
         let auth = build_gb35114_authenticator(&cfg, "34020000001320000001")
             .expect("fixture identities must build")

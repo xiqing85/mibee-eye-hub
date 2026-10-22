@@ -176,6 +176,11 @@ pub struct Gb35114Config {
     /// Platform server ID (20-digit) for the signed REGISTER exchange.
     #[serde(default = "default_gb35114_server_id")]
     pub server_id: String,
+    /// Attach the device certificate PEM as cnonce in the Capability
+    /// announcement (for TOFU-style platforms that do not pre-provision
+    /// the device certificate).
+    #[serde(default)]
+    pub include_device_cert: bool,
 }
 
 fn default_gb35114_server_id() -> String {

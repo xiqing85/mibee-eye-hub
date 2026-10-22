@@ -621,7 +621,8 @@ mod tests {
                 "device_cert_file": "/etc/certs/device_cert.pem",
                 "device_key_file": "/etc/certs/device_key.pem",
                 "platform_cert_file": "/etc/certs/platform_cert.pem",
-                "server_id": "34020000002000000001"
+                "server_id": "34020000002000000001",
+                "include_device_cert": true
             }
         });
         let result = validate_and_coerce("gb28181", &payload).unwrap();
@@ -634,6 +635,7 @@ mod tests {
             result["gb35114"]["server_id"],
             json!("34020000002000000001")
         );
+        assert_eq!(result["gb35114"]["include_device_cert"], json!(true));
         // Only the provided section is in the validated output.
         assert_eq!(result.as_object().unwrap().len(), 1);
     }
