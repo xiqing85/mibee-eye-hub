@@ -436,18 +436,30 @@ pub fn open_upstream(enabled: bool) -> anyhow::Result<Option<UpstreamHandle>> {
     // rejects it — observed: dsnoop advertising a hard 170..=171 frame
     // range @8 kHz, and Unknown ranges that the device still enforces —
     // retry with the device default rather than failing open to 488.
-    let stream =
-        match build_upstream_stream(&device, &fixed_config, config.sample_format(), &tx, &chunker, &law_slot)
-        {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "fixed-buffer upstream capture rejected — retrying with device default"
-                );
-                build_upstream_stream(&device, &config.config(), config.sample_format(), &tx, &chunker, &law_slot)?
-            }
-        };
+    let stream = match build_upstream_stream(
+        &device,
+        &fixed_config,
+        config.sample_format(),
+        &tx,
+        &chunker,
+        &law_slot,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "fixed-buffer upstream capture rejected — retrying with device default"
+            );
+            build_upstream_stream(
+                &device,
+                &config.config(),
+                config.sample_format(),
+                &tx,
+                &chunker,
+                &law_slot,
+            )?
+        }
+    };
     stream
         .play()
         .context("failed to start talkback upstream capture")?;
