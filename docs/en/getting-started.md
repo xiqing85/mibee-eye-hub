@@ -32,7 +32,10 @@ cargo build
 cargo build --release
 ```
 
-The release binary will be available at `target/release/mibee-eye`.
+The release binaries will be available at `target/release/`:
+`mibee-eye` (full form), `mibee-cam` (visual AI + streaming),
+`mibee-mic` (audio pickup), `mibee-talk` (intercom). Pick the form that
+matches the host's role; every form serves the same Web UI and API.
 
 Default ports:
 - Web UI: 8443 (HTTPS with self-signed TLS)

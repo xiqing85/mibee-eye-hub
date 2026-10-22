@@ -32,7 +32,9 @@ cargo build
 cargo build --release
 ```
 
-发布版二进制文件将位于 `target/release/mibee-eye`。
+发布版二进制文件将位于 `target/release/`：`mibee-eye`（全功能）、
+`mibee-cam`（视觉 AI + 推流）、`mibee-mic`（拾音）、`mibee-talk`（对讲）。
+按主机角色选择形态；所有形态共享同一 Web 界面与 API。
 
 默认端口：
 - Web UI：8443（HTTPS 使用自签名 TLS）

@@ -4,6 +4,54 @@
 
 ### Added
 
+- **Four form-factor binaries (roadmap #6 M2).** The single `mibee-eye`
+  binary became a family: `mibee-eye` (full), `mibee-cam` (visual AI +
+  streaming, no mic/dialogue), `mibee-mic` (audio pickup: sound events,
+  ASR, KWS, speaker), `mibee-talk` (intercom: mic upstream + speaker
+  playback + PTZ proxy). A `FormProfile` gate force-disables config
+  families outside the form before any engine builds — misconfigured
+  deployments log why their AI did not load instead of silently
+  over-spending; the gates run ahead of the resource gate (#40).
+- **GB audio pickup channel (2026-10-22 NVR joint test, accepted).**
+  Registering with a type-136 channel ID turns any audio-capable form
+  into a network pickup: the platform auto-enrolls it as
+  `encoding=audio`, auto-INVITEs `m=audio recvonly`, and the device
+  streams 20 ms G.711 upstream (`gb28181.talkback_upstream`). Verified
+  end-to-end on real hardware: registration→INVITE <0.5 s, 4×30.2 s
+  segments at full 1504-frame cadence, zero transport drops, WAV export.
+- **GB35114 A-level TOFU key.** `gb28181.gb35114.include_device_cert`
+  carries the device certificate PEM in the Capability cnonce
+  (`devicecert:` base64) for platforms that do not pre-provision it;
+  the previously undocumented `gb28181.gb35114` sub-table is now in the
+  configuration reference (zh/en), including the fail-closed semantics.
+- **PTZ proxy (M4-a).** GB `PTZCmd` (A505) commands translate to an
+  external ONVIF head: ContinuousMove/Stop, GotoPreset, SetPreset,
+  RemovePreset (`gb28181.ptz_onvif_endpoint` + credentials); without a
+  head configured PTZ stays a no-op ack.
+- **TTS voice change (M4).** `[tts] voice_change = off|high|low` shifts
+  playback pitch by resampling the synthesized WAV (1.22×/0.82×,
+  verified live at exactly 1.220).
+- **Audio telemetry (M3, SPEC #46).** Capture pipeline reports
+  `capture_mode`/`source`; the assistant waveform renders with
+  semantics per state (idle breathing / listening amplitude /
+  thinking pulse / answering syllable envelope).
+- **Per-capability model routing (M5).** `[models.<capability>]`
+  overrides which model file a capability loads, privacy-facing
+  capabilities stay local-first regardless of cloud configuration.
+- **Plugin framework (M6, SPEC #47).** Four trigger sources (alarm
+  rising edge, sound event, zone event, schedule) drive three action
+  families (HTTP webhook, TTS announcement, recording gate); verified
+  end-to-end on a live device.
+- **Elastic resource controller (M7, SPEC #48).** L1 sheds the heavy
+  model tail when available memory enters the warning band; L2 swaps
+  the live LLM between tier ladders under memory pressure without a
+  restart (same-path swaps are no-ops); L3 (model quality tiering)
+  surfaces recommendations only. Closes issue #3 as the systemic fix
+  for swap-creep "PC freeze" recurrence.
+- **85% coverage gate (CI-enforced).** `tools/check-coverage.sh`
+  ratchets line coverage (baseline 85.0, current 85.56) with three
+  documented exemption classes: composition roots, model-gated
+  inference paths, device-gated I/O.
 - **Away mode (SPEC §3.6 / appendix A #44).** Armed watch over the live
   AI detection stream: person arrivals are recorded with evidence
   snapshots, greeted over the speaker (`greeting_known` by enrolled-face
@@ -171,6 +219,15 @@
 
 ### Fixed
 
+- **Talkback upstream capture xruns (~13% frame gap → zero).** The
+  upstream mic capture opened with `BufferSize::Default`; on hosts
+  whose audio server pins small periods (~21 ms) cpal's reader thread
+  overran ~2.7×/s and the platform measured a 13% frame supply gap.
+  The capture now requests a ~100 ms Fixed period clamped to the
+  device's supported range and retries with the device default when a
+  host rejects Fixed sizes (observed: dsnoop advertising Unknown at
+  config level while enforcing a hard range at build time — without
+  the fallback the protocol fail-opens to 488).
 - **The shipped `config.toml` was not valid TOML (blocks every fresh
   install).** Commit `78a7eeb` spliced the `[away]` block into `[agent]`'s
   comment anchor, leaving a stray `[agent]\` table header at line 305.
