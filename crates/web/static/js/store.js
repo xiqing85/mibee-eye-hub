@@ -40,3 +40,16 @@ export function cameraId() {
 export function hasCap(name) {
   return !!(store.caps && store.caps[name]);
 }
+
+/// Is a given SSE event name advertised in `capabilities.events`?
+/// (SPEC §3.1: clients should only wire UI to advertised events.)
+export function eventsHas(name) {
+  return !!(store.caps && Array.isArray(store.caps.events) && store.caps.events.includes(name));
+}
+
+/// Test seam: swap the capabilities document and let callers re-run
+/// visibility (used by the visual suite to exercise gating variants,
+/// e.g. the cam-form ambient card).
+export function setCapsForTests(caps) {
+  store.caps = caps;
+}

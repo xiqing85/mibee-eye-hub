@@ -1,7 +1,7 @@
 // App bootstrap: auth state machine → capability discovery → view wiring.
 
 import { api, onSessionExpired, refreshCapabilities } from './api.js';
-import { store, setLang, hasCap } from './store.js';
+import { store, setLang, hasCap, setCapsForTests } from './store.js';
 import { $, toast, confirmDlg } from './ui.js';
 import { t, applyLang } from './i18n.js';
 import { icon, initIcons } from './icons.js';
@@ -108,10 +108,7 @@ async function enterApp() {
   await refreshCapabilities();
   await refreshCameras();
   applyLang();
-  updateZonesVisibility();
-  updateAssistantVisibility();
-  updateChatVisibility();
-  updateWaveformVisibility();
+  applyCapsVisibility();
   initNav();
   initLive();
   initPtz();
@@ -217,6 +214,15 @@ function updateAssistantVisibility() {
   });
 }
 
+/// Re-run every capability-gated visibility after the capabilities
+/// document changes (initial load; the test seam swaps variants).
+function applyCapsVisibility() {
+  updateZonesVisibility();
+  updateAssistantVisibility();
+  updateChatVisibility();
+  updateWaveformVisibility();
+}
+
 function initShell() {
   initIcons();
   applyLang();
@@ -256,6 +262,14 @@ function initShell() {
 // waveform's capture-tag lanes are driven through the same dispatch the
 // live connection uses.
 window.sse = { dispatchTestEvent };
+
+// Test seam: swap the capabilities document and re-run gated visibility —
+// lets the visual suite exercise gating variants (e.g. the cam-form
+// ambient card, SPEC appendix A #49) against one mock. NB some gates
+// (chat card) only hide, never un-hide — tests restore with a reload.
+window.__test = {
+  setCaps: (c) => { setCapsForTests(c); applyCapsVisibility(); },
+};
 
 window.addEventListener('error', (e) => {
   const box = document.createElement('div');

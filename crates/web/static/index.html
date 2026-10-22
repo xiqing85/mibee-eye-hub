@@ -193,6 +193,18 @@
         </div>
       </div>
 
+      <!-- Ambient sound card (extension: audio_level event without voice,
+           SPEC appendix A #49 — cam form: real mic level waveform) -->
+      <div class="card hidden" id="ambient-card">
+        <h3 data-i18n="ambientTitle">Ambient sound</h3>
+        <p class="card-desc" data-i18n="ambientHint">Live mic level from this device (level only, never audio)</p>
+        <div class="ambient-wave-wrap"><canvas id="ambient-waveform" aria-hidden="true"></canvas></div>
+        <div class="ambient-meta">
+          <span class="ambient-level mono" id="ambient-level">0%</span>
+          <span class="agent-capture hidden" id="ambient-capture"><span id="ambient-capture-label"></span></span>
+        </div>
+      </div>
+
       <!-- PTZ panel (extension: ptz) -->
       <div class="ptz-panel hidden" id="ptz-panel">
         <h3 class="panel-title"><svg class="icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5 2.8 19.5h18.4z"/><path d="M12 10v4.2M12 17.2v.2"/></svg><span data-i18n="ptzControl">PTZ Control</span></h3>

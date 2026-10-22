@@ -37,12 +37,17 @@ impl FormProfile {
     };
 
     /// The camera form (design §3: 采集/AI/RTSP/RTMP/GB28181/ONVIF/录像).
-    /// Visual AI rides the camera; nothing that needs a microphone or a
-    /// language model survives. Away keeps its camera-side watch (it
-    /// degrades to the no-voice visitor record on its own).
+    /// Visual AI rides the camera; the audio family is admitted for
+    /// **ambient-sound listening** (SPEC appendix A #49, 2026-10-22):
+    /// `[audio_ai]` gives a cam deployment YAMNet sound events plus the
+    /// real-mic `audio_level` stream for the ambient waveform — the
+    /// recommended cam setup. `[voice]` (wake-word stack) is also admitted
+    /// by the family gate but pointless without dialogue (wake with no
+    /// answer); deployments leave it off. Away keeps its camera-side watch
+    /// (it degrades to the no-voice visitor record on its own).
     pub const CAM: FormProfile = FormProfile {
         vision_ai: true,
-        audio: false,
+        audio: true,
         voice_out: false,
         dialogue: false,
     };
@@ -166,15 +171,23 @@ mod tests {
     }
 
     #[test]
-    fn cam_disables_audio_and_dialogue_keeps_vision() {
+    fn cam_admits_audio_disables_dialogue_keeps_vision() {
         let mut config = everything_on();
         FormProfile::CAM.apply("cam", &mut config);
         assert!(config.ai.enabled, "visual detection is camera-domain");
         assert!(config.face.enabled);
         assert!(config.ocr.enabled);
-        for off in [
+        // Audio family admitted for ambient listening (SPEC #49): the
+        // config decides whether that is audio_ai (recommended) or voice.
+        assert!(
             config.audio_ai.enabled,
+            "ambient-sound listening is cam-admitted"
+        );
+        assert!(
             config.voice.enabled,
+            "audio family gate covers both sections"
+        );
+        for off in [
             config.tts.enabled,
             config.llm.enabled,
             config.vlm.enabled,
@@ -185,6 +198,20 @@ mod tests {
         ] {
             assert!(!off);
         }
+    }
+
+    #[test]
+    fn cam_with_voice_off_keeps_audio_ai() {
+        // The recommended cam deployment (SPEC #49): ambient listening via
+        // audio_ai only, wake-word stack explicitly off.
+        let mut config = everything_on();
+        config.voice.enabled = false;
+        FormProfile::CAM.apply("cam", &mut config);
+        assert!(config.audio_ai.enabled);
+        assert!(
+            !config.voice.enabled,
+            "form gate never re-enables a section"
+        );
     }
 
     #[test]
