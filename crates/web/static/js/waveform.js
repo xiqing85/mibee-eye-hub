@@ -9,7 +9,7 @@
 // syllabic modulation — and on voice devices the mic picks up the real
 // TTS playback anyway).
 
-import { hasCap } from './store.js';
+import { hasCap, eventsHas } from './store.js';
 import { $ } from './ui.js';
 import { t } from './i18n.js';
 
@@ -26,6 +26,7 @@ const DATA_STALE_MS = 6000;
 
 let env = new Float32Array(POINTS);   // scrolled envelope (per-frame push)
 let curLevel = 0;                     // eased toward last audio_level sample
+let lastLevel = 0;                    // the last real sample (SPEC #36 level)
 let lastSampleAt = 0;
 let speakingUntil = 0;
 let state = 'idle';                   // idle | listening | thinking | answering
@@ -36,6 +37,13 @@ let ctx = null;
 let heroEl = null;
 let dpr = 1;
 
+// Ambient-sound card on the Live view (SPEC appendix A #49): the same
+// audio_level stream rendered for devices that carry a mic but not the
+// voice assistant (cam form). Mutually exclusive with the hero by gating.
+let ambientCtx = null;
+let ambientCanvas = null;
+let ambientWrap = null;
+
 function cssVar(name, fallback) {
   const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   return v || fallback;
@@ -43,26 +51,44 @@ function cssVar(name, fallback) {
 
 export function initWaveform() {
   const canvas = $('agent-waveform');
-  if (!canvas) return;
-  ctx = canvas.getContext('2d');
-  heroEl = canvas.closest('.agent-hero');
+  if (canvas) {
+    ctx = canvas.getContext('2d');
+    heroEl = canvas.closest('.agent-hero');
+  }
+  ambientCanvas = $('ambient-waveform');
+  if (ambientCanvas) {
+    ambientCtx = ambientCanvas.getContext('2d');
+    ambientWrap = ambientCanvas.parentElement;
+  }
   dpr = Math.min(window.devicePixelRatio || 1, 2);
   resize();
   if (window.ResizeObserver && heroEl) {
     new ResizeObserver(resize).observe(heroEl);
+  }
+  if (window.ResizeObserver && ambientWrap) {
+    new ResizeObserver(resize).observe(ambientWrap);
   }
   updateWaveformVisibility();
   if (rafId === null) rafId = requestAnimationFrame(frame);
 }
 
 function resize() {
-  if (!ctx || !heroEl) return;
-  const cssW = Math.max(120, heroEl.clientWidth - 2); // card padding handled by CSS
-  const cssH = 110;
-  ctx.canvas.width = Math.round(cssW * dpr);
-  ctx.canvas.height = Math.round(cssH * dpr);
-  ctx.canvas.style.width = cssW + 'px';
-  ctx.canvas.style.height = cssH + 'px';
+  if (ctx && heroEl) {
+    const cssW = Math.max(120, heroEl.clientWidth - 2); // card padding handled by CSS
+    const cssH = 110;
+    ctx.canvas.width = Math.round(cssW * dpr);
+    ctx.canvas.height = Math.round(cssH * dpr);
+    ctx.canvas.style.width = cssW + 'px';
+    ctx.canvas.style.height = cssH + 'px';
+  }
+  if (ambientCtx && ambientWrap) {
+    const cssW = Math.max(120, ambientWrap.clientWidth - 2);
+    const cssH = 96;
+    ambientCtx.canvas.width = Math.round(cssW * dpr);
+    ambientCtx.canvas.height = Math.round(cssH * dpr);
+    ambientCtx.canvas.style.width = cssW + 'px';
+    ambientCtx.canvas.style.height = cssH + 'px';
+  }
 }
 
 export function updateWaveformVisibility() {
@@ -70,11 +96,22 @@ export function updateWaveformVisibility() {
   // Real levels need `voice`; a chat-only device still shows the synthetic
   // thinking/answering states.
   if (hero) hero.classList.toggle('hidden', !(hasCap('voice') || hasCap('chat')));
+  // Ambient card (SPEC #49): devices that stream audio_level but carry no
+  // voice assistant (cam form) — the hero gate above keeps the two
+  // mutually exclusive.
+  const ambientCard = $('ambient-card');
+  if (ambientCard) {
+    ambientCard.classList.toggle(
+      'hidden',
+      !(eventsHas('audio_level') && !hasCap('voice'))
+    );
+  }
 }
 
 /// One SSE audio_level sample: becomes the envelope target.
 export function handleAudioLevel(p) {
   const level = Math.max(0, Math.min(1, Number(p && p.level) || 0));
+  lastLevel = level;
   lastSampleAt = performance.now();
   // SPEC appendix A #46: capture context rides every sample (additive;
   // older devices omit both — the tag then stays hidden).
@@ -82,6 +119,7 @@ export function handleAudioLevel(p) {
   captureTag.source = p && typeof p.source === 'string' ? p.source : null;
   if (state === 'idle' || state === 'listening') state = 'listening';
   if (level >= SPEAKING_LEVEL) speakingUntil = lastSampleAt + SPEAKING_HANG_MS;
+  updateAmbientReadout(level);
 }
 
 /// External state overrides (agent phases, chat round-trips). Callers own
@@ -93,11 +131,14 @@ export function setWaveformState(next) {
 }
 
 function pushEnvelope(now) {
-  // Effective amplitude for this frame by state.
+  // Effective amplitude for this frame by state. In `listening` the target
+  // is the LAST REAL SAMPLE (SPEC #36) — the hero used to ease toward a
+  // constant instead, so the trace never followed the actual sound (found
+  // 2026-10-22 while wiring the ambient card); this restores real amplitude.
   let target = 0;
   if (state === 'listening') {
     const stale = now - lastSampleAt > DATA_STALE_MS;
-    target = stale ? 0 : 0.05;
+    target = stale ? 0 : lastLevel;
   }
   curLevel += (target - curLevel) * LEVEL_EASE;
   env.copyWithin(0, 1);
@@ -125,23 +166,23 @@ function pushEnvelope(now) {
 
 function frame() {
   rafId = null;
-  if (!ctx) return;
   const now = performance.now();
   // Drop out of listening back to idle when the room goes quiet.
   if (state === 'listening' && now - lastSampleAt > SPEAKING_HANG_MS + 1500) state = 'idle';
   pushEnvelope(now);
-  draw(now);
+  if (ctx) draw(now, ctx, true);
+  if (ambientCtx) draw(now, ambientCtx, false);
   updateStateBadge(now);
   rafId = requestAnimationFrame(frame);
 }
 
-function draw(now) {
-  const canvas = ctx.canvas;
+function draw(now, c, withPulse) {
+  const canvas = c.canvas;
   const w = canvas.width;
   const h = canvas.height;
   const mid = h / 2;
   const t = now / 1000;
-  ctx.clearRect(0, 0, w, h);
+  c.clearRect(0, 0, w, h);
 
   const accent = cssVar('--accent', '#00c8a0');
   const speaking = now < speakingUntil || state === 'answering';
@@ -155,72 +196,73 @@ function draw(now) {
 
   for (let li = 0; li < LAYERS.length; li++) {
     const layer = LAYERS[li];
-    ctx.beginPath();
+    c.beginPath();
     // Upper half left→right, mirrored lower half right→left — a closed
     // voiceprint band around the midline.
     for (let i = 0; i < POINTS; i++) {
       const x = (i / (POINTS - 1)) * w;
       const y = mid - amp(i, layer, t) * mid;
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      if (i === 0) c.moveTo(x, y); else c.lineTo(x, y);
     }
     for (let i = POINTS - 1; i >= 0; i--) {
       const x = (i / (POINTS - 1)) * w;
-      ctx.lineTo(x, mid + amp(i, layer, t) * mid);
+      c.lineTo(x, mid + amp(i, layer, t) * mid);
     }
-    ctx.closePath();
-    ctx.globalAlpha = layer.alpha;
-    ctx.fillStyle = tint;
-    ctx.fill();
-    ctx.globalAlpha = Math.min(1, layer.alpha + 0.35);
-    ctx.strokeStyle = tint;
-    ctx.lineWidth = Math.max(1, 1.2 * dpr);
-    ctx.stroke();
+    c.closePath();
+    c.globalAlpha = layer.alpha;
+    c.fillStyle = tint;
+    c.fill();
+    c.globalAlpha = Math.min(1, layer.alpha + 0.35);
+    c.strokeStyle = tint;
+    c.lineWidth = Math.max(1, 1.2 * dpr);
+    c.stroke();
   }
 
-  // Thinking: a bright pulse sweeping the flat line.
-  if (state === 'thinking') {
+  // Thinking: a bright pulse sweeping the flat line (hero only — the
+  // ambient card has no synthetic states).
+  if (withPulse && state === 'thinking') {
     const px = thinkPhase * w;
-    const grad = ctx.createLinearGradient(px - 60 * dpr, 0, px + 60 * dpr, 0);
+    const grad = c.createLinearGradient(px - 60 * dpr, 0, px + 60 * dpr, 0);
     grad.addColorStop(0, 'transparent');
     grad.addColorStop(0.5, accent);
     grad.addColorStop(1, 'transparent');
-    ctx.globalAlpha = 0.9;
-    ctx.strokeStyle = grad;
-    ctx.lineWidth = Math.max(2, 2.2 * dpr);
-    ctx.beginPath();
-    ctx.moveTo(px - 60 * dpr, mid);
-    ctx.lineTo(px + 60 * dpr, mid);
-    ctx.stroke();
+    c.globalAlpha = 0.9;
+    c.strokeStyle = grad;
+    c.lineWidth = Math.max(2, 2.2 * dpr);
+    c.beginPath();
+    c.moveTo(px - 60 * dpr, mid);
+    c.lineTo(px + 60 * dpr, mid);
+    c.stroke();
     // Glow dot at the pulse head.
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = accent;
-    ctx.beginPath();
-    ctx.arc(px, mid, 3 * dpr, 0, Math.PI * 2);
-    ctx.fill();
+    c.globalAlpha = 1;
+    c.fillStyle = accent;
+    c.beginPath();
+    c.arc(px, mid, 3 * dpr, 0, Math.PI * 2);
+    c.fill();
   }
-  ctx.globalAlpha = 1;
+  c.globalAlpha = 1;
 
   // Faint always-on midline: a near-silent mic must still read as
   // "listening, quiet" rather than a dead canvas.
-  ctx.globalAlpha = 0.18;
-  ctx.strokeStyle = tint;
-  ctx.lineWidth = 1 * dpr;
-  ctx.beginPath();
-  ctx.moveTo(0, mid);
-  ctx.lineTo(w, mid);
-  ctx.stroke();
-  ctx.globalAlpha = 1;
+  c.globalAlpha = 0.18;
+  c.strokeStyle = tint;
+  c.lineWidth = 1 * dpr;
+  c.beginPath();
+  c.moveTo(0, mid);
+  c.lineTo(w, mid);
+  c.stroke();
+  c.globalAlpha = 1;
 
   // Midline glows while speaking.
   if (speaking) {
-    ctx.globalAlpha = 0.25;
-    ctx.strokeStyle = tint;
-    ctx.lineWidth = 1 * dpr;
-    ctx.beginPath();
-    ctx.moveTo(0, mid);
-    ctx.lineTo(w, mid);
-    ctx.stroke();
-    ctx.globalAlpha = 1;
+    c.globalAlpha = 0.25;
+    c.strokeStyle = tint;
+    c.lineWidth = 1 * dpr;
+    c.beginPath();
+    c.moveTo(0, mid);
+    c.lineTo(w, mid);
+    c.stroke();
+    c.globalAlpha = 1;
   }
 }
 
@@ -290,10 +332,43 @@ function updateCaptureTag() {
   label.textContent = text;
 }
 
+/// Ambient card readout (SPEC #49): a plain numeric level plus the same
+/// capture-context tag semantics as the hero, updated per sample (≤10 Hz —
+/// no raf needed). Hidden elements are a no-op on voice devices.
+function updateAmbientReadout(level) {
+  const pct = $('ambient-level');
+  if (pct) pct.textContent = Math.round(level * 100) + '%';
+  const el = $('ambient-capture');
+  const label = $('ambient-capture-label');
+  if (!el || !label) return;
+  let text = null;
+  let cls = 'agent-capture';
+  if (captureTag.source === 'self') {
+    text = t('captureSelf'); cls += ' self active';
+  } else if (captureTag.mode === 'active') {
+    if (captureTag.source && captureTag.source.startsWith('speaker:')) {
+      text = captureTag.source.slice(8); cls += ' active';
+    } else if (captureTag.source === 'others') {
+      text = t('captureOthers'); cls += ' active';
+    } else {
+      text = t('captureActive'); cls += ' active';
+    }
+  } else if (captureTag.mode === 'passive') {
+    text = t('capturePassive');
+  }
+  if (text === null) {
+    el.classList.add('hidden');
+    return;
+  }
+  el.className = cls;
+  label.textContent = text;
+}
+
 /// Test hooks: reset state and expose the canvas for assertions.
 export function resetWaveformForTests() {
   env = new Float32Array(POINTS);
   curLevel = 0;
+  lastLevel = 0;
   lastSampleAt = 0;
   speakingUntil = 0;
   state = 'idle';
@@ -301,6 +376,8 @@ export function resetWaveformForTests() {
   thinkPhase = 0;
   const el = $('agent-capture');
   if (el) el.classList.add('hidden');
+  const amb = $('ambient-capture');
+  if (amb) amb.classList.add('hidden');
 }
 
 export function waveformStateForTests() {

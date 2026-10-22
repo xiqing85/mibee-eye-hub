@@ -2278,3 +2278,19 @@ input[type="range"]::-moz-range-thumb {
   height: 44px; max-width: 78px; object-fit: cover; border-radius: 6px;
   border: 1px solid var(--border, #2a2f3a); flex: none;
 }
+
+/* Ambient sound card (SPEC appendix A #49): real mic level waveform for
+   voice-less devices (cam form). Shares the hero's voiceprint renderer. */
+.ambient-wave-wrap {
+  margin-top: var(--space-sm, 10px);
+  border-radius: 10px;
+  border: 1px solid var(--border, #2a2f3a);
+  background: var(--bg-inset, rgba(127, 137, 161, 0.06));
+  overflow: hidden;
+}
+.ambient-wave-wrap canvas { display: block; width: 100%; }
+.ambient-meta {
+  display: flex; align-items: center; gap: 10px;
+  margin-top: 8px; font-size: 12px; color: var(--text-dim, #8b93a1);
+}
+.ambient-level { font-size: 13px; color: var(--text, #dde3ee); min-width: 38px; }
