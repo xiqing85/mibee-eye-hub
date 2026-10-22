@@ -519,6 +519,19 @@ register_interval_secs = 60
 | `position_longitude` | String | `""` | Static MobilePosition longitude (empty = no position reporting) |
 | `position_latitude` | String | `""` | Static MobilePosition latitude (empty = no position reporting) |
 
+**`[gb28181.gb35114]` sub-section** (GB 35114-2017 A-level REGISTER authentication, SM2 certificates + signaling integrity):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable A-level certificate authentication (replaces Digest; off = plain Digest registration) |
+| `device_cert_file` | String | `""` | Device certificate path (PEM, SM2) |
+| `device_key_file` | String | `""` | Device private key path (PEM, SM2, PKCS#8 or SEC1) |
+| `platform_cert_file` | String | `""` | Platform certificate path (PEM, SM2; required to verify Bidirection sign2) |
+| `server_id` | String | `"34020000002000000001"` | Platform SIP server 20-digit ID |
+| `include_device_cert` | bool | `false` | Carry the device certificate in the Capability cnonce (for TOFU-style platforms without pre-provisioning; keep false with a pre-provisioned strict policy) |
+
+Note: enabled with missing/invalid certificates refuses to start GB28181 (fail-closed — never a silent Digest fallback); after the handshake every outgoing request carries Date+Note (keyed-SM3 digest) and incoming Notes are checked against a ±5-minute freshness window.
+
 **Notes:**
 
 - OUTBOUND protocol — this device registers WITH the platform, not the platform role

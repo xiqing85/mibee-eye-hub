@@ -481,6 +481,19 @@ register_interval_secs = 60
 | `position_longitude` | String | `""` | 静态 MobilePosition 经度（空 = 不上报位置） |
 | `position_latitude` | String | `""` | 静态 MobilePosition 纬度（空 = 不上报位置） |
 
+**`[gb28181.gb35114]` 子节**（GB 35114-2017 A 级注册认证，SM2 证书 + 信令完整性）：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|-------|------|--------|------|
+| `enabled` | bool | `false` | 启用 A 级证书认证（替代 Digest；关闭 = 普通 Digest 注册） |
+| `device_cert_file` | String | `""` | 设备证书路径（PEM，SM2） |
+| `device_key_file` | String | `""` | 设备私钥路径（PEM，SM2，PKCS#8 或 SEC1） |
+| `platform_cert_file` | String | `""` | 平台证书路径（PEM，SM2，Bidirection 验 sign2 必需） |
+| `server_id` | String | `"34020000002000000001"` | 平台 SIP 服务器 20 位 ID |
+| `include_device_cert` | bool | `false` | 在 Capability 公告的 cnonce 携带设备证书（TOFU 式未预置平台用；预置严策略保持 false） |
+
+注意：启用但证书缺失/无效时 GB28181 拒绝启动（fail-closed，绝不静默回落 Digest）；握手完成后全部出向请求携带 Date+Note（keyed-SM3 摘要），入向 Note 按 ±5 分钟新鲜窗校验。
+
 **注意事项：**
 
 - 出站协议 — 此设备向平台注册，而不是平台角色
