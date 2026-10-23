@@ -219,6 +219,14 @@
 
 ### Fixed
 
+- **Log signal-to-noise on network blinks (#2).** The gb28181 bridge's
+  access-unit heartbeat (every 300 forwarded frames, ~2.5/min on a
+  steady pull) dropped from info to debug, and the `gb28181-rs`
+  dependency is pinned to main `78afcc0` so the library's media-teardown
+  fix (gb28181-rs#101 — a session to an unreachable peer errors
+  ~100 ms/packet for minutes instead of tearing down after 25 failed
+  access units) ships with the next deployment. The pin returns to
+  crates.io at the next library release.
 - **Talkback upstream capture xruns (~13% frame gap → zero).** The
   upstream mic capture opened with `BufferSize::Default`; on hosts
   whose audio server pins small periods (~21 ms) cpal's reader thread

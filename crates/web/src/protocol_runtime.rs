@@ -1570,7 +1570,11 @@ impl gb28181_rs::frame::FrameSource for StreamManagerFrameSource {
                             };
                             forwarded += 1;
                             if forwarded % 300 == 1 {
-                                tracing::info!(
+                                // Heartbeat cadence for a steady pull is
+                                // operational noise on journald (#2) — the
+                                // send failures and teardown summary are
+                                // what carry signal, and those stay warn+.
+                                tracing::debug!(
                                     forwarded,
                                     nalus = au.nalus.len(),
                                     key = au.is_key_frame,

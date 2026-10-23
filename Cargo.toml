@@ -21,11 +21,12 @@ rust-version = "1.88"
 # carries the new client half (unused here). Same content as the old
 # 02228fd git pin plus the client packages.
 onvif-device-rs = "0.9.0"
-# GB/T 28181 device stack — 0.13.0: the transport-parity package
-# (pagination, negotiated expiry, silence handling, stream transports,
-# passive TCP media, five-query seam, multicast) on top of the v0.12.0
-# closure package.
-gb28181-rs = { version = "0.13.0", features = ["gb35114"] }
+# GB/T 28181 device stack — 0.13.0 + the #100/#101 media-teardown fix
+# (main 78afcc0): an unreachable peer no longer errors ~100ms/包 for
+# minutes — the session tears down after 25 failed access units with a
+# first-warn + summary (#2). Flip back to the crates.io version at the
+# next library release.
+gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs", rev = "78afcc0", features = ["gb35114"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
