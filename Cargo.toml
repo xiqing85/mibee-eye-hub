@@ -24,7 +24,9 @@ onvif-device-rs = "0.9.0"
 # GB/T 28181 device stack — 0.13.1 carries the media-teardown fix
 # (#101): an unreachable peer tears the session down after 25 failed
 # access units instead of erroring ~100ms/packet for minutes (#2).
-gb28181-rs = { version = "0.13.1", features = ["gb35114"] }
+# TEMP pin: catalog PTZType (hub#7 GB PTZ full chain); switch back to
+# crates.io version once the library tags its next release.
+gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs", rev = "1851b3d", features = ["gb35114"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
