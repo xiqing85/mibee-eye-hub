@@ -1185,6 +1185,11 @@ impl ProtocolRuntime {
             // X-GB-Ver negotiation stays opt-in (None = header omitted);
             // matches the mibee-eye-rs/go product defaults.
             protocol_version: None,
+            // A configured external PTZ head (M4-a proxy) means the
+            // channel can pan/tilt/zoom: advertise the §5.4.12 code 3 so
+            // platforms dispatch PTZCmd. Empty endpoint → None → element
+            // omitted (no PTZ).
+            ptz_type: (!config.ptz_onvif_endpoint.is_empty()).then_some(3),
             // 0.13.0 transport-parity keys (extra_channels, multicast_ttl,
             // tls_*, max_sip_message_size, video-param knobs) stay at
             // their defaults — this runtime rides plain UDP.
