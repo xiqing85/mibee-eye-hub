@@ -1605,7 +1605,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1922,7 +1922,7 @@ dependencies = [
 [[package]]
 name = "gb28181-rs"
 version = "0.13.1"
-source = "git+https://github.com/mickeyzzc/gb28181-rs?rev=1851b3d#1851b3d3a3aa7655201bd4b025ecb8c3a90edf7b"
+source = "git+https://github.com/mickeyzzc/gb28181-rs?rev=755ab00#755ab003e33bf651b68e92deef00c050f0f131c9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4258,7 +4258,7 @@ dependencies = [
  "once_cell",
  "socket2 0.5.10",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4673,7 +4673,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5582,7 +5582,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

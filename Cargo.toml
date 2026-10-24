@@ -26,7 +26,7 @@ onvif-device-rs = "0.9.0"
 # access units instead of erroring ~100ms/packet for minutes (#2).
 # TEMP pin: catalog PTZType (hub#7 GB PTZ full chain); switch back to
 # crates.io version once the library tags its next release.
-gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs", rev = "1851b3d", features = ["gb35114"] }
+gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs", rev = "755ab00", features = ["gb35114"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
