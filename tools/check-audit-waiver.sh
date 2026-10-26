@@ -233,6 +233,96 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
+# Waiver 4 — zstd 0.13 / zstd-safe 7.3 / RUSTSEC-2026-0391,0398,0403
+#   (build-only via zip, same island as waiver 2)
+# ════════════════════════════════════════════════════════════════════════════
+# zstd reaches this graph ONLY through `zip 2.4.2` (zstd -> zstd-safe ->
+# zstd-sys), and `zip` itself is only sherpa-onnx-sys's build-script
+# dependency (see waiver 2) — so the flagged decompression flaws live on
+# the build machine that unpacks release archives, never in a shipped
+# binary. The fix lines (zstd >= 0.14, zstd-safe >= 8) are semver-
+# incompatible with zip 2.x's requirements, and cargo maximises the
+# lockfile, so compatible patches (0.13.4 / 7.3.1) would be picked up
+# automatically the day they exist. Fails when:
+#     a. zstd acquires a normal/dev edge for some target;
+#     b. the lockfile crosses a fix line (zip moved on) — dead config;
+#     c. zstd disappears from the lockfile entirely — dead config.
+# (RUSTSEC-2026-0410 / zstd-sys was NOT waived: 2.1.2 is a compatible
+# patch and Cargo.lock was updated to it.)
+
+ZSTD_ADVISORIES="RUSTSEC-2026-0391/0398/0403"
+
+echo "check-audit-waiver: verifying the ${ZSTD_ADVISORIES} (zstd 0.13 line) waiver"
+
+ZSTD_LOCK="$(python3 - <<'PY'
+import re
+lock = open("Cargo.lock", encoding="utf-8").read()
+for block in lock.split("[[package]]"):
+    m = re.search(r'name = "([^"]+)"', block)
+    if m and m.group(1) == "zstd":
+        v = re.search(r'version = "([^"]+)"', block)
+        print(v.group(1) if v else "?")
+        break
+PY
+)"
+ZSTD_SAFE_LOCK="$(python3 - <<'PY'
+import re
+lock = open("Cargo.lock", encoding="utf-8").read()
+for block in lock.split("[[package]]"):
+    m = re.search(r'name = "([^"]+)"', block)
+    if m and m.group(1) == "zstd-safe":
+        v = re.search(r'version = "([^"]+)"', block)
+        print(v.group(1) if v else "?")
+        break
+PY
+)"
+
+# ── 4c. Still in the graph at all? ─────────────────────────────────────────
+if [[ -z "${ZSTD_LOCK}" || -z "${ZSTD_SAFE_LOCK}" ]]; then
+    echo "check-audit-waiver: zstd/zstd-safe is no longer in Cargo.lock." >&2
+    echo "  The waiver is dead config — remove ${ZSTD_ADVISORIES} from tools/audit.toml." >&2
+    fail=1
+fi
+echo "check-audit-waiver: zstd ${ZSTD_LOCK:-?} / zstd-safe ${ZSTD_SAFE_LOCK:-?}"
+
+# ── 4a. Any normal/dev edge for any target? ────────────────────────────────
+ZSTD_NORMAL_DEV="$(cargo tree -i "zstd@${ZSTD_LOCK}" -e normal,dev --target all --features voice 2>/dev/null || true)"
+
+if [[ -n "${ZSTD_NORMAL_DEV//[[:space:]]/}" ]]; then
+    echo "check-audit-waiver: zstd IS compiled for at least one target:" >&2
+    echo "${ZSTD_NORMAL_DEV}" >&2
+    echo >&2
+    echo "  The waiver only covers build-time use through zip. A normal/dev" >&2
+    echo "  edge here is a LIVE vulnerability in the product." >&2
+    echo "  Fix the dependency — do not widen the ignore list." >&2
+    fail=1
+else
+    echo "check-audit-waiver: zstd has no normal/dev edge for any target (build-only, as the waiver assumes)"
+fi
+
+# ── 4b. Has a fix line been crossed? ───────────────────────────────────────
+# Fixes: zstd >= 0.14, zstd-safe >= 8. Crossing either means the advisories
+# no longer apply and the ignore entries are dead config to remove.
+for pair in "zstd:${ZSTD_LOCK}:0.14" "zstd-safe:${ZSTD_SAFE_LOCK}:8.0"; do
+    IFS=':' read -r name ver fixline <<<"${pair}"
+    if python3 -c "
+import sys
+cur = '${ver}'.split('.')
+fix = '${fixline}'.split('.')
+for i in range(max(len(cur), len(fix))):
+    c = int(cur[i]) if i < len(cur) and cur[i].isdigit() else 0
+    f = int(fix[i]) if i < len(fix) and fix[i].isdigit() else 0
+    if c != f:
+        sys.exit(0 if c > f else 1)
+sys.exit(1)
+"; then
+        echo "check-audit-waiver: ${name} ${ver} >= ${fixline} — the advisories no longer apply." >&2
+        echo "  The waiver is dead config — remove ${ZSTD_ADVISORIES} from tools/audit.toml." >&2
+        fail=1
+    fi
+done
+
+# ════════════════════════════════════════════════════════════════════════════
 
 if [[ "${fail}" -ne 0 ]]; then
     exit 1

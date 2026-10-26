@@ -15,6 +15,11 @@ ignore = [
     "RUSTSEC-2026-0369",
     # webpki-roots 0.26 (build-only via ureq — see the third rationale below)
     "RUSTSEC-2026-0381",
+    # zstd 0.13 / zstd-safe 7.3 (build-only via zip — see the fourth
+    # rationale below; one comment, three advisories)
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0398",
+    "RUSTSEC-2026-0403",
 ]
 
 # RUSTSEC-2023-0071 — `rsa`, Marvin Attack (timing side-channel key recovery).
@@ -75,3 +80,28 @@ ignore = [
 # acquires a normal/dev edge (compiled, product-reachable surface), or if
 # the 0.26 line disappears from the lockfile (dead config — remove this
 # entry).
+
+# RUSTSEC-2026-0391/0398/0403 — `zstd` 0.13.3 / `zstd-safe` 7.3.0
+# (decompression flaws: abandoned-stream data leak, Seekable length
+# overflow, uninitialized memory on legacy-frame failure).
+#
+# zstd reaches this lockfile ONLY through `zip 2.4.2` (zstd ->
+# zstd-safe -> zstd-sys), and `zip` itself is only sherpa-onnx-sys's
+# build-script dependency (see the zip rationale above) — the flagged
+# code runs on the build machine that unpacks downloaded release
+# archives and is never compiled into any shipped binary.
+#
+# The fix lines (zstd >= 0.14, zstd-safe >= 8) are semver-incompatible
+# with zip 2.x's requirements; no compatible patched releases exist as
+# of 2026-10-27 (0.13.x tops at 0.13.3, 7.x at 7.3.0), and cargo
+# maximises the lockfile, so a compatible patch is picked up
+# automatically the day it ships.
+#
+# This waiver is CONDITIONAL. `tools/check-audit-waiver.sh` re-derives
+# the justification on every CI run and fails the job if zstd acquires
+# a normal/dev edge (compiled, product-reachable surface), if the
+# lockfile crosses a fix line (zip moved on — dead config), or if
+# zstd leaves the lockfile entirely.
+#
+# NOTE: RUSTSEC-2026-0410 (`zstd-sys`, wasm allocator shim) is NOT
+# waived — 2.1.2 is a compatible patch and Cargo.lock pins it.

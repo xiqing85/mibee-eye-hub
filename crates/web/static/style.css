@@ -2294,3 +2294,90 @@ input[type="range"]::-moz-range-thumb {
   margin-top: 8px; font-size: 12px; color: var(--text-dim, #8b93a1);
 }
 .ambient-level { font-size: 13px; color: var(--text, #dde3ee); min-width: 38px; }
+
+/* ── Live player empty state (camera-less forms / no camera) ────────── */
+#stream-empty { gap: 10px; }
+#stream-empty .stream-empty-hint {
+  font-size: 12px; color: var(--text-3, #6b7280); max-width: 420px;
+  text-align: center; line-height: 1.5;
+}
+#stream-empty span:first-child { display: inline-flex; color: var(--text-3, #6b7280); }
+
+/* ── Model flow graph (SPEC §6 model_call, appendix A #50) — HUD glow skin */
+/* The card sits in the SAME centered content column as the hero and the
+   chat grid (--content-w) — a full-bleed card breaks the page's vertical
+   rhythm (the original complaint). */
+#modelflow-card {
+  max-width: var(--content-w);
+  margin: 0 auto var(--space-sm);
+}
+.modelflow-wrap { overflow-x: auto; }
+#modelflow-svg { display: block; width: 100%; height: auto; min-width: 620px; }
+#modelflow-svg .mf-edge {
+  fill: none; stroke: var(--accent-dim, #009a7a); stroke-width: 1.4; opacity: .55;
+  transition: stroke .25s, opacity .25s, stroke-width .25s;
+}
+#modelflow-svg .mf-edge.flowing { stroke: var(--accent); opacity: 1; stroke-width: 2; }
+#modelflow-svg .mf-node .core {
+  fill: var(--bg-2, rgba(127,127,127,.07));
+  stroke: var(--accent-dim, #009a7a); stroke-width: 1.3; stroke-opacity: .65;
+  transition: fill .25s, stroke .25s, stroke-opacity .25s, filter .25s;
+}
+#modelflow-svg .mf-node .halo {
+  fill: var(--accent-bg); opacity: 0;
+  transition: opacity .3s;
+}
+#modelflow-svg .mf-node.active .halo { opacity: .5; }
+#modelflow-svg .mf-node.anchor .core {
+  stroke-dasharray: 4 3; fill: none; stroke-opacity: .8;
+}
+#modelflow-svg .mf-node.mini .core { stroke-width: 1.1; }
+#modelflow-svg .mf-node.active .core {
+  fill: var(--accent-bg);
+  stroke: var(--accent); stroke-opacity: 1;
+  filter: drop-shadow(0 0 8px var(--accent-bg));
+}
+#modelflow-svg .mf-node.errored .core {
+  stroke: #e5484d; stroke-opacity: 1;
+  filter: drop-shadow(0 0 8px rgba(229,72,77,.4));
+}
+#modelflow-svg .mf-code {
+  text-anchor: middle; font-size: 13px; font-weight: 700;
+  letter-spacing: .12em; fill: var(--text-primary); opacity: .85;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  transition: fill .25s, opacity .25s;
+}
+#modelflow-svg .mf-node.mini .mf-code { font-size: 10px; }
+#modelflow-svg .mf-node.active .mf-code { fill: var(--accent-text); opacity: 1; }
+#modelflow-svg .mf-label {
+  text-anchor: middle; font-size: 11.5px; fill: var(--text-secondary);
+  transition: fill .25s;
+}
+#modelflow-svg .mf-node.mini .mf-label { font-size: 10px; }
+#modelflow-svg .mf-node.active .mf-label { fill: var(--text-primary); }
+#modelflow-svg .mf-meta {
+  text-anchor: middle; font-size: 10.5px;
+  fill: var(--accent-text); opacity: .95;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+#modelflow-svg .mf-node.mini .mf-meta { font-size: 9px; }
+#modelflow-svg .mf-ripple {
+  fill: none; stroke: var(--accent); stroke-width: 1.8; pointer-events: none;
+  transform-box: fill-box; transform-origin: center;
+  animation: mf-ripple .9s cubic-bezier(.2,.7,.3,1) forwards;
+}
+@keyframes mf-ripple {
+  from { transform: scale(.75); opacity: .6; }
+  to { transform: scale(2.1); opacity: 0; }
+}
+#modelflow-svg .mf-pulse { fill: var(--accent); pointer-events: none; }
+#modelflow-svg .mf-packet { fill: var(--accent); pointer-events: none; }
+#modelflow-svg .mf-pulse-halo {
+  fill: var(--accent); pointer-events: none;
+  filter: blur(3px);
+}
+@media (prefers-reduced-motion: reduce) {
+  #modelflow-svg .mf-ripple, #modelflow-svg .mf-pulse,
+  #modelflow-svg .mf-packet, #modelflow-svg .mf-pulse-halo { display: none; }
+}
