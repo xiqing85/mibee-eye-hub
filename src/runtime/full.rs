@@ -202,41 +202,19 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     // Feature-level resource admission (SPEC appendix A #40), before any
     // engine is built. The LLM tier model resolves first (#30-E) so the
     // gate charges the file that will actually load.
-    // Elasticity (M7, SPEC #48): a persisted LLM-tier decision from the
-    // elastic controller overrides the configured model path — the
-    // systematic memory-low-water action behind issue #3. This is the
-    // LLM ladder (full/mid/lite, #30-E vocabulary), NOT the #40 feature
-    // tier (minimal/basic/standard/full) — two different concepts.
-    // Scoped pool: the main pool initializes further down.
-    {
+    // Elasticity (M7, SPEC #48): a persisted LLM-tier decision overrides
+    // the configured model path — the systematic memory-low-water action
+    // behind issue #3. This is the LLM ladder (full/mid/lite, #30-E
+    // vocabulary), NOT the #40 feature tier (minimal/basic/standard/full)
+    // — two different concepts. Scoped pool: the main pool initializes
+    // further down.
+    let pinned_tier = {
         let db_str = args.db_path.to_string_lossy().into_owned();
-        if let Ok(scope) = web::db::init_pool(&db_str).await
-            && let Ok(Some(tier)) =
-                web::db::get_setting(&scope, crate::runtime::elastic::SETTING_TIER).await
-            && crate::runtime::elastic::LADDER.contains(&tier.as_str())
-        {
-            let pinned = match tier.as_str() {
-                "mid" if !config.llm.model_path_mid.is_empty() => {
-                    Some(config.llm.model_path_mid.clone())
-                }
-                "lite" if !config.llm.model_path_lite.is_empty() => {
-                    Some(config.llm.model_path_lite.clone())
-                }
-                _ => None, // full, or a tier with no model configured
-            };
-            if let Some(path) = pinned
-                && path != config.llm.model_path
-            {
-                tracing::info!(
-                    from = %config.llm.model_path,
-                    to = %path,
-                    tier = %tier,
-                    "elastic: persisted LLM-tier decision applies (runtime downgrade)"
-                );
-                config.llm.model_path = path;
-            }
+        match web::db::init_pool(&db_str).await {
+            Ok(scope) => crate::runtime::elastic::consume_persisted_tier(&scope, &config.llm).await,
+            Err(_) => None,
         }
-    }
+    };
 
     let mem = streaming::tools::memory_mib().unwrap_or((0, 0));
     // Named boot tier (#40 named-tier addendum): "auto" (default) derives
@@ -263,20 +241,38 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
             )
         }
     };
-    let (llm_model, llm_tier) = streaming::tools::resolve_llm_tier(
-        &config.llm.model_path,
-        &config.llm.model_path_mid,
-        &config.llm.model_path_lite,
-        config.resources.auto_tier,
-        mem.1,
-        hardware.physical_cores,
-        &config.resources.tier,
-    );
+    let (llm_model, llm_tier): (String, &str) = match pinned_tier.as_deref() {
+        // The consumed elastic decision stands verbatim (issue #12):
+        // boot on the pinned rung's model and label it with the rung. An
+        // auto re-derivation would call the small model "full" (memory
+        // looks free precisely because it is small), strand the ladder
+        // at the top with nothing to climb, and report the wrong tier
+        // to the UI.
+        Some(tier) => (
+            streaming::llm::ladder_path(tier, &config.llm)
+                .unwrap_or_else(|| config.llm.model_path.clone()),
+            tier,
+        ),
+        None => streaming::tools::resolve_llm_tier(
+            &config.llm.model_path,
+            &config.llm.model_path_mid,
+            &config.llm.model_path_lite,
+            config.resources.auto_tier,
+            mem.1,
+            hardware.physical_cores,
+            &config.resources.tier,
+        ),
+    };
     let tier_ctx = streaming::feature_gate::TierContext {
         tier,
         source: tier_source,
         profile: hardware,
     };
+    // The ladder's full rung must keep the real full-tier model (issue
+    // #12): the write-back below only feeds the engine the tiered boot
+    // model — the elastic swap seam keeps the original top rung so a
+    // pinned/tiered boot can still climb back to it.
+    let ladder_full_model = config.llm.model_path.clone();
     if llm_model != config.llm.model_path {
         config.llm.model_path = llm_model;
     }
@@ -761,7 +757,13 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
                 &config.elastic,
             ));
         if chat_engine.is_active() {
-            let swap_cfg = config.llm.clone();
+            // The swap ladder keeps the ORIGINAL full-tier model as its
+            // top rung (issue #12): config.llm.model_path was rewritten
+            // above to the tiered boot model, which must not shrink the
+            // top rung — a pinned/tiered boot has to be able to climb
+            // back to the real thing.
+            let mut swap_cfg = config.llm.clone();
+            swap_cfg.model_path = ladder_full_model;
             let swap_engine = Arc::clone(&chat_engine);
             ctrl = ctrl.with_live_swap(Arc::new(move |tier| {
                 let Some(path) = streaming::llm::ladder_path(&tier, &swap_cfg) else {

@@ -11,6 +11,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use streaming::llm::{LlmConfig, SwapOutcome};
 use web::routes::events::{CameraEvent, EventBus};
 
 /// Settings-bag key the boot path consumes (`config.resources.tier`).
@@ -22,12 +23,14 @@ pub const LADDER: [&str; 3] = ["full", "mid", "lite"];
 /// L2 live-swap seam: swap the running LLM to a tier's model file. Wired
 /// to `ChatEngine::swap_model` (via `llm::ladder_path`) in production;
 /// tests install fakes. `None` = decisions persist for next boot only.
+/// The outcome distinguishes a real swap from a same-path no-op (issue
+/// #12): a mirrored or unconfigured rung must not be reported as one.
 pub type LiveSwapFn = Arc<
     dyn Fn(
             String,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
-        + Send
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<SwapOutcome>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -159,6 +162,29 @@ impl ElasticState {
             tier: initial_tier.to_string(),
             ..Self::default()
         }
+    }
+
+    /// Roll the ladder back after a failed live swap (issue #12): the
+    /// decision still persists as the next boot's floor, but the
+    /// in-memory position must not claim a rung it could not reach —
+    /// otherwise a refused tier-up strands the small model while the
+    /// controller believes it is back at the top.
+    pub fn revert(&mut self, action: &ElasticAction) {
+        match action {
+            ElasticAction::TierDown { from, .. }
+            | ElasticAction::TierUp { from, .. }
+            | ElasticAction::BatteryPin { from, .. } => {
+                if !from.is_empty() {
+                    self.tier = from.clone();
+                }
+                if matches!(action, ElasticAction::BatteryPin { .. }) {
+                    self.battery_latched = false;
+                }
+            }
+            ElasticAction::Noop | ElasticAction::RecommendMinimalForm => {}
+        }
+        // last_action_at intentionally kept: the cooldown still gates
+        // the retry.
     }
 }
 
@@ -357,23 +383,63 @@ impl ElasticController {
                 if matches!(action, ElasticAction::Noop) {
                     continue;
                 }
-                ctrl.apply_and_report(action, now_ms, &event_tx).await;
+                ctrl.apply_with_rollback(action, now_ms, &event_tx).await;
             }
         });
     }
 
+    /// Current ladder position (the in-memory tier label).
+    #[must_use]
+    pub fn tier(&self) -> String {
+        self.state
+            .lock()
+            .map(|st| st.tier.clone())
+            .unwrap_or_default()
+    }
+
+    /// Apply + rollback wrapper the tick uses (issue #12): a refused or
+    /// failed live swap reverts the ladder position so the decision can
+    /// retry after the cooldown instead of silently desyncing from the
+    /// running model. The persisted decision still stands as the next
+    /// boot's floor either way.
+    pub async fn apply_with_rollback(
+        &self,
+        action: ElasticAction,
+        now_ms: u64,
+        event_tx: &EventBus,
+    ) {
+        let applied = self
+            .apply_and_report(action.clone(), now_ms, event_tx)
+            .await;
+        if !applied && let Ok(mut st) = self.state.lock() {
+            st.revert(&action);
+            tracing::info!(
+                tier = %st.tier,
+                "elastic: ladder position reverted after a failed swap — retries after cooldown"
+            );
+        }
+    }
+
     /// Persist tier decisions, attempt the L2 live swap, and emit the
-    /// `scale` event (SPEC #48). The live swap is best-effort: a failed
-    /// swap never cancels the decision — the persisted tier still applies
-    /// at the next boot.
-    pub async fn apply_and_report(&self, action: ElasticAction, now_ms: u64, event_tx: &EventBus) {
+    /// `scale` event (SPEC #48). Returns whether the decision took
+    /// effect at runtime (real swap, same-path no-op, or persistence
+    /// without a seam); `false` marks a failed live swap — the caller
+    /// reverts the ladder and the persistence still applies at the next
+    /// boot.
+    pub async fn apply_and_report(
+        &self,
+        action: ElasticAction,
+        now_ms: u64,
+        event_tx: &EventBus,
+    ) -> bool {
         let reason = match &action {
             ElasticAction::TierDown { .. } => "memory_low",
             ElasticAction::TierUp { .. } => "memory_recovered",
             ElasticAction::BatteryPin { .. } => "battery_powered",
             ElasticAction::RecommendMinimalForm => "memory_critical",
-            ElasticAction::Noop => return,
+            ElasticAction::Noop => return true,
         };
+        let mut applied = true;
         if let ElasticAction::TierDown { to, .. }
         | ElasticAction::TierUp { to, .. }
         | ElasticAction::BatteryPin { to, .. } = &action
@@ -384,11 +450,24 @@ impl ElasticController {
             // still lands on the decided tier.
             if let Some(swap) = &self.swap {
                 match swap(to.clone()).await {
-                    Ok(()) => {
+                    Ok(SwapOutcome::Swapped { .. }) => {
                         tracing::info!(tier = %to, reason, "elastic: LLM live-swapped (no restart)");
                     }
+                    Ok(SwapOutcome::NoopSamePath { .. }) => {
+                        tracing::info!(
+                            tier = %to,
+                            reason,
+                            "elastic: tier rung resolves to the loaded model — no model change \
+                             (slot unconfigured or mirrored); decision recorded"
+                        );
+                    }
                     Err(e) => {
-                        tracing::warn!(error = %e, tier = %to, "elastic: live swap failed — decision persists for next boot");
+                        tracing::warn!(
+                            error = %e,
+                            tier = %to,
+                            "elastic: live swap failed — decision persists for next boot"
+                        );
+                        applied = false;
                     }
                 }
             }
@@ -416,7 +495,53 @@ impl ElasticController {
             reason: reason.to_string(),
             timestamp_ms: now_ms,
         });
+        applied
     }
+}
+
+/// Boot-path consumption of a persisted tier decision (issue #12).
+/// Reads and DELETEs the row — one-shot, so a stale pin can never
+/// relabel every following boot. Returns the pinned tier label so the
+/// boot threads the *effective* tier (label == loaded model) into the
+/// controller and capabilities. The LLM config is deliberately NOT
+/// mutated: the ladder's `full` rung must keep pointing at the real
+/// full-tier model — a pinned boot starts lower on the ladder, it must
+/// not shrink the top rung (else a mid→full "climb" would swap to the
+/// pinned boot model instead of the real one).
+pub async fn consume_persisted_tier(pool: &sqlx::SqlitePool, llm: &LlmConfig) -> Option<String> {
+    let tier = web::db::get_setting(pool, SETTING_TIER)
+        .await
+        .ok()
+        .flatten()?;
+    // One-shot regardless of validity: an unknown value is consumed and
+    // ignored, not left to nag every boot.
+    if let Err(e) = web::db::delete_setting(pool, SETTING_TIER).await {
+        tracing::warn!(
+            error = %e,
+            "elastic: tier pin consumed but not deleted — it will re-apply next boot"
+        );
+    }
+    if !LADDER.contains(&tier.as_str()) {
+        tracing::warn!(tier = %tier, "elastic: persisted tier value not on the ladder — ignored");
+        return None;
+    }
+    let pinned_path = match tier.as_str() {
+        "mid" if !llm.model_path_mid.is_empty() => Some(llm.model_path_mid.clone()),
+        "lite" if !llm.model_path_lite.is_empty() => Some(llm.model_path_lite.clone()),
+        _ => None,
+    };
+    if let Some(path) = pinned_path.as_deref()
+        && path != llm.model_path
+    {
+        tracing::info!(
+            from = %llm.model_path,
+            to = %path,
+            tier = %tier,
+            "elastic: persisted tier decision applies (runtime downgrade)"
+        );
+    }
+    tracing::info!(tier = %tier, "elastic: persisted tier decision consumed (one-shot)");
+    Some(tier)
 }
 
 #[cfg(test)]
@@ -652,10 +777,21 @@ mod tests {
     fn recording_swap(seen: Arc<Mutex<Vec<String>>>) -> LiveSwapFn {
         Arc::new(move |tier| {
             let seen = Arc::clone(&seen);
+            let swapped = tier.clone();
             Box::pin(async move {
-                seen.lock().expect("swap recorder").push(tier);
-                Ok(())
+                seen.lock().expect("swap recorder").push(swapped.clone());
+                Ok(SwapOutcome::Swapped {
+                    from: String::new(),
+                    to: swapped,
+                })
             })
+        })
+    }
+
+    fn noop_swap() -> LiveSwapFn {
+        Arc::new(|tier| {
+            let path = format!("/models/{tier}.gguf");
+            Box::pin(async move { Ok(SwapOutcome::NoopSamePath { path }) })
         })
     }
 
@@ -718,6 +854,101 @@ mod tests {
         assert_eq!(
             web::db::get_setting(&pool, SETTING_TIER).await.unwrap(),
             Some("lite".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn same_path_noop_reports_true_and_persists() {
+        let pool = mem_pool().await;
+        let ctrl = ElasticController::new(pool.clone(), "full").with_live_swap(noop_swap());
+        let bus = web::routes::events::new_event_bus();
+        let applied = ctrl
+            .apply_and_report(
+                ElasticAction::TierDown {
+                    from: "full".into(),
+                    to: "mid".into(),
+                },
+                7,
+                &bus,
+            )
+            .await;
+        // A mirrored/unconfigured rung is not a failure — the decision
+        // stands, it just changes nothing at runtime (issue #12).
+        assert!(applied);
+        assert_eq!(
+            web::db::get_setting(&pool, SETTING_TIER).await.unwrap(),
+            Some("mid".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_swap_rolls_the_ladder_back_for_retry() {
+        let pool = mem_pool().await;
+        let failing: LiveSwapFn = Arc::new(|_| Box::pin(async { anyhow::bail!("guard refused") }));
+        let ctrl = ElasticController::new(pool.clone(), "full").with_live_swap(failing);
+        let bus = web::routes::events::new_event_bus();
+        ctrl.apply_with_rollback(
+            ElasticAction::TierDown {
+                from: "full".into(),
+                to: "mid".into(),
+            },
+            1,
+            &bus,
+        )
+        .await;
+        // Ladder reverted (retry after cooldown) while the decision
+        // persists as the next boot's floor.
+        assert_eq!(ctrl.tier(), "full");
+        assert_eq!(
+            web::db::get_setting(&pool, SETTING_TIER).await.unwrap(),
+            Some("mid".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_persisted_tier_is_one_shot_and_reports_the_rung() {
+        let pool = mem_pool().await;
+        web::db::set_setting(&pool, SETTING_TIER, "lite")
+            .await
+            .expect("seed pin");
+        let llm = LlmConfig {
+            model_path: "big.gguf".into(),
+            model_path_mid: String::new(),
+            model_path_lite: "small.gguf".into(),
+            ..LlmConfig::default()
+        };
+        let pinned = consume_persisted_tier(&pool, &llm).await;
+        assert_eq!(pinned.as_deref(), Some("lite"));
+        // The config is NOT mutated: the caller resolves the boot model
+        // via ladder_path so the ladder's full rung keeps the real
+        // full-tier model.
+        assert_eq!(llm.model_path, "big.gguf");
+        assert_eq!(
+            streaming::llm::ladder_path("lite", &llm).as_deref(),
+            Some("small.gguf")
+        );
+        assert_eq!(
+            web::db::get_setting(&pool, SETTING_TIER).await.unwrap(),
+            None,
+            "one-shot: the row is consumed, not left to re-pin every boot"
+        );
+        // Second boot: nothing left to consume.
+        assert_eq!(consume_persisted_tier(&pool, &llm).await, None);
+    }
+
+    #[tokio::test]
+    async fn consume_persisted_tier_ignores_and_consumes_unknown_values() {
+        let pool = mem_pool().await;
+        web::db::set_setting(&pool, SETTING_TIER, "bogus")
+            .await
+            .expect("seed pin");
+        let llm = LlmConfig::default();
+        assert_eq!(consume_persisted_tier(&pool, &llm).await, None);
+        assert_eq!(llm.model_path, LlmConfig::default().model_path);
+        assert_eq!(
+            web::db::get_setting(&pool, SETTING_TIER).await.unwrap(),
+            None,
+            "garbage values are consumed too, not left to nag every boot"
         );
     }
 
