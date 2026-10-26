@@ -275,7 +275,10 @@
            their model runs, pulses travel the edges as the chain
            advances. Gated on the capability; the hero above is untouched. -->
       <div id="modelflow-card" class="card hidden">
-        <h3><svg class="icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.5" cy="12" r="2.2"/><circle cx="18.5" cy="5.5" r="2.2"/><circle cx="18.5" cy="18.5" r="2.2"/><path d="M7.6 11l8.6-4.6M7.6 13l8.6 4.6"/></svg><span data-i18n="modelflowTitle">Model flow</span></h3>
+        <div class="chat-card-head">
+          <h3><svg class="icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.5" cy="12" r="2.2"/><circle cx="18.5" cy="5.5" r="2.2"/><circle cx="18.5" cy="18.5" r="2.2"/><path d="M7.6 11l8.6-4.6M7.6 13l8.6 4.6"/></svg><span data-i18n="modelflowTitle">Model flow</span></h3>
+          <button type="button" id="mf-help" class="btn-small btn-ghost" aria-haspopup="dialog" data-i18n-title="mfHelpBtn">?</button>
+        </div>
         <p class="card-desc" data-i18n="modelflowDesc"></p>
         <div class="modelflow-wrap"><svg id="modelflow-svg" viewBox="0 0 920 340" preserveAspectRatio="xMidYMid meet" role="img" data-i18n-title="modelflowTitle" aria-label="model flow graph"></svg></div>
       </div>
@@ -618,6 +621,52 @@
     </div>
   </div>
 
+  <!-- Model flow glossary (SPEC #50 presentation layer): every node's
+       model and the meta-line data definitions. Pure static help — no
+       API surface. Opened from the "?" button on the flow card. -->
+  <div id="mf-help-overlay" class="confirm-overlay hidden">
+    <div class="mf-help-box" role="dialog" aria-modal="true" aria-labelledby="mf-help-title">
+      <div class="chat-card-head">
+        <h3 id="mf-help-title" data-i18n="mfHelpTitle">Model flow · help</h3>
+        <button type="button" id="mf-help-close" class="btn-small btn-ghost" data-i18n="mfHelpClose">Close</button>
+      </div>
+      <h4 data-i18n="mfHelpLegendTitle">How to read the graph</h4>
+      <ul class="mf-help-legend">
+        <li><span class="mf-lg-dot"></span><span data-i18n="mfLgFlow"></span></li>
+        <li><span class="mf-lg-dot hot"></span><span data-i18n="mfLgHot"></span></li>
+        <li><span class="mf-lg-ring"></span><span data-i18n="mfLgRipple"></span></li>
+        <li><span class="mf-lg-orb"></span><span data-i18n="mfLgActive"></span></li>
+        <li><span class="mf-lg-orb src"></span><span data-i18n="mfLgSource"></span></li>
+        <li><span class="mf-lg-orb err"></span><span data-i18n="mfLgErr"></span></li>
+      </ul>
+      <h4 data-i18n="mfHelpNodesTitle">Nodes &amp; models</h4>
+      <div class="mf-help-grid">
+        <div class="mf-help-node"><span class="mono mf-help-code">MIC</span><span class="mf-help-body"><b data-i18n="mfMic">麦克风</b><i data-i18n="mfHelpMic"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">ASR</span><span class="mf-help-body"><b data-i18n="mfAsr">听觉识别</b><i data-i18n="mfHelpAsr"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">DEC</span><span class="mf-help-body"><b data-i18n="mfDecision">意图决策</b><i data-i18n="mfHelpDecision"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">LLM</span><span class="mf-help-body"><b data-i18n="mfLlm">思考模型</b><i data-i18n="mfHelpLlm"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">TTS</span><span class="mf-help-body"><b data-i18n="mfTts">语音播报</b><i data-i18n="mfHelpTts"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">OUT</span><span class="mf-help-body"><b data-i18n="mfOut">播报</b><i data-i18n="mfHelpOut"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">CLD</span><span class="mf-help-body"><b data-i18n="mfCloud">云端对话</b><i data-i18n="mfHelpCloud"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">VLM</span><span class="mf-help-body"><b data-i18n="mfVlm">视觉理解</b><i data-i18n="mfHelpVlm"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">CAM</span><span class="mf-help-body"><b data-i18n="mfCam">摄像头</b><i data-i18n="mfHelpCam"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">SND</span><span class="mf-help-body"><b data-i18n="mfAudioAi">声音事件</b><i data-i18n="mfHelpAudioAi"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">SPK</span><span class="mf-help-body"><b data-i18n="mfSpeaker">声纹识别</b><i data-i18n="mfHelpSpeaker"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">MTG</span><span class="mf-help-body"><b data-i18n="mfMeeting">会议转写</b><i data-i18n="mfHelpMeeting"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">DET</span><span class="mf-help-body"><b data-i18n="mfAi">目标检测</b><i data-i18n="mfHelpAi"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">FACE</span><span class="mf-help-body"><b data-i18n="mfFace">人脸识别</b><i data-i18n="mfHelpFace"></i></span></div>
+        <div class="mf-help-node"><span class="mono mf-help-code">OCR</span><span class="mf-help-body"><b data-i18n="mfOcr">文字识别</b><i data-i18n="mfHelpOcr"></i></span></div>
+      </div>
+      <h4 data-i18n="mfHelpDataTitle">Data definitions</h4>
+      <ul class="mf-help-defs">
+        <li><code>模型名 · n=次数 · 耗时</code><span data-i18n="mfDfMeta"></span></li>
+        <li><b data-i18n="mfDfVariantK"></b><span data-i18n="mfDfVariant"></span></li>
+        <li><b>n=</b><span data-i18n="mfDfCount"></span></li>
+        <li><b data-i18n="mfDfDurK"></b><span data-i18n="mfDfDur"></span></li>
+        <li><span data-i18n="mfDfSource"></span></li>
+      </ul>
+    </div>
+  </div>
   <div id="confirm-overlay" class="confirm-overlay hidden">
     <div class="confirm-box" role="dialog" aria-modal="true" aria-labelledby="confirm-msg">
       <div class="confirm-icon" id="confirm-icon"></div>
