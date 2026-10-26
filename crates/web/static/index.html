@@ -191,6 +191,11 @@
           <div class="spinner"></div>
           <span id="stream-loading-label" data-i18n="loading">Loading...</span>
         </div>
+        <div class="stream-loading hidden" id="stream-empty">
+          <span id="stream-empty-icon"></span>
+          <span data-i18n="liveEmptyTitle">No camera picture</span>
+          <span class="stream-empty-hint" data-i18n="liveEmptyHint"></span>
+        </div>
       </div>
 
       <!-- Ambient sound card (extension: audio_level event without voice,
@@ -264,6 +269,15 @@
           <span id="agent-activity" class="agent-activity mono" aria-live="polite"></span>
         </div>
         <canvas id="agent-waveform" height="110" data-i18n-title="waveformTitle" aria-label="voiceprint waveform"></canvas>
+      </div>
+      <!-- Model flow (SPEC §6 model_call + §3.1 observability.model_flow,
+           appendix A #50): live call-chain topology — nodes ripple while
+           their model runs, pulses travel the edges as the chain
+           advances. Gated on the capability; the hero above is untouched. -->
+      <div id="modelflow-card" class="card hidden">
+        <h3><svg class="icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="5.5" cy="12" r="2.2"/><circle cx="18.5" cy="5.5" r="2.2"/><circle cx="18.5" cy="18.5" r="2.2"/><path d="M7.6 11l8.6-4.6M7.6 13l8.6 4.6"/></svg><span data-i18n="modelflowTitle">Model flow</span></h3>
+        <p class="card-desc" data-i18n="modelflowDesc"></p>
+        <div class="modelflow-wrap"><svg id="modelflow-svg" viewBox="0 0 920 340" preserveAspectRatio="xMidYMid meet" role="img" data-i18n-title="modelflowTitle" aria-label="model flow graph"></svg></div>
       </div>
       <div class="assistant-grid">
         <div class="card chat-card">
