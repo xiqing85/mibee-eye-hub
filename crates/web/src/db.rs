@@ -1567,6 +1567,18 @@ pub async fn set_setting(pool: &SqlitePool, key: &str, value: &str) -> Result<()
     Ok(())
 }
 
+/// Delete one setting row. One-shot consumption semantics (issue #12):
+/// a consumed decision must not re-apply on every following boot.
+pub async fn delete_setting(pool: &SqlitePool, key: &str) -> Result<()> {
+    sqlx::query("DELETE FROM settings WHERE key = ?1")
+        .bind(key)
+        .execute(pool)
+        .await
+        .context("Failed to delete setting")?;
+
+    Ok(())
+}
+
 /// List all settings as a vector of (key, value) pairs.
 pub async fn list_settings(pool: &SqlitePool) -> Result<Vec<(String, String)>> {
     let rows =

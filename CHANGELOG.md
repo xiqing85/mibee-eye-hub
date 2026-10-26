@@ -219,6 +219,26 @@
 
 ### Fixed
 
+- **Elastic tier-down action path (issue #12, three defects).** Found by
+  the 2026-10-26 controlled down/up cycle on the workstation instance:
+  (1) a same-path swap (unconfigured or mirrored tier slot) was logged
+  as `LLM live-swapped` while freeing nothing — `swap_model` now returns
+  a `SwapOutcome` and the controller reports the no-op honestly;
+  (2) the 2/3 memory guardrail was direction-blind, so the emergency
+  downsize was refused exactly when memory ran out (609 MiB model vs
+  418 MiB available) — strictly-smaller files now take a park-first
+  swap: the old model leaves the slot before the guard + load, any
+  failure restores it (still fail-closed), and a failed live swap rolls
+  the ladder position back so the decision retries after cooldown
+  instead of silently desyncing; (3) a persisted tier pin was never
+  consumed — every following boot re-applied it and re-labeled the small
+  model as `full` (memory looks free precisely because the model is
+  small), stranding the ladder at the top with no rung to climb. The pin
+  is now one-shot (deleted on read) and the boot threads the pinned
+  label verbatim into the controller and capabilities — while the
+  ladder's full rung keeps the real full-tier model, so a pinned or
+  tiered boot can still climb back to it. Measured on the
+  workstation: a real 4B→0.6B downsize releases ~2.8 GB RSS, no restart.
 - **Log signal-to-noise on network blinks (#2).** The gb28181 bridge's
   access-unit heartbeat (every 300 forwarded frames, ~2.5/min on a
   steady pull) dropped from info to debug, and the `gb28181-rs`

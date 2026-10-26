@@ -165,40 +165,120 @@ impl ChatEngine {
     /// closed). In-flight completions finish on the model they started
     /// with. Swapping in the currently loaded path is a no-op `Ok`.
     ///
+    /// Downgrades (strictly smaller file) park the old model out of the
+    /// slot first (issue #12): the load-first default demands headroom
+    /// the emergency path never has — a smaller model must be loadable
+    /// exactly when memory ran out. In-flight completions keep their own
+    /// `Arc`, so a pinned old model simply fails the guard and is
+    /// restored — still fail-closed.
+    ///
     /// # Errors
     ///
     /// Missing file, the available-memory guardrail, or a load failure.
-    pub async fn swap_model(&self, new_path: &str) -> anyhow::Result<()> {
+    pub async fn swap_model(&self, new_path: &str) -> anyhow::Result<SwapOutcome> {
         // Same-path short-circuit regardless of build features: a tier that
         // resolves to the loaded model needs no swap at all.
         if new_path == self.loaded_model_path() {
-            return Ok(());
+            tracing::info!(
+                path = %new_path,
+                "llm: swap target equals the loaded model — no-op (tier slot unconfigured or mirrored)"
+            );
+            return Ok(SwapOutcome::NoopSamePath {
+                path: new_path.to_string(),
+            });
         }
         #[cfg(feature = "llm")]
         {
             if !std::path::Path::new(new_path).exists() {
                 anyhow::bail!("llm swap: file not found: {new_path}");
             }
-            ensure_model_fits_memory(new_path)?;
-            let path = new_path.to_string();
-            let loaded = tokio::task::spawn_blocking(move || Self::load_model_file(&path))
-                .await
-                .map_err(|e| anyhow::anyhow!("llm swap: load task failed: {e}"))??;
-            let mut slot = self.slot.write();
-            let from = slot.model_path.clone();
-            slot.model = Some(std::sync::Arc::new(loaded));
-            slot.active = true;
-            slot.inactive_reason.clear();
-            slot.model_path = new_path.to_string();
-            drop(slot);
-            tracing::info!(from = %from, to = %new_path, "llm: live model swap applied");
-            Ok(())
+            if is_downgrade(&self.loaded_model_path(), new_path) {
+                self.swap_downgrade(new_path).await
+            } else {
+                ensure_model_fits_memory(new_path)?;
+                let path = new_path.to_string();
+                let loaded = tokio::task::spawn_blocking(move || Self::load_model_file(&path))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("llm swap: load task failed: {e}"))??;
+                let mut slot = self.slot.write();
+                let from = slot.model_path.clone();
+                slot.model = Some(std::sync::Arc::new(loaded));
+                slot.active = true;
+                slot.inactive_reason.clear();
+                slot.model_path = new_path.to_string();
+                drop(slot);
+                tracing::info!(from = %from, to = %new_path, "llm: live model swap applied");
+                Ok(SwapOutcome::Swapped {
+                    from,
+                    to: new_path.to_string(),
+                })
+            }
         }
         #[cfg(not(feature = "llm"))]
         {
             let _ = new_path;
             anyhow::bail!("llm swap: built without the `llm` feature")
         }
+    }
+
+    /// Downgrade swap (issue #12): park the old model so its pages are
+    /// reclaimable for the load, then guard + load the smaller file. Any
+    /// failure restores the parked model — the engine never ends up
+    /// empty because a swap was refused.
+    #[cfg(feature = "llm")]
+    async fn swap_downgrade(&self, new_path: &str) -> anyhow::Result<SwapOutcome> {
+        let parked = {
+            let mut slot = self.slot.write();
+            let old = slot.model.take();
+            slot.active = false;
+            slot.inactive_reason = format!("downgrading to {new_path}");
+            old
+        };
+        let loaded = {
+            let result = async {
+                ensure_model_fits_memory(new_path)?;
+                let path = new_path.to_string();
+                let loaded = tokio::task::spawn_blocking(move || Self::load_model_file(&path))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("llm swap: load task failed: {e}"))??;
+                anyhow::Ok(loaded)
+            }
+            .await;
+            match result {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    let mut slot = self.slot.write();
+                    if slot.model.is_none() {
+                        slot.model = parked;
+                    }
+                    slot.active = true;
+                    slot.inactive_reason.clear();
+                    drop(slot);
+                    anyhow::bail!(
+                        "llm swap: downgrade to {new_path} failed — old model restored: {e:#}"
+                    );
+                }
+            }
+        };
+        let mut slot = self.slot.write();
+        let from = slot.model_path.clone();
+        slot.model = Some(std::sync::Arc::new(loaded));
+        slot.active = true;
+        slot.inactive_reason.clear();
+        slot.model_path = new_path.to_string();
+        drop(slot);
+        tracing::info!(
+            from = %from,
+            to = %new_path,
+            "llm: live model swap applied (downgrade; old model parked for release)"
+        );
+        // Drop the parked reference after the flip: with no in-flight
+        // completion holding the old Arc, its memory frees here.
+        drop(parked);
+        Ok(SwapOutcome::Swapped {
+            from,
+            to: new_path.to_string(),
+        })
     }
 
     /// Whether dialogue is available.
@@ -473,6 +553,30 @@ pub(crate) fn backend_shared() -> &'static llama_cpp_2::llama_backend::LlamaBack
     })
 }
 
+/// What a live swap (`ChatEngine::swap_model`) actually did. The elastic
+/// controller reports these differently (issue #12): a same-path "Ok"
+/// that used to be logged as a swap freed nothing and hid the fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapOutcome {
+    /// A different model file was loaded and installed.
+    Swapped { from: String, to: String },
+    /// The target resolves to the already-loaded model — nothing changed
+    /// (tier slot unconfigured, or mirrored onto the same file).
+    NoopSamePath { path: String },
+}
+
+/// Strict downgrade check by on-disk file size (issue #12): only a
+/// strictly smaller file may take the park-first swap path. Missing
+/// metadata (either side) conservatively reports `false` — the caller
+/// then keeps the load-first semantics.
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
+fn is_downgrade(old_path: &str, new_path: &str) -> bool {
+    match (std::fs::metadata(old_path), std::fs::metadata(new_path)) {
+        (Ok(old), Ok(new)) => new.len() < old.len(),
+        _ => false,
+    }
+}
+
 /// Available memory in bytes from `/proc/meminfo` (`MemAvailable`), or
 /// `None` off Linux / when unreadable (the guardrail is skipped then).
 pub fn available_memory_bytes() -> Option<u64> {
@@ -577,12 +681,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn swap_to_current_path_is_a_no_op() {
+    async fn swap_to_current_path_is_a_reported_no_op() {
         let e = ChatEngine::from_config(&LlmConfig::default());
-        // Even an inactive engine short-circuits on the same path.
-        e.swap_model(&LlmConfig::default().model_path)
+        // Even an inactive engine short-circuits on the same path — now
+        // as an explicit NoopSamePath, not a silent Ok(()) (issue #12).
+        let outcome = e
+            .swap_model(&LlmConfig::default().model_path)
             .await
             .expect("same-path swap is a no-op");
+        assert_eq!(
+            outcome,
+            SwapOutcome::NoopSamePath {
+                path: LlmConfig::default().model_path
+            }
+        );
         assert!(!e.is_active());
+    }
+
+    #[test]
+    fn is_downgrade_compares_file_sizes() {
+        let dir = std::env::temp_dir();
+        let big = dir.join(format!("mibee-llm-big-{}.gguf", std::process::id()));
+        let small = dir.join(format!("mibee-llm-small-{}.gguf", std::process::id()));
+        std::fs::write(&big, vec![0_u8; 2048]).expect("big");
+        std::fs::write(&small, vec![0_u8; 512]).expect("small");
+        let (big, small) = (big.to_str().unwrap(), small.to_str().unwrap());
+        assert!(is_downgrade(big, small), "smaller file is a downgrade");
+        assert!(!is_downgrade(small, big), "larger file is not");
+        assert!(!is_downgrade(big, big), "equal size is not a downgrade");
+        assert!(
+            !is_downgrade(big, "definitely-not-here.gguf"),
+            "missing metadata is conservatively not a downgrade"
+        );
+        let _ = std::fs::remove_file(big);
+        let _ = std::fs::remove_file(small);
     }
 }
