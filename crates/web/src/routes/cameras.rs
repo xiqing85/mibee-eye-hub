@@ -293,6 +293,7 @@ mod tests {
             true,
         ));
         crate::server::AppRouterState {
+            video_capable: true,
             db,
             auth_db,
             active: crate::server::ActiveStreams::default(),

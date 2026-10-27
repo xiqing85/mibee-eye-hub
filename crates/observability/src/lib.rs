@@ -13,6 +13,9 @@ pub mod metrics;
 // Re-export the most commonly used functions for ergonomic access.
 pub use metrics::{
     ModelCallGuard,
+    ModelCallPhase,
+    ModelCallSignal,
+    ModelEventSink,
     ResourceSample,
     dec_recording_active,
     inc_recording_active,
@@ -30,12 +33,14 @@ pub use metrics::{
     increment_rtsp_bytes_sent,
     increment_rtsp_sessions,
     model_call,
+    model_event_sink_installed,
     publish_resource_gauges,
     publish_resource_profile,
     register_metrics,
     render_metrics,
     set_active_streams,
     set_audio_level,
+    set_model_event_sink,
     set_recording_active,
 };
 pub use tracing_setup::init_tracing;

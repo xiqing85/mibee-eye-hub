@@ -37,6 +37,12 @@ pub type SharedTools = Arc<std::sync::RwLock<streaming::tools::ToolsConfig>>;
 
 /// Application state passed to all routes via Extension.
 pub struct AppRouterState {
+    /// Whether this form carries the video family (eye/cam): camera
+    /// management, live transports and watermark are video-surface
+    /// capabilities — a mic/talk form must not advertise them (the UI
+    /// builds its navigation from this, so a camera-less device never
+    /// shows a preview that cannot exist).
+    pub video_capable: bool,
     /// Async pool for web CRUD operations (cameras, settings, protocols)
     pub db: sqlx::SqlitePool,
     /// Blocking connection for security crate calls (auth, sessions)
@@ -554,6 +560,7 @@ pub fn build_app_with_state(state: AppRouterState) -> Router {
             agent_config: agent_config.clone(),
             plugins_loaded: state.plugins_loaded,
             away: away.clone(),
+            video_capable: state.video_capable,
         }))
         // CSP — strict Content-Security-Policy
         .layer(middleware::from_fn(csp_middleware))
@@ -585,6 +592,7 @@ pub fn build_app(db: sqlx::SqlitePool, auth_db: Arc<Mutex<Connection>>) -> Route
         true,
     ));
     build_app_with_state(AppRouterState {
+        video_capable: true,
         db,
         auth_db,
         active: ActiveStreams::default(),
@@ -671,6 +679,7 @@ pub async fn test_app_with_user() -> Router {
         true,
     ));
     crate::server::build_app_with_state(AppRouterState {
+        video_capable: true,
         db: pool,
         auth_db,
         active: ActiveStreams::default(),
@@ -942,6 +951,7 @@ pub async fn run(
         true,
     ));
     let state = AppRouterState {
+        video_capable: true,
         db,
         auth_db,
         active: ActiveStreams::default(),
@@ -1055,6 +1065,7 @@ pub async fn run_with_shutdown(
     models_routing: streaming::model_route::RoutingConfig,
     plugins_loaded: usize,
     away: Arc<crate::away::AwayEngine>,
+    video_capable: bool,
 ) -> anyhow::Result<()> {
     // Register Prometheus metrics
     crate::routes::mark_boot_time();
@@ -1072,6 +1083,7 @@ pub async fn run_with_shutdown(
     crate::observe::spawn_sampler();
 
     let state = AppRouterState {
+        video_capable,
         db,
         auth_db,
         active: ActiveStreams::default(),
@@ -1321,6 +1333,7 @@ mod tests {
             streaming::model_route::RoutingConfig::default(),
             0,
             AppRouterState::away_for_tests(),
+            true,
         ));
 
         // Wait for the TLS listener to accept, then drain it via shutdown.

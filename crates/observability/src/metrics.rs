@@ -294,6 +294,59 @@ pub struct ModelCallGuard {
     finished: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Live model-call signals (SPEC §6 `model_call`, appendix A #50)
+// ---------------------------------------------------------------------------
+
+/// One signal's position in the invocation lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCallPhase {
+    /// The guard was just created — the inference is entering.
+    Start,
+    /// The guard finished — duration and outcome are known.
+    End,
+}
+
+/// A borrowed start/end signal delivered to the installed sink. The web
+/// layer turns these into SSE `model_call` events for the model-flow
+/// graph; metrics/spans stay the durable record either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelCallSignal<'a> {
+    pub model: &'a str,
+    pub variant: &'a str,
+    pub phase: ModelCallPhase,
+    /// Milliseconds, `End` only.
+    pub duration_ms: Option<u64>,
+    /// `false` on a failed invocation, `End` only.
+    pub ok: Option<bool>,
+}
+
+/// Sink type installed once by the runtime that owns the SSE bus.
+pub type ModelEventSink = Box<dyn Fn(ModelCallSignal<'_>) + Send + Sync>;
+
+static MODEL_EVENT_SINK: OnceLock<ModelEventSink> = OnceLock::new();
+
+/// Install the live model-call sink (once). Guards fire it from any
+/// thread — including blocking inference closures — so the sink must be
+/// cheap, non-blocking and panicking-free.
+pub fn set_model_event_sink(sink: ModelEventSink) {
+    if MODEL_EVENT_SINK.set(sink).is_err() {
+        tracing::warn!("model event sink already installed — ignoring the second registration");
+    }
+}
+
+/// Whether the SSE `model_call` stream is live — capabilities gate the
+/// announcement on this (the capability is a fact, not a promise).
+pub fn model_event_sink_installed() -> bool {
+    MODEL_EVENT_SINK.get().is_some()
+}
+
+fn emit_model_signal(signal: ModelCallSignal<'_>) {
+    if let Some(sink) = MODEL_EVENT_SINK.get() {
+        sink(signal);
+    }
+}
+
 /// Begin one model invocation: inflight gauge up + an OTel `model_call`
 /// span that lives until the guard finishes. In blocking closures, pair
 /// it with [`ModelCallGuard::enter`] so nested events/logs attach; in
@@ -311,6 +364,13 @@ pub fn model_call(model: &str, variant: &str) -> ModelCallGuard {
     if let Some(m) = GLOBAL_METRICS.get() {
         m.model_inflight.with_label_values(&[model]).inc();
     }
+    emit_model_signal(ModelCallSignal {
+        model,
+        variant,
+        phase: ModelCallPhase::Start,
+        duration_ms: None,
+        ok: None,
+    });
     ModelCallGuard {
         model: model.to_string(),
         variant: variant.to_string(),
@@ -367,6 +427,13 @@ impl ModelCallGuard {
         if let Some(m) = GLOBAL_METRICS.get() {
             m.record_model_call(&self.model, &self.variant, duration, cpu, errored);
         }
+        emit_model_signal(ModelCallSignal {
+            model: &self.model,
+            variant: &self.variant,
+            phase: ModelCallPhase::End,
+            duration_ms: Some(duration.as_millis() as u64),
+            ok: Some(!errored),
+        });
         if errored {
             // Debug, not warn: fail-open engines (e.g. face matching with
             // no face in frame) can fire this per detection event — the
@@ -731,6 +798,54 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live signals (SPEC §6 `model_call`, appendix A #50): one Start on
+    /// entry, exactly one End (explicit or drop) with duration + outcome.
+    /// The sink is process-global (OnceLock) — everything it must prove
+    /// lives in this single test.
+    #[test]
+    fn model_call_signals_start_then_single_end() {
+        use std::sync::Mutex;
+        #[derive(Debug)]
+        struct Rec(String, ModelCallPhase, Option<u64>, Option<bool>);
+        let seen: std::sync::Arc<Mutex<Vec<Rec>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let recorder = {
+            let seen = std::sync::Arc::clone(&seen);
+            let sink: ModelEventSink = Box::new(move |sig: ModelCallSignal<'_>| {
+                seen.lock().expect("sig").push(Rec(
+                    sig.model.to_string(),
+                    sig.phase,
+                    sig.duration_ms,
+                    sig.ok,
+                ));
+            });
+            sink
+        };
+        set_model_event_sink(recorder);
+        assert!(model_event_sink_installed());
+
+        let guard = model_call("llm", "qwen3-4b");
+        // The drop-only path also emits exactly one End (unknown outcome
+        // counts as non-error per the guard contract).
+        drop(guard);
+        model_call("tts.zh", "melo").finish_ok(None, None);
+        model_call("face.recog", "sface").finish_err();
+
+        let seen = seen.lock().expect("read");
+        assert_eq!(seen.len(), 6, "start+end per call: {seen:?}");
+        assert_eq!(seen[0].0, "llm", "{}", "start carries model only");
+        assert_eq!(seen[0].1, ModelCallPhase::Start);
+        assert_eq!(seen[1].0, "llm");
+        assert_eq!(seen[1].1, ModelCallPhase::End);
+        assert_eq!(seen[1].3, Some(true), "drop = non-error: {seen:?}");
+        assert_eq!(seen[3].3, Some(true), "finish_ok: {seen:?}");
+        assert!(seen[3].2.is_some(), "end carries duration: {seen:?}");
+        assert_eq!(
+            seen[5].3,
+            Some(false),
+            "finish_err marks the failure: {seen:?}"
+        );
+    }
 
     /// The whole public helper family through the registered global:
     /// every counter/gauge must accept its call without panicking and

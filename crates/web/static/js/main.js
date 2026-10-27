@@ -14,6 +14,7 @@ import { handleAlarmEvent, handleAlarmDescription, handleVoiceTranscript } from 
 import { initZones, updateZonesVisibility, refreshZones, renderZonesOverlay } from './zones.js';
 import { initChat, updateChatVisibility, handleChatReplyEvent, refreshChatHistory, handleConversationEvent } from './chat.js';
 import { initWaveform, updateWaveformVisibility, handleAudioLevel } from './waveform.js';
+import { initModelFlow, updateModelFlowVisibility, handleModelCall } from './modelflow.js';
 import { initThink, handleAgentStep, handleTurnFinished, showTurnThinking } from './think.js';
 import { initTools, refreshTools, startToolsPolling } from './tools.js';
 import { initPtz, fetchPtz, updatePtzVisibility, handlePtzEvent } from './ptz.js';
@@ -128,6 +129,7 @@ async function enterApp() {
   initZones();
   initChat();
   initWaveform();
+  initModelFlow();
   initModelMetrics();
   initTraces();
   initThink();
@@ -141,6 +143,7 @@ async function enterApp() {
     ai_model_changed: handleModelChanged,
     model_task: handleModelTask,
     audio_level: handleAudioLevel,
+    model_call: handleModelCall,
     alarm_description: handleAlarmDescription,
     // Hearing records view refreshes itself when a record lands while open.
     alarm: (p) => { handleAlarmEvent(p); recordsSseHook('alarm', p); },
@@ -221,6 +224,7 @@ function applyCapsVisibility() {
   updateAssistantVisibility();
   updateChatVisibility();
   updateWaveformVisibility();
+  updateModelFlowVisibility();
 }
 
 function initShell() {

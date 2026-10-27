@@ -297,7 +297,13 @@ mod tests {
                         .unwrap_or("")
                         .to_string();
                     s2.lock().push(format!("{action}|{body}"));
-                    axum::http::StatusCode::OK
+                    // A real SOAP answer body: an empty 200 reads as an
+                    // auth-ladder-retryable empty body in onvif-rs ≥0.11 and
+                    // would make every command retry to the cap.
+                    (
+                        axum::http::StatusCode::OK,
+                        "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\"><s:Body/></s:Envelope>",
+                    )
                 },
             ),
         );

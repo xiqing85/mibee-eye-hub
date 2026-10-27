@@ -24,6 +24,10 @@ use rusqlite::Connection;
 /// Everything `web::server::run_with_shutdown` needs, as one named
 /// struct — the M2 assembly face.
 pub struct WebServerDeps {
+    /// The form carries the video family (eye/cam) — threaded into the
+    /// capability advertisement so audio-only forms do not promise a
+    /// preview surface.
+    pub video_capable: bool,
     pub host: String,
     pub port: u16,
     pub http_port: u16,
@@ -101,6 +105,7 @@ pub async fn serve(deps: WebServerDeps) -> anyhow::Result<()> {
         models_routing,
         plugins_loaded,
         away,
+        video_capable,
     } = deps;
     web::server::run_with_shutdown(
         &host,
@@ -139,6 +144,7 @@ pub async fn serve(deps: WebServerDeps) -> anyhow::Result<()> {
         models_routing,
         plugins_loaded,
         away,
+        video_capable,
     )
     .await
 }
