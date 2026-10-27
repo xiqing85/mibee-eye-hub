@@ -110,6 +110,32 @@ export function initModelFlow() {
   // Labels re-resolve when the language flips (SVG text is built
   // dynamically, so the data-i18n scan in applyLang never sees it).
   window.addEventListener('langchange', renderLabels);
+  initHelp();
+}
+
+/// Glossary overlay ("?" on the card header): static markup in
+/// index.html; this only wires open/close (button, backdrop, Escape)
+/// with basic focus handling.
+function initHelp() {
+  const btn = $('mf-help');
+  const overlay = $('mf-help-overlay');
+  const close = $('mf-help-close');
+  if (!btn || !overlay || !close) return;
+  const hide = () => {
+    overlay.classList.add('hidden');
+    btn.focus();
+  };
+  btn.addEventListener('click', () => {
+    overlay.classList.remove('hidden');
+    close.focus();
+  });
+  close.addEventListener('click', hide);
+  overlay.addEventListener('click', (ev) => {
+    if (ev.target === overlay) hide();
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && !overlay.classList.contains('hidden')) hide();
+  });
 }
 
 /// Show the card when the device streams model_call (SPEC §3.1

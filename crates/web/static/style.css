@@ -2381,3 +2381,92 @@ input[type="range"]::-moz-range-thumb {
   #modelflow-svg .mf-ripple, #modelflow-svg .mf-pulse,
   #modelflow-svg .mf-packet, #modelflow-svg .mf-pulse-halo { display: none; }
 }
+
+/* ── Model flow glossary overlay (presentation layer of #50) ────────── */
+.mf-help-box {
+  width: 100%;
+  max-width: 660px;
+  max-height: min(80vh, 680px);
+  overflow-y: auto;
+  background: var(--card-solid);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+  box-shadow: var(--shadow-lg);
+  text-align: left;
+  animation: view-in var(--ease-normal);
+}
+.mf-help-box h4 {
+  margin: var(--space-lg) 0 var(--space-sm);
+  font-size: .82rem;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+.mf-help-box h4:first-of-type { margin-top: var(--space-sm); }
+.mf-help-legend {
+  list-style: none;
+  display: grid;
+  gap: 8px;
+  font-size: .85rem;
+  color: var(--text-primary);
+}
+.mf-help-legend li { display: flex; align-items: center; gap: 12px; }
+.mf-lg-dot, .mf-lg-ring, .mf-lg-orb { flex: 0 0 auto; }
+.mf-lg-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent); opacity: .6;
+}
+.mf-lg-dot.hot {
+  opacity: 1;
+  box-shadow: 0 0 8px var(--accent-bg), 0 0 3px var(--accent);
+}
+.mf-lg-ring {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 1.8px solid var(--accent); opacity: .65;
+}
+.mf-lg-orb {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 1.6px solid var(--accent);
+  background: var(--accent-bg);
+  box-shadow: 0 0 7px var(--accent-bg);
+}
+.mf-lg-orb.src {
+  border-style: dashed; background: none;
+  box-shadow: none; opacity: .8;
+}
+.mf-lg-orb.err {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+  box-shadow: 0 0 7px var(--danger-bg);
+}
+.mf-help-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+  gap: 8px 18px;
+}
+.mf-help-node { display: flex; gap: 10px; align-items: baseline; }
+.mf-help-code {
+  flex: 0 0 44px;
+  font-size: .72rem; font-weight: 700;
+  letter-spacing: .1em;
+  color: var(--accent-text);
+}
+.mf-help-body { display: flex; flex-direction: column; gap: 1px; }
+.mf-help-body b { font-size: .85rem; color: var(--text-primary); font-weight: 600; }
+.mf-help-body i {
+  font-style: normal; font-size: .78rem;
+  color: var(--text-secondary); line-height: 1.45;
+}
+.mf-help-defs {
+  list-style: none;
+  display: grid; gap: 8px;
+  font-size: .83rem;
+  color: var(--text-secondary);
+}
+.mf-help-defs li { display: flex; flex-direction: column; gap: 1px; }
+.mf-help-defs b, .mf-help-defs code {
+  color: var(--text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .8rem;
+}
