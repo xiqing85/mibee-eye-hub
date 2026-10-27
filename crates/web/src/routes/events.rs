@@ -209,6 +209,19 @@ pub enum CameraEvent {
         outcome: String,
         timestamp_ms: u64,
     },
+    /// One model invocation's start or end (SPEC §6 `model_call`,
+    /// appendix A #50) — the model-flow graph's live data source. Fed by
+    /// the observability `model_call` guard's global sink; the timestamp
+    /// is set at publish time.
+    ModelCall {
+        model: String,
+        variant: String,
+        /// `"start"` | `"end"`.
+        phase: String,
+        duration_ms: Option<u64>,
+        ok: Option<bool>,
+        timestamp_ms: u64,
+    },
     AgentStep {
         conversation_id: String,
         /// `"tool"` | `"phase"`.
@@ -508,6 +521,25 @@ fn event_wire(event: &CameraEvent) -> (&'static str, String) {
                 "action": action,
                 "outcome": outcome,
                 "timestamp": timestamp_ms,
+            })
+            .to_string(),
+        ),
+        CameraEvent::ModelCall {
+            model,
+            variant,
+            phase,
+            duration_ms,
+            ok,
+            timestamp_ms,
+        } => (
+            "model_call",
+            serde_json::json!({
+                "model": model,
+                "variant": variant,
+                "phase": phase,
+                "duration_ms": duration_ms,
+                "ok": ok,
+                "timestamp_ms": timestamp_ms,
             })
             .to_string(),
         ),

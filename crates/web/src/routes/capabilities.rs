@@ -76,6 +76,11 @@ pub struct CapHandles {
     /// count from the composition root (0 = no plugins configured).
     pub plugins_loaded: usize,
     pub away: Arc<crate::away::AwayEngine>,
+    /// The form carries the video family (eye/cam): gates every
+    /// video-surface key below — a mic/talk form advertises no camera
+    /// management and no live transports, so the UI never builds a
+    /// preview surface for a device that cannot stream.
+    pub video_capable: bool,
 }
 
 #[tracing::instrument(skip_all)]
@@ -101,6 +106,7 @@ pub async fn get_capabilities(
         agent_config,
         plugins_loaded,
         away,
+        video_capable,
     } = h;
     static CACHE: std::sync::OnceLock<CapabilitiesResponse> = std::sync::OnceLock::new();
     let cached = CACHE.get_or_init(|| {
@@ -174,6 +180,12 @@ pub async fn get_capabilities(
     if chat.is_active() || vlm.is_active() {
         events.push("scale");
     }
+    // Live model-call signals (SPEC §6 model_call, appendix A #50): the
+    // observability guard's sink is installed by the runtime that owns
+    // this bus — announcing without it would be a promise, not a fact.
+    if observability::model_event_sink_installed() {
+        events.push("model_call");
+    }
     // Real-time mic level for the voice waveform (SPEC §6 audio_level):
     // fires while any audio consumer keeps the monitor running.
     if voice.is_active() || audio_ai.is_active() || meeting.is_active() {
@@ -206,9 +218,12 @@ pub async fn get_capabilities(
         // Build provenance (mibee-rec#1): version + git sha + dirty flag
         // stamped at compile time — additive wire key, old frontends ignore.
         "build": build_document(),
-        "multi_camera": true,
-        "camera_management": true,
-        "camera_control": true,
+        // Video-surface keys ride the form's video family (eye/cam).
+        // A mic/talk form captures no video, so advertising a preview
+        // surface here would promise what the device cannot stream.
+        "multi_camera": video_capable,
+        "camera_management": video_capable,
+        "camera_control": video_capable,
         "imaging": false,
         "ai": ai.is_active(),
         // Always-on sound-event detection + voice-presence signal
@@ -271,10 +286,10 @@ pub async fn get_capabilities(
         "recording": false,
         // SPEC v1 §5.2: burned into every video output pre-encode; config
         // lives in protocols.watermark (applies at next stream start).
-        "watermark": true,
+        "watermark": video_capable,
         "devices": true,
-        "mjpeg": true,
-        "mse": true,
+        "mjpeg": video_capable,
+        "mse": video_capable,
         // Low-resolution substream (SPEC appendix A #20): advertised
         // while any active stream runs with a substream.
         "substream": stream_manager.any_substream_active().await,
@@ -317,6 +332,10 @@ fn observability_document() -> serde_json::Value {
         // means false for older frontends.
         "traces": true,
         "model_metrics": true,
+        // Live model-call SSE stream (SPEC §6 model_call, appendix A
+        // #50) — the model-flow graph's data source; tracked with the
+        // sink, not promised.
+        "model_flow": observability::model_event_sink_installed(),
     })
 }
 
@@ -397,54 +416,60 @@ mod tests {
 
     /// The capability superset is hand-built JSON — a check that the
     /// watermark key (SPEC v1 §5.2) stays present and true.
+    /// Shared fixture: the full handle set with a chosen video family
+    /// flag (the form gate under test).
+    #[allow(clippy::too_many_lines)]
+    async fn test_handles(video_capable: bool) -> CapHandles {
+        CapHandles {
+            video_capable,
+            ai: Arc::new(AiEngine::from_parts(
+                streaming::ai::AiConfig::default(),
+                None,
+            )),
+            audio_ai: Arc::new(streaming::audio_ai::AudioAiEngine::from_config(
+                &streaming::audio_ai::AudioAiConfig::default(),
+            )),
+            ocr: Arc::new(streaming::ocr::OcrEngine::from_config(
+                &streaming::ocr::OcrConfig::default(),
+            )),
+            voice: Arc::new(streaming::voice::VoiceEngine::from_config(
+                &streaming::voice::VoiceConfig::default(),
+            )),
+            chat: Arc::new(streaming::llm::ChatEngine::from_config(
+                &streaming::llm::LlmConfig::default(),
+            )),
+            llm_tier: Arc::new(LlmTier("manual".into())),
+            resource: Arc::new(streaming::feature_gate::ResourceProfile::unrestricted()),
+            decision: Arc::new(streaming::decision::DecisionEngine::from_config(
+                &streaming::decision::DecisionConfig::default(),
+            )),
+            meeting: Arc::new(streaming::meeting::MeetingEngine::from_config(
+                &streaming::meeting::MeetingConfig::default(),
+                &streaming::voice::VoiceConfig::default(),
+            )),
+            vlm: Arc::new(streaming::vlm::VlmEngine::from_config(
+                &streaming::vlm::VlmConfig::default(),
+            )),
+            face: Arc::new(streaming::face::FaceEngine::from_config(
+                &streaming::face::FaceConfig::default(),
+            )),
+            stream_manager: Arc::new(crate::stream_manager::StreamManager::new()),
+            convlog: Arc::new(crate::conversations::ConversationLog::new(
+                create_test_pool().await,
+                Arc::new(crate::routes::events::new_event_bus()),
+                true,
+            )),
+            agent: crate::server::AppRouterState::agent_for_tests().0,
+            agent_config: crate::server::AppRouterState::agent_for_tests().1,
+            plugins_loaded: 0,
+            away: crate::server::AppRouterState::away_for_tests(),
+        }
+    }
+
     #[tokio::test]
     async fn capabilities_advertise_watermark() {
-        let ai = Arc::new(AiEngine::from_parts(
-            streaming::ai::AiConfig::default(),
-            None,
-        ));
-        let audio_ai = Arc::new(streaming::audio_ai::AudioAiEngine::from_config(
-            &streaming::audio_ai::AudioAiConfig::default(),
-        ));
         let res = get_capabilities(
-            Extension(CapHandles {
-                ai,
-                audio_ai,
-                ocr: Arc::new(streaming::ocr::OcrEngine::from_config(
-                    &streaming::ocr::OcrConfig::default(),
-                )),
-                voice: Arc::new(streaming::voice::VoiceEngine::from_config(
-                    &streaming::voice::VoiceConfig::default(),
-                )),
-                chat: Arc::new(streaming::llm::ChatEngine::from_config(
-                    &streaming::llm::LlmConfig::default(),
-                )),
-                llm_tier: Arc::new(LlmTier("manual".into())),
-                resource: Arc::new(streaming::feature_gate::ResourceProfile::unrestricted()),
-                decision: Arc::new(streaming::decision::DecisionEngine::from_config(
-                    &streaming::decision::DecisionConfig::default(),
-                )),
-                meeting: Arc::new(streaming::meeting::MeetingEngine::from_config(
-                    &streaming::meeting::MeetingConfig::default(),
-                    &streaming::voice::VoiceConfig::default(),
-                )),
-                vlm: Arc::new(streaming::vlm::VlmEngine::from_config(
-                    &streaming::vlm::VlmConfig::default(),
-                )),
-                face: Arc::new(streaming::face::FaceEngine::from_config(
-                    &streaming::face::FaceConfig::default(),
-                )),
-                stream_manager: Arc::new(crate::stream_manager::StreamManager::new()),
-                convlog: Arc::new(crate::conversations::ConversationLog::new(
-                    create_test_pool().await,
-                    Arc::new(crate::routes::events::new_event_bus()),
-                    true,
-                )),
-                agent: crate::server::AppRouterState::agent_for_tests().0,
-                agent_config: crate::server::AppRouterState::agent_for_tests().1,
-                plugins_loaded: 0,
-                away: crate::server::AppRouterState::away_for_tests(),
-            }),
+            Extension(test_handles(true).await),
             Extension(security::middleware::AuthenticatedUser("admin".to_string())),
         )
         .await
@@ -514,6 +539,36 @@ mod tests {
     /// defaults to off and both models are deployment assets. A stock install
     /// therefore rendered the "Enrolled faces" card and clicking enroll
     /// returned 501. The flag must follow the engine's real state.
+    #[tokio::test]
+    async fn audio_forms_do_not_advertise_the_video_surface() {
+        // The user-facing contract: the web builds its navigation from
+        // these keys, so a mic/talk form (no video family) must not
+        // promise a preview that cannot exist.
+        let res = get_capabilities(
+            Extension(test_handles(false).await),
+            Extension(security::middleware::AuthenticatedUser("admin".to_string())),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        for key in [
+            "camera_management",
+            "camera_control",
+            "multi_camera",
+            "mjpeg",
+            "mse",
+            "watermark",
+        ] {
+            assert_eq!(json[key], serde_json::json!(false), "key {key}");
+        }
+        // Non-video keys stay untouched.
+        assert_eq!(json["devices"], serde_json::json!(true));
+        assert_eq!(json["spec_version"], serde_json::json!("1"));
+    }
+
     #[tokio::test]
     async fn face_capability_follows_the_engine_not_a_constant() {
         let res = capabilities_json(Arc::new(streaming::face::FaceEngine::from_config(
@@ -702,6 +757,7 @@ mod tests {
         ));
         let res = get_capabilities(
             Extension(CapHandles {
+                video_capable: true,
                 ai,
                 audio_ai,
                 ocr: Arc::new(streaming::ocr::OcrEngine::from_config(

@@ -584,6 +584,36 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     // hot-plug monitor share one bus with the web server.
     let event_tx = Arc::new(web::routes::events::new_event_bus());
 
+    // Live model-call signals (SPEC §6 `model_call`, appendix A #50):
+    // the observability guard's global start/end hook rides the SSE bus —
+    // installed once here so every model_call site (all 13 classes) feeds
+    // the model-flow graph. The guard fires from blocking inference
+    // threads; broadcast::send is sync-safe, and without this sink the
+    // guard's hook is a no-op (other forms stay quiet, the capability
+    // stays honestly absent).
+    {
+        let bus = Arc::clone(&event_tx);
+        observability::set_model_event_sink(Box::new(move |sig| {
+            let timestamp_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let event = web::routes::events::CameraEvent::ModelCall {
+                model: sig.model.to_string(),
+                variant: sig.variant.to_string(),
+                phase: match sig.phase {
+                    observability::ModelCallPhase::Start => "start",
+                    observability::ModelCallPhase::End => "end",
+                }
+                .to_string(),
+                duration_ms: sig.duration_ms,
+                ok: sig.ok,
+                timestamp_ms,
+            };
+            let _ = bus.send(event);
+        }));
+    }
+
     // Conversation records (SPEC §3.4): the shared dialogue-turn sink for
     // the HTTP chat route, the voice bridge and the record list endpoint.
     let conversations_log = Arc::new(web::conversations::ConversationLog::new(
@@ -1240,6 +1270,10 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     // (M1 final slice: the 34-argument call is assembled in
     // runtime::web_server — the M2 form bins construct the same struct.)
     crate::runtime::web_server::serve(crate::runtime::web_server::WebServerDeps {
+        // Capability advertisement rides the form (issue: the web must
+        // show only what the device can do): eye/cam carry the video
+        // family; mic/talk capture no video and must not promise one.
+        video_capable: crate::runtime::forms::FormProfile::for_form(form).vision_ai,
         host: config.web.host.clone(),
         port: config.web.port,
         http_port: config.web.http_port,

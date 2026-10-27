@@ -7,6 +7,7 @@
 
 import { api } from './api.js';
 import { store, cameraId, hasCap } from './store.js';
+import { icon } from './icons.js';
 import { $, toast } from './ui.js';
 import { t } from './i18n.js';
 import { beginDeviceRestart } from './restart.js';
@@ -233,6 +234,20 @@ export async function startLive() {
   updateQualityButton();
   applyTransform();
   $('stream-error').classList.add('hidden');
+  // Camera-less devices (no camera configured, or a mic/talk form where
+  // the form profile gates video capture off): an engine against
+  // camera '0' would retry a 404 forever behind the loading overlay —
+  // show the honest empty state instead.
+  const camsKnownEmpty = hasCap('camera_management') && Array.isArray(store.cameras)
+    && store.cameras.length === 0;
+  if (!hasCap('camera_management') || camsKnownEmpty) {
+    $('stream-loading').classList.add('hidden');
+    const iconHost = $('stream-empty-icon');
+    if (iconHost && !iconHost.innerHTML) iconHost.innerHTML = icon('video', 40);
+    $('stream-empty').classList.remove('hidden');
+    return;
+  }
+  $('stream-empty').classList.add('hidden');
   $('stream-loading').classList.remove('hidden');
   setLoadingLabel(false);
   $('mjpeg-fallback-badge').classList.add('hidden');
