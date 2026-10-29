@@ -85,6 +85,23 @@ const MODEL_TO_NODE = {
   'ocr': 'ocr',
 };
 
+// `/api/models` catalog capability id → flow node (audio_ai has no
+// switchable model, cloud legs are not local models — both stay
+// event-populated only).
+const CATALOG_TO_NODE = {
+  'llm': 'llm',
+  'vlm': 'vlm',
+  'voice.asr': 'voice.asr',
+  'decision': 'decision',
+  'speaker': 'speaker',
+  'ai': 'ai',
+  'face.recog': 'face.recog',
+  'ocr': 'ocr',
+  'tts.zh': 'tts',
+  'tts.yue': 'tts',
+  'tts.en': 'tts',
+};
+
 const RIPPLE_MIN_GAP_MS = 600;    // per-orb visual throttle (counters stay real)
 const INFLIGHT_RIPPLE_MS = 1400;  // long calls keep pulsing while active
 const AMBIENT_MS = 1500;          // idle spawn interval per link
@@ -364,6 +381,33 @@ function buildGraph() {
   }
   renderLabels();
   startAmbientLoop();
+  prefillFromCatalog();
+}
+
+/// First-screen model names: the /api/models catalog (SPEC §4.9) knows
+/// each capability's active model — seed the orb names from it so the
+/// dialogue row isn't blank on load (a real call still refreshes the
+/// name afterwards; elastic swaps rename on next call as before).
+/// Fail-open: any fetch/parse problem leaves the event-driven behavior.
+async function prefillFromCatalog() {
+  try {
+    const res = await fetch('/api/models');
+    if (!res.ok) return;
+    const body = await res.json();
+    applyModelCatalog(body.data || body);
+  } catch (_) { /* fail-open */ }
+}
+
+/// Apply a /api/models document to the orb name seeds. Exported for the
+/// visual suite (deterministic without racing ambient broadcasts).
+export function applyModelCatalog(doc) {
+  for (const cap of (doc && doc.capabilities) || []) {
+    const node = CATALOG_TO_NODE[cap.id];
+    if (node && cap.active && !state.variant[node]) {
+      state.variant[node] = variantShort(cap.active);
+      renderMeta(node);
+    }
+  }
 }
 
 /// Energy link between two orbs: leaves/enters at the orb borders,
