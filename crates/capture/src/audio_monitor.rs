@@ -113,8 +113,11 @@ impl AudioMonitor {
         // Widen the device period deliberately: old onboard codecs
         // (ALC269-class) overrun their tiny default buffers whenever
         // inference threads preempt the audio callback on weak CPUs.
-        // 2048 frames ≈ 46 ms at 44.1 kHz — latency is irrelevant to a
+        // 4096 frames ≈ 93 ms at 44.1 kHz — latency is irrelevant to a
         // ≥ 32 ms-chunk classifier/wake-word stream, dropped audio is not.
+        // (.41 field data: two voice stacks on a 2C/4T i3 still saw ~1.3
+        // ALSA xruns/hour at 2048 — doubling the period doubles the
+        // preemption tolerance; 2026-10-29.)
         //
         // The enumerated range can lie: PipeWire-era ALSA plugins advertise
         // a wide range but enforce the current quantum at open time, so the
@@ -123,7 +126,7 @@ impl AudioMonitor {
         // constraints) instead of losing sound for the whole run.
         let preferred =
             if let cpal::SupportedBufferSize::Range { min, max } = supported.buffer_size() {
-                Some(cpal::BufferSize::Fixed(2048u32.clamp(*min, *max)))
+                Some(cpal::BufferSize::Fixed(4096u32.clamp(*min, *max)))
             } else {
                 None
             };
