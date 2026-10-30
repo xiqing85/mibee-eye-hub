@@ -104,6 +104,92 @@ pub async fn get_models(
 
 /// `GET /api/models/tasks` — task list (SPEC §4.9).
 #[tracing::instrument(skip_all)]
+/// `GET /api/models/routing` — the live per-capability model routing
+/// (design §6, M5): `{chat:{provider,fallback}, vision:…, asr:…, tts:…}`.
+/// The same document `PUT` accepts; unknown capabilities are local-only.
+#[tracing::instrument(skip_all)]
+pub async fn get_routing(
+    Extension(routing): Extension<Arc<std::sync::RwLock<streaming::model_route::RoutingConfig>>>,
+    Extension(_user): Extension<AuthenticatedUser>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let cfg = routing.read().expect("models routing lock").clone();
+    // The envelope middleware wraps `{data, ok}` — return the bare
+    // document like the cloud routes do.
+    let doc = serde_json::to_value(cfg)
+        .map_err(|e| ApiError::internal(format!("serialize routing: {e}")))?;
+    Ok(Json(doc))
+}
+
+/// `PUT /api/models/routing` — partial merge by capability. Each of
+/// `chat`/`vision`/`asr`/`tts` accepts `{provider, fallback}` with
+/// values `local`|`cloud`; absent capabilities keep their current
+/// selection. Applies immediately (the HTTP chat route and the voice
+/// bridge read the same lock) and persists to the settings bag
+/// (`models.routing`) so the choice survives restarts.
+#[tracing::instrument(skip_all)]
+pub async fn put_routing(
+    Extension(routing): Extension<Arc<std::sync::RwLock<streaming::model_route::RoutingConfig>>>,
+    Extension(db): Extension<SqlitePool>,
+    Extension(_user): Extension<AuthenticatedUser>,
+    body: axum::extract::Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use streaming::model_route::{Provider, RouteSelection, RoutingConfig};
+    let obj = body
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("body must be an object"))?;
+    fn one_selection(v: &serde_json::Value) -> Result<RouteSelection, ApiError> {
+        let o = v
+            .as_object()
+            .ok_or_else(|| ApiError::bad_request("capability value must be an object"))?;
+        let parse = |key: &str| -> Result<Option<Provider>, ApiError> {
+            match o.get(key) {
+                None => Ok(None),
+                Some(p) => match p.as_str() {
+                    Some("local") => Ok(Some(Provider::Local)),
+                    Some("cloud") => Ok(Some(Provider::Cloud)),
+                    _ => Err(ApiError::bad_request(format!(
+                        "{key} must be \"local\" or \"cloud\""
+                    ))),
+                },
+            }
+        };
+        let provider = parse("provider")?;
+        let fallback = parse("fallback")?;
+        Ok(RouteSelection {
+            provider: provider.unwrap_or_default(),
+            fallback: fallback.unwrap_or_default(),
+        })
+    }
+    let mut next: RoutingConfig = routing.read().expect("models routing lock").clone();
+    for (cap, value) in obj {
+        match cap.as_str() {
+            "chat" => next.chat = one_selection(value)?,
+            "vision" => next.vision = one_selection(value)?,
+            "asr" => next.asr = one_selection(value)?,
+            "tts" => next.tts = one_selection(value)?,
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "unknown capability: {other} (chat|vision|asr|tts)"
+                )));
+            }
+        }
+    }
+    let doc =
+        serde_json::to_string(&next).map_err(|e| ApiError::internal(format!("serialize: {e}")))?;
+    crate::db::set_setting(&db, "models.routing", &doc)
+        .await
+        .map_err(|e| ApiError::internal(format!("persist routing: {e}")))?;
+    *routing.write().expect("models routing lock") = next.clone();
+    tracing::info!(
+        chat = ?next.chat.provider,
+        vision = ?next.vision.provider,
+        "models: routing updated"
+    );
+    Ok(Json(
+        json!({ "data": next, "applied": "immediate", "ok": true }),
+    ))
+}
+
 pub async fn list_tasks(
     Extension(mgr): Extension<Arc<ModelManager>>,
     Extension(_user): Extension<AuthenticatedUser>,
@@ -518,5 +604,83 @@ mod tests {
         // yunet survives (still active) and the shared face/ dir stays.
         assert!(dir.join("face/face_detection_yunet_2023mar.onnx").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn routing_endpoints_roundtrip_and_reject_garbage() {
+        use streaming::model_route::Provider;
+        let routing = Arc::new(std::sync::RwLock::new(
+            streaming::model_route::RoutingConfig::default(),
+        ));
+        let app = Router::new()
+            .route("/api/models/routing", get(get_routing).put(put_routing))
+            .layer(Extension(Arc::clone(&routing)))
+            .layer(Extension({
+                let (pool, _auth) = crate::db::create_test_dbs().await;
+                crate::db::run_migrations(&pool).await.expect("migrations");
+                pool
+            }))
+            .layer(Extension(AuthenticatedUser("tester".to_string())));
+        // GET reflects the seed (chat cloud-first, vision local).
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/api/models/routing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        // No envelope middleware in this harness — the bare document.
+        assert_eq!(doc["chat"]["provider"], "cloud");
+        assert_eq!(doc["vision"]["provider"], "local");
+        // PUT flips chat local; the live lock + the persisted settings
+        // row both move.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::put("/api/models/routing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"chat": {"provider": "local", "fallback": "local"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            routing.read().unwrap().effective("chat", true),
+            Provider::Local
+        );
+        // Unknown capability / bad provider value are rejected loudly.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::put("/api/models/routing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"diarize": {"provider": "cloud"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let res = app
+            .oneshot(
+                Request::put("/api/models/routing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"chat": {"provider": "satellite"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }

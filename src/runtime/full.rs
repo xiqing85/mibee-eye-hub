@@ -754,6 +754,26 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
             "cloud: online AI routing active"
         );
     }
+    // Per-capability model routing (design §6, M5): TOML seeds it, the
+    // settings bag (`models.routing`, JSON) overlays any hot change made
+    // through PUT /api/models/routing, and the lock below is shared by
+    // the HTTP chat route and the voice bridge — one knob, everywhere.
+    let models_routing = {
+        let mut routing = config.models.routing.clone();
+        match web::db::get_setting(&pool, "models.routing").await {
+            Ok(Some(s)) => {
+                match serde_json::from_str::<streaming::model_route::RoutingConfig>(&s) {
+                    Ok(hot) => routing = hot,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "models: routing overlay unparsable — keeping TOML seed")
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "models: routing overlay unreadable"),
+            Ok(None) => {}
+        }
+        Arc::new(std::sync::RwLock::new(routing))
+    };
     // Audio AI engine (sound events + voice presence). Fail-open: no
     // microphone, missing models, or a missing ONNX Runtime library leave
     // it inactive.
@@ -1070,6 +1090,7 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         pool: pool.clone(),
         interrupt_enabled: config.voice.interrupt_enable,
         interrupt_confidence: config.voice.interrupt_confidence,
+        routing: Arc::clone(&models_routing),
     }
     .spawn();
 
@@ -1309,7 +1330,7 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         conversations: conversations_log,
         agent: Arc::clone(&agent_registry),
         agent_config: config.agent.clone(),
-        models_routing: config.models.routing.clone(),
+        models_routing: Arc::clone(&models_routing),
         plugins_loaded: config.plugin.len(),
         away: Arc::clone(&away_engine),
     })

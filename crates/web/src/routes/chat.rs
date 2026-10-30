@@ -285,6 +285,7 @@ pub async fn chat(
     Extension(tools): Extension<crate::server::SharedTools>,
     Extension(wake_word): Extension<Arc<crate::routes::capabilities::WakeWord>>,
     Extension(cloud): Extension<Arc<crate::cloud::CloudAi>>,
+    Extension(routing): Extension<Arc<std::sync::RwLock<streaming::model_route::RoutingConfig>>>,
     Extension(convlog): Extension<Arc<crate::conversations::ConversationLog>>,
     Extension(registry): Extension<Arc<crate::agent::ToolRegistry>>,
     Extension(agent_config): Extension<crate::agent::AgentConfig>,
@@ -317,7 +318,20 @@ pub async fn chat(
             .user_text(body.text.clone());
     let camera_id = primary_camera_id(&pool).await;
     let cloud_on = cloud.enabled();
-    let route = route_chat(cloud_on, body.vision, cloud.vision_ready(), vlm.is_active());
+    // M5 routing (design §6): the operator's per-capability declarations
+    // decide cloud vs local before the historic posture kicks in —
+    // `[models.chat] provider = "local"` (or a PUT /api/models/routing)
+    // pins the whole dialogue local; vision stays local unless explicitly
+    // flipped. Before this the live path consulted defaults only — the
+    // TOML knob parsed but never reached the decision (2026-10-30).
+    let routing = routing.read().expect("models routing lock").clone();
+    let route = route_chat_routed(
+        cloud_on,
+        body.vision,
+        cloud.vision_ready(),
+        vlm.is_active(),
+        &routing,
+    );
     let tools_now = tools.read().expect("tools config lock poisoned").clone();
     let ctx = TurnContext {
         scene: camera_id
