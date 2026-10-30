@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- **Triage no longer silently drops substantive speech (SPEC #26 guard,
+  2026-10-30 afternoon).** Field data: the classifier labeled real,
+  deliberately-woken utterances "ignore" at up to 0.91 confidence
+  ("干吗没听到你的声音呐", "你的反应很慢呢") — the user experienced these as
+  "对它说话没反应". An `ignore` verdict may now only drop filler-like
+  transcripts (<5 non-space chars after filler interjections are
+  discounted); substantive speech always fails open to a reply. Second
+  field-data-driven fail-open on this triage (Cantonese was the first).
 - **Conversation latency: VLM inference now yields to the reply it was
   starving (2026-10-30).** Field data from the workstation: with away
   mode armed and a visitor present, every visitor event ran a ~75 s

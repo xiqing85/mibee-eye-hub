@@ -572,6 +572,25 @@ fn cfg_get_f32(cfg: &serde_json::Value, idx: usize) -> f32 {
         .unwrap_or(1.0)
 }
 
+/// Filler syllables discounted by [`triage_substantive`]: ambient-noise
+/// ASR transcribes to chains of interjections ("嗯嗯啊啊的背景声"),
+/// while real speech addressed to the device carries content words.
+const TRIAGE_FILLERS: &[&str] = &[
+    "嗯", "啊", "哦", "呃", "诶", "唉", "呀", "哈", "嘿", "blah", "haha",
+];
+
+/// Whether a transcript carries substantive content for the triage
+/// ignore guard (2026-10-30): ≥[`INTERRUPT_CONTENT_MIN_CHARS`] non-space
+/// characters after filler interjections are discounted.
+#[must_use]
+pub fn triage_substantive(transcript: &str) -> bool {
+    let mut rest = transcript.to_string();
+    for f in TRIAGE_FILLERS {
+        rest = rest.replace(f, "");
+    }
+    rest.chars().filter(|c| !c.is_whitespace()).count() >= INTERRUPT_CONTENT_MIN_CHARS
+}
+
 /// Voice-triage ignore guard. The triage options are written in
 /// Mandarin and the multilingual classifier is out-of-domain on
 /// written Cantonese — it confidently labels real Cantonese
@@ -579,9 +598,19 @@ fn cfg_get_f32(cfg: &serde_json::Value, idx: usize) -> f32 {
 /// silently drops the spoken reply. An "ignore" verdict on a
 /// Cantonese transcript is not trustworthy; fail open to a reply,
 /// like every other uncertain path (speaker_verify, weather).
+///
+/// The same distrust now extends to *substantive* transcripts in any
+/// language (2026-10-30 field data): the wake word fired, so the user
+/// deliberately addressed the device — yet the classifier labeled real
+/// conversational speech "ignore" at up to 0.91 confidence ("干吗没听到
+/// 你的声音呐", "你的反应很慢呢"), producing the "说话没反应" experience.
+/// An "ignore" verdict may now only drop filler-like transcripts; the
+/// answer category covers chit-chat and complaints by definition.
 #[must_use]
 pub fn triage_skips_reply(label: &str, transcript: &str) -> bool {
-    label == "ignore" && crate::lang::detect(transcript) != crate::lang::SpokenLang::Cantonese
+    label == "ignore"
+        && crate::lang::detect(transcript) != crate::lang::SpokenLang::Cantonese
+        && !triage_substantive(transcript)
 }
 
 /// What to do with an utterance that arrives while an answer round is
@@ -808,6 +837,9 @@ mod tests {
     fn triage_ignore_still_skips_mandarin_and_english_noise() {
         assert!(triage_skips_reply("ignore", "嗯嗯啊啊的背景声"));
         assert!(triage_skips_reply("ignore", "blah blah"));
+        // Short/wake-only fragments stay droppable.
+        assert!(triage_skips_reply("ignore", "小蜜蜂"));
+        assert!(triage_skips_reply("ignore", "嗯嗯嗯嗯"));
     }
 
     #[test]
@@ -815,6 +847,19 @@ mod tests {
         assert!(!triage_skips_reply("answer", "现在几点了"));
         assert!(!triage_skips_reply("device", "打开录像"));
         assert!(!triage_skips_reply("answer", "而家几点"));
+    }
+
+    #[test]
+    fn triage_ignore_fails_open_for_substantive_speech() {
+        // Field data 2026-10-30: the classifier labeled these real,
+        // deliberately-woken utterances "ignore" at up to 0.91 — the
+        // user experienced them as "说话没反应".
+        for said in ["干吗没听到你的声音呐", "你的反应很慢呢", "问我是谁嘛"] {
+            assert!(
+                !triage_skips_reply("ignore", said),
+                "substantive speech must not be silently dropped: {said}"
+            );
+        }
     }
 
     #[test]
