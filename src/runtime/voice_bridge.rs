@@ -48,6 +48,12 @@ pub struct VoiceBridge {
     pub pool: sqlx::SqlitePool,
     pub interrupt_enabled: bool,
     pub interrupt_confidence: f32,
+    /// Per-capability model routing (design §6, M5) — shared with the
+    /// HTTP chat route and hot-swapped by `PUT /api/models/routing`.
+    /// The voice legs consult the `chat` capability: `local` pins the
+    /// dialogue on-device, `cloud` keeps the historic cloud-first
+    /// posture (with the #35 local fallback).
+    pub routing: Arc<std::sync::RwLock<streaming::model_route::RoutingConfig>>,
 }
 
 impl VoiceBridge {
@@ -74,6 +80,7 @@ impl VoiceBridge {
             pool: records_pool,
             interrupt_enabled,
             interrupt_confidence,
+            routing,
         } = self;
         let tts_for_away_cmd = Arc::clone(&tts_engine);
         // Conversation session (#30-B): the last 120 s of turns give
@@ -608,6 +615,9 @@ impl VoiceBridge {
                             // draft rides along (SPEC §3.4): success
                             // returns it with the reply; failure returns it
                             // with the error thinking note appended.
+                            // Per-iteration clone: the answer block
+                            // moves the routing Arc into its async move.
+                            let routing = Arc::clone(&routing);
                             let answer = async move {
                                 let mut draft = draft;
                                 // Agent tool loop (SPEC §3.5) — same
@@ -620,8 +630,17 @@ impl VoiceBridge {
                                 // the fast single-shot path.
                                 let voice_tools = !agent_cfg.voice_tool_gate
                                     || streaming::tools::tool_intent(&ev.transcript);
+                                // M5 routing (design §6): the chat
+                                // capability's operator declaration gates
+                                // the cloud leg — `local` keeps every
+                                // voice turn on-device.
+                                let chat_cloud = {
+                                    let r = routing.read().expect("models routing lock");
+                                    r.effective("chat", cloud.enabled())
+                                        == streaming::model_route::Provider::Cloud
+                                };
                                 if agent_registry.agent_ready(&agent_cfg) && voice_tools {
-                                    let cloud_first = cloud.enabled();
+                                    let cloud_first = chat_cloud;
                                     let engine_label = if cloud_first { "cloud" } else { "local" };
                                     let (think_source, model_id) = if cloud_first {
                                         ("cloud.chat", cloud.config().chat_model.clone())
@@ -767,7 +786,10 @@ impl VoiceBridge {
                                         }
                                     }
                                 }
-                                if cloud.enabled() {
+                                // Same M5 gate on the single-shot cloud
+                                // leg: a `local` chat declaration keeps
+                                // the dialogue on-device here too.
+                                if cloud.enabled() && chat_cloud {
                                     let model_id = cloud.config().chat_model.clone();
                                     let mut span = conv_for_answer.span(
                                         "cloud.chat",
@@ -1373,6 +1395,9 @@ mod tests {
             false,
         ));
         VoiceBridge {
+            routing: Arc::new(std::sync::RwLock::new(
+                streaming::model_route::RoutingConfig::default(),
+            )),
             events: events_rx,
             bridge_tx: Arc::clone(&bus_tx),
             chat: Arc::new(ChatEngine::from_config(

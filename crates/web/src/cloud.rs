@@ -27,12 +27,14 @@ const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// Static suggestions surfaced by `GET /api/cloud` — the field accepts any
 /// OpenRouter model id; this list just saves a lookup.
 pub const SUGGEST_CHAT: &[&str] = &[
+    "openrouter/free",
     "openai/gpt-4o-mini",
     "deepseek/deepseek-chat-v3.1",
     "qwen/qwen3-8b",
     "google/gemini-2.5-flash",
 ];
 pub const SUGGEST_VISION: &[&str] = &[
+    "nvidia/nemotron-3.5-super-vl:free",
     "openai/gpt-4o-mini",
     "google/gemini-2.5-flash",
     "qwen/qwen3-vl-8b",
@@ -260,6 +262,14 @@ impl CloudAi {
             "model": model,
             "messages": messages,
             "max_tokens": 512,
+            // Voice-forward posture: a security camera's spoken replies
+            // want direct answers, not hidden deliberation. Several
+            // OpenRouter models otherwise route the whole reply into
+            // the `reasoning` field and return empty `content`
+            // (measured 2026-10-30: openrouter/free → n choices[0]
+            // message content on plain questions). OpenRouter ignores
+            // the knob for models that do not support it.
+            "reasoning": { "enabled": false },
         });
         if with_tools && !tools.is_empty() {
             let defs: Vec<serde_json::Value> = tools

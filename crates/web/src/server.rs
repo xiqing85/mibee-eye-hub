@@ -114,8 +114,10 @@ pub struct AppRouterState {
     /// by the chat route and the voice bridge to gate the loop.
     pub agent_config: crate::agent::AgentConfig,
     /// Per-capability model routing (design §6, M5) — the chat route
-    /// consults it; defaults reproduce the historic posture.
-    pub models_routing: streaming::model_route::RoutingConfig,
+    /// and the voice bridge consult it; hot-swapped by
+    /// PUT /api/models/routing and seeded at boot from `[models]` +
+    /// the persisted settings overlay.
+    pub models_routing: Arc<std::sync::RwLock<streaming::model_route::RoutingConfig>>,
     /// Loaded plugin manifest count (SPEC appendix A #47; 0 = none).
     pub plugins_loaded: usize,
     /// Away mode engine (SPEC v1 §3.6): armed flag + decision state —
@@ -401,6 +403,10 @@ pub fn build_app_with_state(state: AppRouterState) -> Router {
         )
         // AI model manager (SPEC §4.9, capability model_manager)
         .route("/api/models", get(routes::models_api::get_models))
+        .route(
+            "/api/models/routing",
+            get(routes::models_api::get_routing).put(routes::models_api::put_routing),
+        )
         .route("/api/models/tasks", get(routes::models_api::list_tasks))
         .route(
             "/api/models/tasks/{task_id}",
@@ -534,6 +540,7 @@ pub fn build_app_with_state(state: AppRouterState) -> Router {
         .layer(Extension(state.restart_tx.clone()))
         .layer(Extension(state.models.clone()))
         .layer(Extension(state.cloud.clone()))
+        .layer(Extension(state.models_routing.clone()))
         .layer(Extension(conversations.clone()))
         .layer(Extension(meeting.clone()))
         .layer(Extension(agent.clone()))
@@ -647,7 +654,9 @@ pub fn build_app(db: sqlx::SqlitePool, auth_db: Arc<Mutex<Connection>>) -> Route
         conversations,
         agent: AppRouterState::agent_for_tests().0,
         agent_config: AppRouterState::agent_for_tests().1,
-        models_routing: streaming::model_route::RoutingConfig::default(),
+        models_routing: Arc::new(std::sync::RwLock::new(
+            streaming::model_route::RoutingConfig::default(),
+        )),
         plugins_loaded: 0,
         away: AppRouterState::away_for_tests(),
     })
@@ -734,7 +743,9 @@ pub async fn test_app_with_user() -> Router {
         conversations,
         agent: AppRouterState::agent_for_tests().0,
         agent_config: AppRouterState::agent_for_tests().1,
-        models_routing: streaming::model_route::RoutingConfig::default(),
+        models_routing: Arc::new(std::sync::RwLock::new(
+            streaming::model_route::RoutingConfig::default(),
+        )),
         plugins_loaded: 0,
         away: AppRouterState::away_for_tests(),
     })
@@ -982,7 +993,9 @@ pub async fn run(
         conversations,
         agent: AppRouterState::agent_for_tests().0,
         agent_config: AppRouterState::agent_for_tests().1,
-        models_routing: streaming::model_route::RoutingConfig::default(),
+        models_routing: Arc::new(std::sync::RwLock::new(
+            streaming::model_route::RoutingConfig::default(),
+        )),
         plugins_loaded: 0,
         away: AppRouterState::away_for_tests(),
     };
@@ -1062,7 +1075,7 @@ pub async fn run_with_shutdown(
     conversations: Arc<crate::conversations::ConversationLog>,
     agent: Arc<crate::agent::ToolRegistry>,
     agent_config: crate::agent::AgentConfig,
-    models_routing: streaming::model_route::RoutingConfig,
+    models_routing: Arc<std::sync::RwLock<streaming::model_route::RoutingConfig>>,
     plugins_loaded: usize,
     away: Arc<crate::away::AwayEngine>,
     video_capable: bool,
@@ -1330,7 +1343,9 @@ mod tests {
             conversations,
             AppRouterState::agent_for_tests().0,
             AppRouterState::agent_for_tests().1,
-            streaming::model_route::RoutingConfig::default(),
+            Arc::new(std::sync::RwLock::new(
+                streaming::model_route::RoutingConfig::default(),
+            )),
             0,
             AppRouterState::away_for_tests(),
             true,
