@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Model family: Qwen3 → Qwen3.5 (2026-10-30).** The chat LLM and the
+  VLM now point at one unified vision-language model (Qwen3.5-4B Q4_K_M
+  + its mmproj; the elastic mid rung becomes Qwen3.5-2B). Every
+  Qwen3.5 size ships a vision encoder, so one file serves both
+  engines — weights are mmap-shared between the two instances. Landed
+  with it:
+  - llama-cpp-2 `=0.1.157` → `=0.1.160` (bundled llama.cpp with
+    Qwen3.5 + libmtmd support).
+  - The local agent tool-call dialect grew a second arm: Qwen3.5 /
+    Qwen3-Coder emit `<tool_call><function=…><parameter=…>…</function>`
+    XML instead of the Qwen3 JSON body. The tools-section instruction
+    now shows the XML form and `parse_tool_calls` accepts both bodies
+    (mixed-dialect conversation histories keep parsing); XML parameter
+    values inject as strings (stringly-typed schemas).
+
 ### Fixed
 
 - **Triage no longer silently drops substantive speech (SPEC #26 guard,

@@ -173,7 +173,8 @@ enabled = false
 # answers voice interactions when both are enabled.
 [llm]
 enabled = false
-# model_path = "models/llm/qwen3-0.6b-q8_0.gguf"
+# model_path = "models/llm/Qwen3.5-4B-Q4_K_M.gguf"
+# model_path_mid = "models/llm/Qwen3.5-2B-Q4_K_M.gguf"
 # n_ctx = 1024
 # n_threads = 2
 # max_tokens = 200
@@ -224,8 +225,10 @@ enabled = false
 
 [vlm]
 enabled = false
-# model_path = "models/vlm/qwen3-vl-2b-instruct-q4_k_m.gguf"
-# mmproj_path = "models/vlm/mmproj-qwen3-vl-2b-instruct-q8_0.gguf"
+# Qwen3.5 ships a vision encoder in every size — one unified GGUF serves
+# both [llm] and [vlm] (weights are mmap-shared between the engines).
+# model_path = "models/llm/Qwen3.5-4B-Q4_K_M.gguf"
+# mmproj_path = "models/vlm/mmproj-qwen3.5-4b-F16.gguf"
 # n_ctx = 2048
 # n_threads = 2
 # max_tokens = 100
