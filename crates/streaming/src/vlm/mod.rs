@@ -194,26 +194,64 @@ impl VlmEngine {
     pub fn answer_jpeg(&self, jpeg: &[u8], question: &str) -> anyhow::Result<String> {
         #[cfg(feature = "vlm")]
         {
-            let Some(inner) = &self.inner else {
+            let Some(inner) = self.inner.clone() else {
                 anyhow::bail!("vlm inactive: {}", self.inactive_reason);
             };
-            // Background inference is SCHED_BATCH-demoted for the duration:
-            // a VLM description used to saturate the cores and starve the
-            // real-time voice pipeline (observed 2026-10-12: five wake
-            // attempts, zero KWS hits while a description ran). The
-            // context (and its llama worker threads) is created inside
-            // this demoted scope, so they inherit the lower priority — which
-            // is what we want for them, they are background work for the
-            // life of the engine. The *calling* thread is the one that must
-            // come back, because tokio's blocking pool hands it to other
-            // tasks; that is why this uses SCHED_BATCH rather than nice.
-            let _batch = BatchGuard::demote();
-            // Serialize against every other VLM call (see `inner`).
-            // Recover from a poisoned lock rather than bricking the
-            // engine forever — the mutex guards buffers, not invariants.
-            let guard = inner.lock().unwrap_or_else(|p| p.into_inner());
             let call = observability::model_call("vlm", &self.model_variant());
-            match self.run_qa(&guard, jpeg, question) {
+            // Dedicated background thread (2026-10-30). Two demotions,
+            // both on a throwaway thread:
+            //
+            // * `setpriority(nice 19)` — SCHED_BATCH alone proved
+            //   insufficient: at equal nice the vision encode ran ~75 s at
+            //   full tilt and every stalled conversation round's first
+            //   audio landed exactly when the description released the
+            //   cores (workstation field data, 2026-10-30). nice 19 makes
+            //   the encode yield to the LLM decode/KWS threads *inside the
+            //   process*, not just to other processes. It must live on a
+            //   dedicated thread because nice cannot be restored
+            //   unprivileged (see `BatchGuard`'s doc comment) — a pooled
+            //   tokio blocking thread demoted to 19 would poison every
+            //   later task. The context and its ggml workers are created
+            //   inside the demoted scope and inherit it.
+            // * `SCHED_BATCH` — kept for the interactive-scheduler
+            //   behaviour on top of the nice demotion.
+            //
+            // The calling thread blocks on the join — it holds no CPU while
+            // the background thread works.
+            let config = self.config.clone();
+            let owned_jpeg = jpeg.to_vec();
+            let owned_question = question.to_string();
+            let inner_for_thread = std::sync::Arc::clone(&inner);
+            let spawned = std::thread::Builder::new().name("vlm-bg".into()).spawn(
+                move || -> anyhow::Result<String> {
+                    // SAFETY: `setpriority` with `which = PRIO_PROCESS` and
+                    // `who = 0` addresses the calling thread; raising one's
+                    // own nice is always permitted.
+                    unsafe {
+                        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+                    }
+                    let _batch = BatchGuard::demote();
+                    // Serialize against every other VLM call (see
+                    // `inner`). Recover from a poisoned lock rather than
+                    // bricking the engine forever — the mutex guards
+                    // buffers, not invariants.
+                    let guard = inner_for_thread.lock().unwrap_or_else(|p| p.into_inner());
+                    Self::run_qa(&config, &guard, &owned_jpeg, &owned_question)
+                },
+            );
+            let result = match spawned {
+                Ok(handle) => handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("vlm: background thread panicked"))),
+                // Thread spawn failure is the host being out of threads —
+                // run inline with the batch demotion only (fail-open).
+                Err(_) => {
+                    let _batch = BatchGuard::demote();
+                    let guard = inner.lock().unwrap_or_else(|p| p.into_inner());
+                    Self::run_qa(&self.config, &guard, jpeg, question)
+                }
+            };
+            match result {
                 Ok(reply) => {
                     call.finish_ok(None, None);
                     if is_degenerate_output(&reply) {
@@ -247,7 +285,12 @@ impl VlmEngine {
     }
 
     #[cfg(feature = "vlm")]
-    fn run_qa(&self, inner: &VlmInner, jpeg: &[u8], question: &str) -> anyhow::Result<String> {
+    fn run_qa(
+        config: &VlmConfig,
+        inner: &VlmInner,
+        jpeg: &[u8],
+        question: &str,
+    ) -> anyhow::Result<String> {
         use llama_cpp_2::context::params::LlamaContextParams;
         use llama_cpp_2::llama_batch::LlamaBatch;
         use llama_cpp_2::model::AddBos;
@@ -280,9 +323,9 @@ impl VlmEngine {
             .map_err(|e| anyhow::anyhow!("vlm: multimodal tokenize: {e:?}"))?;
 
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(self.config.n_ctx.max(1024)))
+            .with_n_ctx(std::num::NonZeroU32::new(config.n_ctx.max(1024)))
             .with_n_threads(i32::from(
-                u16::try_from(self.config.n_threads.max(1)).unwrap_or(u16::MAX),
+                u16::try_from(config.n_threads.max(1)).unwrap_or(u16::MAX),
             ));
         let mut ctx = inner.model.new_context(backend, ctx_params)?;
 
@@ -313,13 +356,13 @@ impl VlmEngine {
         let mut reply = String::new();
         let mut logits_at = 0_i32;
         let mut recent_tokens: std::collections::VecDeque<i32> = std::collections::VecDeque::new();
-        for pos in (n_pos + 1..).take(self.config.max_tokens as usize) {
+        for pos in (n_pos + 1..).take(config.max_tokens as usize) {
             let mut logits: Vec<f32> = ctx.get_logits_ith(logits_at).to_vec();
             logits_at = 0;
             apply_repeat_penalty(
                 &mut logits,
                 &recent_tokens.iter().copied().collect::<Vec<_>>(),
-                self.config.repeat_penalty,
+                config.repeat_penalty,
             );
             let best = logits
                 .iter()

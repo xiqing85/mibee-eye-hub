@@ -639,6 +639,48 @@ pub fn interrupt_policy(label: &str, confidence: f32, threshold: f32) -> Interru
     }
 }
 
+/// Minimum non-whitespace chars for a mid-round transcript to count as
+/// substantive content in the [`interrupt_content_gate`] (2026-10-30).
+/// Real backchannels are ≤4 chars (嗯 / 对 / 好的 / 嗯嗯嗯嗯 / "yeah");
+/// everything longer deserves a hearing.
+pub const INTERRUPT_CONTENT_MIN_CHARS: usize = 5;
+
+/// The ②.5 tier of the #45 policy (2026-10-30): a *substantive* transcript
+/// is content, not a backchannel, regardless of classifier confidence.
+///
+/// Field data from the workstation 2026-10-30: one two-minute round ignored
+/// ten follow-up utterances — including clear questions (问我是谁嘛 /
+/// 唉呀对不起啊我不应该骂你) — because noisy ASR kept Laya below the
+/// fail-open threshold. Waiting out a stale answer with no way to redirect
+/// it is the worst failure mode of the interrupt gate, worse than a false
+/// supersede (which just re-answers).
+///
+/// The veto: a *confident* backchannel verdict (`label == "backchannel"` at
+/// or above `threshold`) still ignores the utterance, so genuine
+/// acknowledgements (好的没问题 / 哈哈哈哈) do not cancel a reply the user
+/// wants to hear. `label` is `None` when the classifier was unavailable.
+#[must_use]
+pub fn interrupt_content_gate(
+    action: InterruptAction,
+    transcript: &str,
+    label: Option<&str>,
+    confidence: f32,
+    threshold: f32,
+) -> InterruptAction {
+    use InterruptAction::Backchannel;
+    if !matches!(action, Backchannel) {
+        return action;
+    }
+    let chars = transcript.chars().filter(|c| !c.is_whitespace()).count();
+    if chars < INTERRUPT_CONTENT_MIN_CHARS {
+        return action;
+    }
+    if label == Some("backchannel") && confidence >= threshold {
+        return action;
+    }
+    InterruptAction::Supersede
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,6 +731,76 @@ mod tests {
             interrupt_policy("anything-else", 0.99, 0.6),
             InterruptAction::Backchannel,
             "unknown label is never an interrupt"
+        );
+    }
+
+    #[test]
+    fn content_gate_promotes_substantive_utterances() {
+        // Field data 2026-10-30: real questions that sat ignored for a
+        // whole two-minute round because Laya stayed under threshold.
+        for (utterance, label, conf) in [
+            ("问我是谁嘛", Some("backchannel"), 0.55),
+            ("唉呀对不起啊我不应该骂你", None, 0.0),
+            ("这个给你看吧", Some("supersede"), 0.4),
+            ("well well what about this", None, 0.0),
+        ] {
+            let action = interrupt_policy(label.unwrap_or("backchannel"), conf, 0.6);
+            assert_eq!(
+                interrupt_content_gate(action, utterance, label, conf, 0.6),
+                InterruptAction::Supersede,
+                "should supersede on: {utterance}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_gate_keeps_confident_backchannel_verdicts() {
+        assert_eq!(
+            interrupt_content_gate(
+                InterruptAction::Backchannel,
+                "好的没问题",
+                Some("backchannel"),
+                0.9,
+                0.6
+            ),
+            InterruptAction::Backchannel
+        );
+        assert_eq!(
+            interrupt_content_gate(
+                InterruptAction::Backchannel,
+                "哈哈哈哈哈",
+                Some("backchannel"),
+                0.75,
+                0.6
+            ),
+            InterruptAction::Backchannel
+        );
+    }
+
+    #[test]
+    fn content_gate_keeps_short_and_non_backchannel_actions() {
+        // ≤4 chars (whitespace excluded) is backchannel territory.
+        for short in ["嗯嗯嗯嗯", "这么大了", "they", "  好 的  "] {
+            assert_eq!(
+                interrupt_content_gate(InterruptAction::Backchannel, short, None, 0.0, 0.6),
+                InterruptAction::Backchannel,
+                "short utterance stays ignored: {short}"
+            );
+        }
+        // Stop/Supersede verdicts pass through untouched.
+        assert_eq!(
+            interrupt_content_gate(
+                InterruptAction::Stop,
+                "好的没问题",
+                Some("backchannel"),
+                0.9,
+                0.6
+            ),
+            InterruptAction::Stop
+        );
+        assert_eq!(
+            interrupt_content_gate(InterruptAction::Supersede, "嗯", None, 0.0, 0.6),
+            InterruptAction::Supersede
         );
     }
 

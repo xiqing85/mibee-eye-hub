@@ -208,10 +208,12 @@ impl VoiceBridge {
                                 continue;
                             }
                             let interrupt_started = std::time::Instant::now();
+                            let mut content_gated = false;
                             let action = if streaming::decision::stop_words_match(&ev.transcript) {
                                 streaming::decision::InterruptAction::Stop
                             } else {
                                 let mut action = streaming::decision::InterruptAction::Backchannel;
+                                let mut verdict: Option<(String, f32)> = None;
                                 if decision_for_voice.is_active() {
                                     let state_text = format!(
                                         "语音助手正在回答上一个问题时，用户又说：「{}」",
@@ -238,6 +240,13 @@ impl VoiceBridge {
                                     .await
                                         && let Some(d) = d
                                     {
+                                        tracing::debug!(
+                                            label = %d.label,
+                                            confidence = d.confidence,
+                                            transcript = %ev.transcript,
+                                            "voice: interrupt classifier verdict"
+                                        );
+                                        verdict = Some((d.label.clone(), d.confidence));
                                         action = streaming::decision::interrupt_policy(
                                             &d.label,
                                             d.confidence,
@@ -245,7 +254,28 @@ impl VoiceBridge {
                                         );
                                     }
                                 }
-                                action
+                                // ②.5 content gate (#45 amendment 2026-10-30):
+                                // a substantive transcript (≥5 non-space
+                                // chars) is a new question unless the
+                                // classifier *confidently* said backchannel.
+                                // Field data: one round ignored ten real
+                                // follow-ups for two minutes because noisy
+                                // ASR kept Laya below the fail-open bar.
+                                let gated = streaming::decision::interrupt_content_gate(
+                                    action,
+                                    &ev.transcript,
+                                    verdict.as_ref().map(|(l, _)| l.as_str()),
+                                    verdict.as_ref().map_or(0.0, |(_, c)| *c),
+                                    interrupt_confidence,
+                                );
+                                content_gated = matches!(
+                                    action,
+                                    streaming::decision::InterruptAction::Backchannel
+                                ) && matches!(
+                                    gated,
+                                    streaming::decision::InterruptAction::Supersede
+                                );
+                                gated
                             };
                             match action {
                                 streaming::decision::InterruptAction::Stop => {
@@ -309,10 +339,15 @@ impl VoiceBridge {
                                     // Fall through: this utterance becomes
                                     // the new round below (the dying round
                                     // records itself as interrupted).
+                                    let (src, note) = if content_gated {
+                                        ("rule", "长话语（≥5字）— 按新问题处理，已取消上一轮回答")
+                                    } else {
+                                        ("laya", "新问题 — 已取消上一轮回答")
+                                    };
                                     draft = draft.think(
                                         "interrupt",
-                                        "laya",
-                                        "新问题 — 已取消上一轮回答",
+                                        src,
+                                        note,
                                         interrupt_started.elapsed().as_millis() as u64,
                                     );
                                 }
@@ -497,8 +532,14 @@ impl VoiceBridge {
                             };
                             let grounded =
                                 if ctx.scene.is_some() { "scene" } else { "none" }.to_string();
-                            // Session history: keep the last 8 turns if the
-                            // conversation is younger than 120 s.
+                            // Session history: keep the last 4 turns if the
+                            // conversation is younger than 120 s. Voice
+                            // prefill is paid on the latency path every
+                            // turn (~28 ms/token on the workstation), and
+                            // 8 turns measured 442 prompt tokens for a
+                            // plain chit-chat round (2026-10-30); four
+                            // exchanges of context is plenty for spoken
+                            // follow-ups. HTTP keeps its longer window.
                             let history_turns = {
                                 let slot = conversation.lock().expect("conversation slot lock");
                                 slot.as_ref()
@@ -506,7 +547,7 @@ impl VoiceBridge {
                             };
                             let mut turns =
                                 vec![web::routes::chat::build_system_turn(&ctx, &ev.transcript)];
-                            turns.extend(history_turns.iter().take(8).cloned());
+                            turns.extend(history_turns.iter().take(4).cloned());
                             turns.push(streaming::llm::ChatTurn {
                                 role: "user".into(),
                                 content: ev.transcript.clone(),

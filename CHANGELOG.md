@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Conversation latency: VLM inference now yields to the reply it was
+  starving (2026-10-30).** Field data from the workstation: with away
+  mode armed and a visitor present, every visitor event ran a ~75 s
+  vision-tower encode at the same scheduling weight as the LLM decode,
+  and every conversation round's first audio landed exactly when the
+  description released the cores (48–81 s speech→reply). VLM calls now
+  run on a dedicated throwaway thread demoted to `nice 19` (+
+  `SCHED_BATCH`): the context and its ggml workers inherit the demotion,
+  and because the thread is never returned to a pool, the
+  unrestoreable-nice pitfall documented on `BatchGuard` cannot recur.
+  Descriptions soak up idle cycles only; the reply keeps the cores.
+- **Interrupt gate: substantive follow-ups are no longer swallowed as
+  backchannel (SPEC #45 ③, 2026-10-30).** One two-minute round ignored
+  ten real follow-up questions ("问我是谁嘛"…) because noisy ASR kept
+  the Laya classifier under the fail-open threshold. A ≥5-non-space-char
+  transcript now supersedes unless Laya *confidently* voted backchannel
+  (real acknowledgements keep their veto).
+- **Voice-turn prefill halved.** The voice path sent the last 8 session
+  turns as prompt (442 prompt tokens measured on a plain chit-chat
+  round; ~28 ms/token prefill on this host); it now sends 4 — enough
+  context for spoken follow-ups, ~100+ tokens less prefill per turn.
+  HTTP keeps its longer window.
+
 ### Added
 
 - **Four form-factor binaries (roadmap #6 M2).** The single `mibee-eye`
