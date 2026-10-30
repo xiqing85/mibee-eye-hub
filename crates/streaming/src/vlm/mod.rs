@@ -235,8 +235,8 @@ impl VlmEngine {
                     // `inner`). Recover from a poisoned lock rather than
                     // bricking the engine forever — the mutex guards
                     // buffers, not invariants.
-                    let guard = inner_for_thread.lock().unwrap_or_else(|p| p.into_inner());
-                    Self::run_qa(&config, &guard, &owned_jpeg, &owned_question)
+                    let mut guard = inner_for_thread.lock().unwrap_or_else(|p| p.into_inner());
+                    Self::run_qa(&config, &mut guard, &owned_jpeg, &owned_question)
                 },
             );
             let result = match spawned {
@@ -247,8 +247,8 @@ impl VlmEngine {
                 // run inline with the batch demotion only (fail-open).
                 Err(_) => {
                     let _batch = BatchGuard::demote();
-                    let guard = inner.lock().unwrap_or_else(|p| p.into_inner());
-                    Self::run_qa(&self.config, &guard, jpeg, question)
+                    let mut guard = inner.lock().unwrap_or_else(|p| p.into_inner());
+                    Self::run_qa(&self.config, &mut guard, jpeg, question)
                 }
             };
             match result {
@@ -287,13 +287,12 @@ impl VlmEngine {
     #[cfg(feature = "vlm")]
     fn run_qa(
         config: &VlmConfig,
-        inner: &VlmInner,
+        inner: &mut VlmInner,
         jpeg: &[u8],
         question: &str,
     ) -> anyhow::Result<String> {
         use llama_cpp_2::context::params::LlamaContextParams;
         use llama_cpp_2::llama_batch::LlamaBatch;
-        use llama_cpp_2::model::AddBos;
         use llama_cpp_2::mtmd::{MtmdBitmap, MtmdInputText};
         use llama_cpp_2::token::LlamaToken;
 
@@ -333,14 +332,12 @@ impl VlmEngine {
         // No logits here: the helper bypasses the Rust wrapper's
         // initialized-logits bookkeeping, so the first generated token is
         // seeded by decoding the assistant newline through the wrapper.
+        // 0.1.160 takes the mtmd helper and the context mutably.
         let n_pos = chunks
-            .eval_chunks(&inner.mtmd, &ctx, 0, 0, 512, false)
+            .eval_chunks(&mut inner.mtmd, &mut ctx, 0, 0, 512, false)
             .map_err(|e| anyhow::anyhow!("vlm: multimodal eval: {e:?}"))?;
 
-        let nl_tokens = inner
-            .model
-            .str_to_token("\n", AddBos::Never)
-            .map_err(|e| anyhow::anyhow!("vlm: newline tokenize: {e:?}"))?;
+        let nl_tokens = inner.model.vocab().tokenize(b"\n", false, false);
         let nl = nl_tokens
             .first()
             .copied()
@@ -375,15 +372,13 @@ impl VlmEngine {
             if recent_tokens.len() > 64 {
                 recent_tokens.pop_front();
             }
-            if inner.model.is_eog_token(token) {
+            if inner.model.vocab().is_eog(token) {
                 break;
             }
-            // Same detokenize call the chat engine uses (special=false:
-            // pieces of ordinary tokens only, specials never generate).
-            let piece = inner
-                .model
-                .token_to_piece_bytes(token, 16, false, None)
-                .map_err(|e| anyhow::anyhow!("vlm: detokenize: {e:?}"))?;
+            // Same detokenize semantics the chat engine uses
+            // (special=false: pieces of ordinary tokens only, specials
+            // never generate).
+            let piece = inner.model.vocab().token_to_piece(token, false, None);
             reply.push_str(&String::from_utf8_lossy(&piece));
             let mut next = LlamaBatch::new(1, 1);
             next.add(token, pos, &[0], true)?;

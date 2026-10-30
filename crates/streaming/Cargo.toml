@@ -74,7 +74,7 @@ sherpa-onnx = { version = "=1.13.8", optional = true }
 # default-features off: no openmp (the statically linked sherpa-onnx
 # already embeds its own OpenMP runtime — two static OpenMP copies in one
 # binary corrupt each other's init and abort with bad_alloc).
-llama-cpp-2 = { version = "=0.1.157", optional = true, default-features = false }
+llama-cpp-2 = { version = "=0.1.160", optional = true, default-features = false }
 
 [dev-dependencies]
 axum.workspace = true

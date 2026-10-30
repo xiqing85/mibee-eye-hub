@@ -347,10 +347,15 @@ pub struct FeatureInput {
 /// Estimated resident MiB for the given model files: the on-disk bytes
 /// rounded up to MiB, scaled ×1.15 (ORT sessions keep weights resident;
 /// llama.cpp mmap touches roughly the file over a conversation).
+/// `billed` lists files already paid for by an admitted feature — they
+/// cost nothing here (llama.cpp loads weights via shared mmap, so two
+/// engines pointing at one GGUF keep one resident copy; the unified
+/// Qwen3.5 chat+vision model is exactly that shape).
 #[must_use]
-pub fn file_cost_mib(paths: &[String]) -> u64 {
+pub fn file_cost_mib_shared(paths: &[String], billed: &std::collections::HashSet<String>) -> u64 {
     let bytes: u64 = paths
         .iter()
+        .filter(|p| !billed.contains(*p))
         .filter_map(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .sum();
@@ -358,8 +363,15 @@ pub fn file_cost_mib(paths: &[String]) -> u64 {
     (mib * 115).div_ceil(100)
 }
 
+/// [`file_cost_mib_shared`] with nothing pre-billed — the standalone
+/// per-feature cost.
+#[must_use]
+pub fn file_cost_mib(paths: &[String]) -> u64 {
+    file_cost_mib_shared(paths, &std::collections::HashSet::new())
+}
+
 /// Greedy priority-order admission (pure; file sizes are the only I/O,
-/// via [`file_cost_mib`]).
+/// via [`file_cost_mib_shared`]).
 ///
 /// `mode = "all"` admits every enabled feature (legacy behaviour --
 /// tier irrelevant, applied tier reported as `full`); anything else is
@@ -370,7 +382,10 @@ pub fn file_cost_mib(paths: &[String]) -> u64 {
 /// honestly). A feature whose dependency was not admitted is reported
 /// `dependency` (and costs nothing — it will not start). Budget
 /// overflow marks `off_budget` but keeps scanning: cheaper
-/// lower-priority features may still fit.
+/// lower-priority features may still fit. Files already billed by an
+/// admitted earlier feature are not charged again (mmap-shared
+/// weights) — a later feature's `cost_mib` is its incremental
+/// residency.
 #[must_use]
 pub fn plan(
     inputs: &[FeatureInput],
@@ -387,9 +402,10 @@ pub fn plan(
         available_mib.saturating_sub(reserve_mib)
     };
     let mut used = 0_u64;
+    let mut billed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut decisions = Vec::with_capacity(inputs.len());
     for f in inputs {
-        let cost = file_cost_mib(&f.model_paths) + f.overhead_mib;
+        let cost = file_cost_mib_shared(&f.model_paths, &billed) + f.overhead_mib;
         if !f.enabled {
             decisions.push(FeatureDecision {
                 name: f.name,
@@ -431,6 +447,10 @@ pub fn plan(
         let admitted = used.saturating_add(cost) <= budget;
         if admitted {
             used += cost;
+            // Charge the files to the budget once; a later feature
+            // pointing at the same GGUF (unified chat+vision model)
+            // pays only its incremental residency.
+            billed.extend(f.model_paths.iter().cloned());
         }
         decisions.push(FeatureDecision {
             name: f.name,
@@ -472,6 +492,49 @@ mod tests {
             overhead_mib: mib,
             depends_on: None,
         }
+    }
+
+    #[test]
+    fn shared_weights_are_billed_once_across_features() {
+        // The unified Qwen3.5 shape: [llm] and [vlm] point at one GGUF
+        // (mmap-shared), vlm additionally loads an mmproj. Before the
+        // shared-path accounting the gate double-billed the weights and
+        // shed vlm on a 15 GiB host (2026-10-30 field report).
+        let dir = std::env::temp_dir().join(format!("fgate-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let weights = dir.join("unified.gguf");
+        let mmproj = dir.join("mmproj.gguf");
+        std::fs::write(&weights, vec![0_u8; 3 * 1024 * 1024]).unwrap();
+        std::fs::write(&mmproj, vec![0_u8; 1024 * 1024]).unwrap();
+        let inputs = vec![
+            FeatureInput {
+                name: "llm",
+                enabled: true,
+                model_paths: vec![weights.to_string_lossy().into_owned()],
+                overhead_mib: 64,
+                depends_on: None,
+            },
+            FeatureInput {
+                name: "vlm",
+                enabled: true,
+                model_paths: vec![
+                    weights.to_string_lossy().into_owned(),
+                    mmproj.to_string_lossy().into_owned(),
+                ],
+                overhead_mib: 64,
+                depends_on: None,
+            },
+        ];
+        let profile = plan(&inputs, "auto", &tctx(Tier::Full), 8000, 8000, 512);
+        let llm = profile.features.iter().find(|d| d.name == "llm").unwrap();
+        let vlm = profile.features.iter().find(|d| d.name == "vlm").unwrap();
+        assert!(llm.admitted);
+        assert!(vlm.admitted, "shared weights must not double-bill");
+        // llm pays 3 MiB ×1.15 + 64; vlm pays only the mmproj
+        // (1 MiB ×1.15) + 64 — the 3 MiB weights cost nothing twice.
+        assert_eq!(llm.cost_mib, (3_u64 * 115).div_ceil(100) + 64);
+        assert_eq!(vlm.cost_mib, 115_u64.div_ceil(100) + 64);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Config-pinned context (`Full` reproduces the pre-tier semantics

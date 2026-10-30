@@ -201,9 +201,12 @@ fn feedback(turns: &mut Vec<ChatTurn>, name: &str, text: &str) {
 
 // ─── Qwen3 local formatting/parsing ──────────────────────────────────
 
-/// The `# Tools` system-section fragment per the Qwen3 chat template
+/// The `# Tools` system-section fragment per the Qwen chat template
 /// convention: JSON tool definitions inside <tools>, instructions to
-/// emit <tool_call> JSON.
+/// emit `<tool_call>`. Qwen3.5 moved the *call* dialect to the
+/// Qwen3-Coder XML form (`<function=…><parameter=…>`); the instruction
+/// shows that form, and [`parse_tool_calls`] accepts both it and the
+/// older JSON body — a model trained on either dialect works.
 pub fn qwen_tools_section(specs: &[ToolSpec]) -> String {
     // Prefill dominates CPU inference (~28 ms/token on a laptop-class
     // core), so the section is kept minimal: single-line JSON and a
@@ -222,15 +225,69 @@ pub fn qwen_tools_section(specs: &[ToolSpec]) -> String {
         })
         .collect();
     format!(
-        "\n\n# Tools\n\n如需外部信息或设备能力，可调用下列函数（签名见 <tools>）：\n<tools>\n{}\n</tools>\n\n调用时仅输出：\n<tool_call>\n{{\"name\": \"<name>\", \"arguments\": {{...}}}}\n</tool_call>",
+        "\n\n# Tools\n\n如需外部信息或设备能力，可调用下列函数（签名见 <tools>）：\n<tools>\n{}\n</tools>\n\n调用时仅输出：\n<tool_call>\n<function=名称>\n<parameter=参数名>值</parameter>\n</function>\n</tool_call>",
         serde_json::to_string(&defs).unwrap_or_default()
     )
 }
 
-/// Extract `<tool_call>{"name":…,"arguments":{…}}</tool_call>` blocks
-/// from a model reply. Tolerant of surrounding prose/think blocks;
-/// malformed JSON inside a marker is skipped (that call is lost, the
-/// rest still parse). Empty output = no calls.
+/// Parse one `<tool_call>` body in the Qwen3.5/Qwen3-Coder XML dialect:
+/// `<function=name>…<parameter=key>value</parameter>…</function>`.
+/// Tolerant of newlines and stray whitespace anywhere; a `function`
+/// header without parameters yields an empty argument object.
+fn parse_xml_tool_call(body: &str) -> Option<ParsedToolCall> {
+    let start = body.find("<function=")?;
+    let after = &body[start + "<function=".len()..];
+    let name_end = after.find('>')?;
+    let name = after[..name_end].trim();
+    if name.is_empty() || name.contains('<') {
+        return None;
+    }
+    let mut arguments = serde_json::Map::new();
+    let mut rest = &after[name_end + 1..];
+    while let Some(p) = rest.find("<parameter=") {
+        let after_p = &rest[p + "<parameter=".len()..];
+        let Some(k_end) = after_p.find('>') else {
+            break;
+        };
+        let key = after_p[..k_end].trim().to_string();
+        let Some(v_close) = after_p[k_end + 1..].find("</parameter>") else {
+            break;
+        };
+        let value = after_p[k_end + 1..k_end + 1 + v_close].trim();
+        if !key.is_empty() && !key.contains('<') {
+            // Values arrive as raw text; keep them as JSON strings —
+            // tool schemas here take stringly-typed inputs, and a
+            // non-string would need the schema to disambiguate.
+            arguments.insert(key, serde_json::Value::String(value.to_string()));
+        }
+        rest = &after_p[k_end + 1 + v_close + "</parameter>".len()..];
+    }
+    Some(ParsedToolCall {
+        name: name.to_string(),
+        arguments: serde_json::Value::Object(arguments),
+    })
+}
+
+/// Parse one `<tool_call>` body in the Qwen3 JSON dialect:
+/// `{"name":…,"arguments":{…}}`.
+fn parse_json_tool_call(body: &str) -> Option<ParsedToolCall> {
+    let v = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return None;
+    }
+    Some(ParsedToolCall {
+        name: name.to_string(),
+        arguments: v.get("arguments").cloned().unwrap_or(serde_json::json!({})),
+    })
+}
+
+/// Extract `<tool_call>` blocks from a model reply. Two bodies are
+/// accepted: the Qwen3 JSON form (`{"name":…,"arguments":{…}}`) and
+/// the Qwen3.5/Qwen3-Coder XML form (`<function=…><parameter=…>…`).
+/// Tolerant of surrounding prose/think blocks; malformed content
+/// inside a marker is skipped (that call is lost, the rest still
+/// parse). Empty output = no calls.
 pub fn parse_tool_calls(output: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
     let mut rest = output;
@@ -240,14 +297,15 @@ pub fn parse_tool_calls(output: &str) -> Vec<ParsedToolCall> {
             break; // unterminated marker — nothing more to parse
         };
         let body = after[..end].trim();
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-            let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if !name.is_empty() {
-                calls.push(ParsedToolCall {
-                    name: name.to_string(),
-                    arguments: v.get("arguments").cloned().unwrap_or(serde_json::json!({})),
-                });
-            }
+        let call = if body.contains("<function=") {
+            // Qwen3.5 XML dialect first, JSON as a fallback so a
+            // degenerate XML body carrying a JSON payload still parses.
+            parse_xml_tool_call(body).or_else(|| parse_json_tool_call(body))
+        } else {
+            parse_json_tool_call(body)
+        };
+        if let Some(call) = call {
+            calls.push(call);
         }
         rest = &after[end + "</tool_call>".len()..];
     }
@@ -271,6 +329,65 @@ mod tests {
         assert!(s.contains("<tools>"));
         assert!(s.contains("\"weather.current\""));
         assert!(s.contains("<tool_call>"));
+        assert!(s.contains("<function="));
+    }
+
+    #[test]
+    fn parse_extracts_qwen35_xml_call_with_parameters() {
+        // Qwen3.5 / Qwen3-Coder dialect as emitted raw (newlines and
+        // all) — verified against field reports of llama.cpp issue
+        // #20837 and the froggeric template write-ups.
+        let out = "我查一下天气。\n<tool_call>\n<function=weather.current>\n<parameter=city>广州</parameter>\n</function>\n</tool_call>";
+        let calls = parse_tool_calls(out);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "weather.current");
+        assert_eq!(calls[0].arguments["city"], "广州");
+    }
+
+    #[test]
+    fn parse_extracts_xml_call_without_parameters() {
+        let out = "<tool_call><function=time.now></function></tool_call>";
+        let calls = parse_tool_calls(out);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "time.now");
+        assert_eq!(calls[0].arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn parse_accepts_mixed_json_and_xml_dialects() {
+        // A Qwen3-4B turn (JSON) and a Qwen3.5 turn (XML) can both
+        // appear when models are swapped mid-conversation history.
+        let out = concat!(
+            "<tool_call>{\"name\": \"time.now\", \"arguments\": {}}</tool_call>",
+            "，还有：",
+            "<tool_call>\n<function=weather.current>\n<parameter=city>广州</parameter>\n</function>\n</tool_call>",
+        );
+        let calls = parse_tool_calls(out);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "time.now");
+        assert_eq!(calls[1].name, "weather.current");
+        assert_eq!(calls[1].arguments["city"], "广州");
+    }
+
+    #[test]
+    fn parse_skips_malformed_xml_but_keeps_later_calls() {
+        let out = concat!(
+            "<tool_call><function=broken name</function></tool_call>",
+            "<tool_call><function=time.now></function></tool_call>",
+        );
+        let calls = parse_tool_calls(out);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "time.now");
+    }
+
+    #[test]
+    fn parse_xml_multi_parameter_call() {
+        let out = "<tool_call>\n<function=lamp.switch>\n<parameter=room>客厅</parameter>\n<parameter=on>true</parameter>\n</function>\n</tool_call>";
+        let calls = parse_tool_calls(out);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "lamp.switch");
+        assert_eq!(calls[0].arguments["room"], "客厅");
+        assert_eq!(calls[0].arguments["on"], "true");
     }
 
     #[test]

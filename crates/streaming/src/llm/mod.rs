@@ -377,7 +377,7 @@ impl ChatEngine {
     ) -> anyhow::Result<(String, u64, u64)> {
         use llama_cpp_2::context::params::LlamaContextParams;
         use llama_cpp_2::llama_batch::LlamaBatch;
-        use llama_cpp_2::model::{AddBos, LlamaChatMessage};
+        use llama_cpp_2::model::LlamaChatMessage;
         use llama_cpp_2::token::LlamaToken;
 
         let backend = backend_shared();
@@ -394,7 +394,19 @@ impl ChatEngine {
                 LlamaChatMessage::new(t.role.clone(), content)
             })
             .collect::<Result<_, _>>()?;
-        let prompt = model.apply_chat_template(&template, &messages, true)?;
+        let mut prompt = model.apply_chat_template(&template, &messages, true)?;
+        // llama.cpp 0.1.160's chat-template application strips the
+        // template's own <think> scaffolding (reasoning-format
+        // handling), leaving a bare `assistant\n` turn — hybrid-
+        // thinking models (Qwen3.5) then reopen a fresh <think> and
+        // burn the whole completion budget on hidden reasoning
+        // (measured 2026-10-30: every generated token landed inside
+        // <think>, the visible reply came back empty). Restore the
+        // closed-think prefill the Qwen3.5 template intends; models
+        // whose templates carry their own prefill are left alone.
+        if prompt.ends_with("assistant\n") || prompt.ends_with("assistant\n\n") {
+            prompt.push_str("<think>\n\n</think>\n\n");
+        }
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(self.config.n_ctx.max(128)))
@@ -405,7 +417,11 @@ impl ChatEngine {
             ));
         let mut ctx = model.new_context(backend, ctx_params)?;
 
-        let mut tokens = model.str_to_token(&prompt, AddBos::Never)?;
+        // llama-cpp-2 0.1.160 moved tokenization onto `vocab()`;
+        // (add_special=false, parse_special=true) preserves the old
+        // `str_to_token(…, AddBos::Never)` semantics — the chat-template
+        // output contains special markers that must tokenize as such.
+        let mut tokens = model.vocab().tokenize(prompt.as_bytes(), false, true);
         let n_prompt = tokens.len();
         let mut batch = LlamaBatch::new(n_prompt, 1);
         let last = n_prompt - 1;
@@ -432,19 +448,21 @@ impl ChatEngine {
                 .map(|(i, _)| i)
                 .unwrap_or(0);
             let token = LlamaToken(best as i32);
-            if model.is_eog_token(token) {
+            if model.vocab().is_eog(token) {
                 break;
             }
-            if let Ok(bytes) = model.token_to_piece_bytes(token, 16, false, None)
-                && let Ok(piece) = String::from_utf8(bytes)
             {
-                reply.push_str(&piece);
-                if let Some(cb) = on_delta.as_deref_mut()
-                    && !cb(&piece)
-                {
-                    // Consumer is done (queue closed / cancelled): stop
-                    // burning tokens; the partial reply is returned.
-                    break;
+                let bytes = model.vocab().token_to_piece(token, false, None);
+                let piece = String::from_utf8_lossy(&bytes);
+                if !piece.is_empty() {
+                    reply.push_str(&piece);
+                    if let Some(cb) = on_delta.as_deref_mut()
+                        && !cb(&piece)
+                    {
+                        // Consumer is done (queue closed / cancelled): stop
+                        // burning tokens; the partial reply is returned.
+                        break;
+                    }
                 }
             }
             tokens.clear();
@@ -455,11 +473,16 @@ impl ChatEngine {
         }
         // Qwen3 chatml: /no_think still emits an empty <think> block —
         // strip think sections, keep the visible answer.
-        Ok((
-            strip_think_blocks(&reply),
-            n_prompt as u64,
-            generated_tokens,
-        ))
+        let stripped = strip_think_blocks(&reply);
+        if stripped.trim().is_empty() && !reply.trim().is_empty() {
+            // The model spent its whole budget on hidden reasoning —
+            // an operational warning worth surfacing, not debug noise.
+            tracing::warn!(
+                generated_tokens,
+                "llm: reply stripped to empty — generation was all <think>"
+            );
+        }
+        Ok((stripped, n_prompt as u64, generated_tokens))
     }
 }
 
