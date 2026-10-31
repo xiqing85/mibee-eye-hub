@@ -1055,6 +1055,19 @@ impl StreamManager {
     /// Used by the snapshot endpoint to serve a single frame without joining
     /// the encode loop. Returns `None` if the camera has no active stream or
     /// no frame has been captured yet (the first frame may take ~100 ms).
+    /// The first stream that actually holds a frame — the default
+    /// camera for tool calls that omit an explicit id (the stream
+    /// registry is keyed by camera UUID; the historic `"0"` default
+    /// never matched and `camera.snapshot` failed with "no frame"
+    /// whenever the model called it without arguments).
+    pub async fn first_stream_with_frame(&self) -> Option<String> {
+        let streams = self.streams.read().await;
+        streams
+            .iter()
+            .find(|(_, h)| h.latest_jpeg.as_ref().is_some_and(|m| m.lock().is_some()))
+            .map(|(id, _)| id.clone())
+    }
+
     pub async fn latest_jpeg(&self, camera_id: &str) -> Option<Arc<[u8]>> {
         let streams = self.streams.read().await;
         let handle = streams.get(camera_id)?;
