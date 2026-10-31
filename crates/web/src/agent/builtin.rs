@@ -115,12 +115,20 @@ async fn snapshot(
     args: &serde_json::Value,
     streams: &Arc<StreamManager>,
 ) -> anyhow::Result<ToolOutput> {
-    let camera_id = args
+    let camera_id = match args
         .get("camera_id")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("0")
-        .to_string();
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id.to_string(),
+        // No explicit id: the registry is UUID-keyed and `"0"` never
+        // matched — default to whichever stream actually holds a frame.
+        None => streams
+            .first_stream_with_frame()
+            .await
+            .unwrap_or_else(|| "0".into()),
+    };
     let jpeg = streams
         .latest_jpeg(&camera_id)
         .await
