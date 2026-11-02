@@ -79,6 +79,14 @@ pub fn preprocess_rgb8(
 /// coordinate space the detections must be scaled back to (SPEC v1 §4.6:
 /// video pixel coordinates of the native stream).
 pub fn preprocess_jpeg(jpeg: &[u8], dst_w: u32, dst_h: u32) -> Result<(Vec<f32>, u32, u32)> {
+    let (rgb, w, h) = decode_jpeg_rgb(jpeg)?;
+    let tensor = preprocess_rgb8(&rgb, w, h, dst_w, dst_h)?;
+    Ok((tensor, w, h))
+}
+
+/// Decode a JPEG to interleaved RGB8 plus its dimensions (shared by the
+/// NanoDet and YOLOX preprocess paths).
+fn decode_jpeg_rgb(jpeg: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     let mut decoder = jpeg_decoder::Decoder::new(std::io::Cursor::new(jpeg));
     let pixels = decoder.decode().context("ai: JPEG decode failed")?;
     let info = decoder
@@ -98,9 +106,69 @@ pub fn preprocess_jpeg(jpeg: &[u8], dst_w: u32, dst_h: u32) -> Result<(Vec<f32>,
         }
         other => bail!("ai: unsupported JPEG pixel format {other:?}"),
     };
+    Ok((rgb, w, h))
+}
 
-    let tensor = preprocess_rgb8(&rgb, w, h, dst_w, dst_h)?;
-    Ok((tensor, w, h))
+/// YOLOX-family preprocess (Megvii Apache-2.0 ONNX exports; semantics
+/// verified 2026-11-02 against the official `demo/ONNXRuntime`
+/// pipeline): **gray-114 letterbox** keeping aspect ratio (image at
+/// top-left, padding bottom/right), nearest resize, **BGR** channel
+/// order, **raw 0-255 values** (the /255 normalization is baked into
+/// the exported graph — dividing again produces a black input), NCHW
+/// f32 output.
+///
+/// Returns `(tensor, frame_w, frame_h, scale)` where `scale` maps
+/// frame pixels to model pixels (the letterbox inverse for bboxes).
+pub fn preprocess_yolox_jpeg(
+    jpeg: &[u8],
+    dst_w: u32,
+    dst_h: u32,
+) -> Result<(Vec<f32>, u32, u32, f32)> {
+    let (rgb, src_w, src_h) = decode_jpeg_rgb(jpeg)?;
+    let (sw, sh, dw, dh) = (
+        src_w as usize,
+        src_h as usize,
+        dst_w as usize,
+        dst_h as usize,
+    );
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        bail!("yolox preprocess: zero-sized frame ({sw}x{sh} → {dw}x{dh})");
+    }
+    let scale = (dw as f32 / sw as f32).min(dh as f32 / sh as f32);
+    let (rw, rh) = (
+        ((sw as f32 * scale) as usize).min(dw),
+        ((sh as f32 * scale) as usize).min(dh),
+    );
+
+    // Letterboxed image, HWC BGR, gray-114 padding.
+    let mut img = vec![114u8; dw * dh * 3];
+    for y in 0..rh {
+        // Inverse-scale sample centers, mirroring INTER_LINEAR's
+        // half-pixel convention with a nearest pick (cheap and stable).
+        let sy =
+            (((y as f32 + 0.5) / scale - 0.5).round() as isize).clamp(0, sh as isize - 1) as usize;
+        for x in 0..rw {
+            let sx = (((x as f32 + 0.5) / scale - 0.5).round() as isize).clamp(0, sw as isize - 1)
+                as usize;
+            let s = (sy * sw + sx) * 3;
+            let d = (y * dw + x) * 3;
+            img[d] = rgb[s + 2]; // B
+            img[d + 1] = rgb[s + 1]; // G
+            img[d + 2] = rgb[s]; // R
+        }
+    }
+
+    // HWC → NCHW planes, raw 0-255.
+    let mut tensor = vec![0f32; 3 * dw * dh];
+    for y in 0..dh {
+        for x in 0..dw {
+            let s = (y * dw + x) * 3;
+            tensor[y * dw + x] = img[s] as f32; // B plane
+            tensor[dw * dh + y * dw + x] = img[s + 1] as f32; // G
+            tensor[2 * dw * dh + y * dw + x] = img[s + 2] as f32; // R
+        }
+    }
+    Ok((tensor, src_w, src_h, scale))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

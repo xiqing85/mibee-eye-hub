@@ -205,6 +205,144 @@ pub fn postprocess(output: &[f32], confidence_threshold: f32) -> Result<Vec<Dete
         .collect())
 }
 
+/// YOLOX row width: 4 box (dx, dy, log_w, log_h) + 1 objectness + 80
+/// COCO classes (same class order as [`COCO_LABELS`]).
+const YOLOX_ROW: usize = 85;
+
+/// Grid cells at stride 32 implied by a YOLOX row count. The three
+/// pyramid levels contribute `21·side²` cells total: `(4s)² + (2s)² + s²`
+/// with strides 8/16/32. 416-input exports → 3549 rows (side 13),
+/// 640-input → 8400 (side 20).
+#[must_use]
+pub fn yolox_side_from_rows(rows: usize) -> Option<usize> {
+    let side2 = rows / 21;
+    if side2 == 0 || !rows.is_multiple_of(21) {
+        return None;
+    }
+    let side = (side2 as f64).sqrt().round() as usize;
+    (side > 0 && 21 * side * side == rows).then_some(side)
+}
+
+/// Decode a YOLOX-family output into detections.
+///
+/// The Megvii ONNX exports ship the **raw head output**: rows are grid
+/// cells (stride 8/16/32 levels, row-major within a level) carrying
+/// `[dx, dy, log_w, log_h, obj(sigmoid), 80×cls(sigmoid)]` — the
+/// official demo decodes with `cx=(dx+gx)·stride`, `w=exp(log_w)·stride`
+/// (`yolox/utils/demo_utils.py::demo_postprocess`), and this port does
+/// the same, then reuses the greedy per-label NMS below.
+///
+/// `confidence_threshold` gates the final `obj × cls` score; bboxes are
+/// clamped to the square model-input space (the letterbox inverse is
+/// [`scale_yolox_to_frame`], applied by the caller).
+pub fn postprocess_yolox(
+    output: &[f32],
+    side_cells: usize,
+    confidence_threshold: f32,
+) -> Result<Vec<Detection>> {
+    let rows = 21 * side_cells * side_cells;
+    if output.len() != rows * YOLOX_ROW {
+        bail!(
+            "Unexpected YOLOX output length: got {}, expected {} ({} rows × {})",
+            output.len(),
+            rows * YOLOX_ROW,
+            rows,
+            YOLOX_ROW
+        );
+    }
+    let input_px = (side_cells * 32) as f32;
+    let levels = [
+        (side_cells * 4, 8usize),
+        (side_cells * 2, 16),
+        (side_cells, 32),
+    ];
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut row = 0usize;
+    for &(grid, stride) in &levels {
+        for gy in 0..grid {
+            for gx in 0..grid {
+                let base = row * YOLOX_ROW;
+                row += 1;
+                let obj = output[base + 4];
+                if obj < confidence_threshold {
+                    continue; // score = obj × cls ≤ obj
+                }
+                let mut label = 0usize;
+                let mut best = output[base + 5];
+                for (class, &s) in output[base + 5..base + YOLOX_ROW]
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                {
+                    if s > best {
+                        best = s;
+                        label = class;
+                    }
+                }
+                let score = obj * best;
+                if score < confidence_threshold {
+                    continue;
+                }
+                let cx = (output[base] + gx as f32) * stride as f32;
+                let cy = (output[base + 1] + gy as f32) * stride as f32;
+                let w = output[base + 2].exp() * stride as f32;
+                let h = output[base + 3].exp() * stride as f32;
+                candidates.push(Candidate {
+                    label,
+                    confidence: score,
+                    x1: (cx - w / 2.0).max(0.0),
+                    y1: (cy - h / 2.0).max(0.0),
+                    x2: (cx + w / 2.0).min(input_px),
+                    y2: (cy + h / 2.0).min(input_px),
+                });
+            }
+        }
+    }
+    candidates.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    let kept = nms(&candidates, NMS_IOU_THRESHOLD);
+    Ok(kept
+        .into_iter()
+        .map(|c| Detection {
+            label: COCO_LABELS[c.label].to_string(),
+            confidence: c.confidence,
+            bbox: [
+                c.x1.round() as u32,
+                c.y1.round() as u32,
+                (c.x2 - c.x1).round() as u32,
+                (c.y2 - c.y1).round() as u32,
+            ],
+        })
+        .collect())
+}
+
+/// Invert the YOLOX letterbox: model-pixel bboxes → frame pixels.
+/// Padding sits bottom/right only, so `frame = model / scale` with a
+/// clamp; boxes stay inside the frame like
+/// [`scale_detections_to_frame`].
+#[must_use]
+pub fn scale_yolox_to_frame(
+    detections: Vec<Detection>,
+    scale: f32,
+    frame_w: u32,
+    frame_h: u32,
+) -> Vec<Detection> {
+    if scale <= 0.0 || frame_w == 0 || frame_h == 0 {
+        return detections;
+    }
+    detections
+        .into_iter()
+        .map(|mut det| {
+            let [x, y, w, h] = det.bbox;
+            let x = ((x as f32 / scale).round() as u32).min(frame_w.saturating_sub(1));
+            let y = ((y as f32 / scale).round() as u32).min(frame_h.saturating_sub(1));
+            let w = ((w as f32 / scale).round() as u32).min(frame_w - x);
+            let h = ((h as f32 / scale).round() as u32).min(frame_h - y);
+            det.bbox = [x, y, w, h];
+            det
+        })
+        .collect()
+}
+
 /// Scale detections from model-input pixel space back to the source video
 /// frame's pixel space (SPEC v1 §4.6: bboxes are in **video pixel**
 /// coordinates). The preprocessing stretches the frame into the square
@@ -314,6 +452,83 @@ fn iou(a: &Candidate, b: &Candidate) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod yolox {
+        use super::*;
+
+        /// One hot cell in a synthetic 416-input tensor (side 13, 3549
+        /// rows): stride-8 level, grid (10, 20), a 32×32 box centered
+        /// there. Verifies the grid/stride/exp decode and the letterbox
+        /// inverse end to end.
+        #[test]
+        fn decode_and_scale_one_hot_cell() {
+            let side = 13;
+            let rows = 21 * side * side;
+            let mut tensor = vec![0f32; rows * YOLOX_ROW];
+            // Row index: level stride 8 first → grid (gx=10, gy=20) at
+            // 20*52 + 10.
+            let row = 20 * 52 + 10;
+            let base = row * YOLOX_ROW;
+            tensor[base] = 0.0; // dx → cx = (0+10)*8 = 80
+            tensor[base + 1] = 0.0; // dy → cy = (0+20)*8 = 160
+            tensor[base + 2] = 2f32.ln(); // log w → w = exp(ln2)*8 = 16
+            tensor[base + 3] = 2f32.ln(); // h = 16
+            tensor[base + 4] = 0.9; // obj
+            tensor[base + 5 + 16] = 0.9; // cls 16 = dog
+            let dets = postprocess_yolox(&tensor, side, 0.5).expect("decode");
+            assert_eq!(dets.len(), 1);
+            let d = &dets[0];
+            assert_eq!(d.label, "dog");
+            assert!((d.confidence - 0.81).abs() < 1e-6, "{:?}", d.confidence);
+            // Model-space xywh: center (80,160), 16×16 → (72,152,16,16).
+            assert_eq!(d.bbox, [72, 152, 16, 16]);
+            // Letterbox inverse: 1280×720 frame into 416×416 → scale
+            // = min(416/1280, 416/720) = 0.325; model px / 0.325.
+            let scaled = scale_yolox_to_frame(vec![d.clone()], 416.0 / 1280.0, 1280, 720);
+            let s = &scaled[0];
+            // 72/0.325 ≈ 221.5 → 222 (round); 152/0.325 ≈ 467.7 → 468.
+            assert_eq!(s.bbox[0], 222);
+            assert_eq!(s.bbox[1], 468);
+        }
+
+        /// Duplicate overlapping cells collapse under NMS; a far cell
+        /// survives.
+        #[test]
+        fn nms_collapses_overlapping_cells() {
+            let side = 13;
+            let rows = 21 * side * side;
+            let mut tensor = vec![0f32; rows * YOLOX_ROW];
+            for (row, conf) in [(100, 0.9f32), (101, 0.8), (3000, 0.7)] {
+                let base = row * YOLOX_ROW;
+                tensor[base] = 0.5;
+                tensor[base + 1] = 0.5;
+                tensor[base + 2] = 2f32.ln();
+                tensor[base + 3] = 2f32.ln();
+                tensor[base + 4] = conf;
+                tensor[base + 5] = conf; // class 0 person
+            }
+            // Rows 100/101 are adjacent grid cells (stride-8 level,
+            // gx 48→(48,1) vs 49→(49,1)): same object, near-identical
+            // boxes → NMS keeps the stronger. Row 3000 sits in the
+            // stride-16 level, far away → kept.
+            let dets = postprocess_yolox(&tensor, side, 0.5).expect("decode");
+            assert_eq!(dets.len(), 2, "{dets:?}");
+            assert!(dets.iter().all(|d| d.label == "person"));
+        }
+
+        #[test]
+        fn side_from_rows_round_trips_both_exports() {
+            assert_eq!(yolox_side_from_rows(3549), Some(13)); // 416
+            assert_eq!(yolox_side_from_rows(8400), Some(20)); // 640
+            assert_eq!(yolox_side_from_rows(3548), None);
+            assert_eq!(yolox_side_from_rows(21), Some(1)); // 32px input: legal decomposition
+        }
+
+        #[test]
+        fn wrong_length_rejected() {
+            assert!(postprocess_yolox(&[0f32; 100], 13, 0.5).is_err());
+        }
+    }
 
     mod scale_to_frame {
         use super::*;
