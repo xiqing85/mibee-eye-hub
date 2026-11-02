@@ -118,6 +118,14 @@ font_path = ""
 # or the system library path.
 enabled = false
 model_path = "models/nanodet-m.onnx"
+# Any YOLOX-family ONNX export (Megvii, Apache-2.0 — e.g. yolox_s.onnx
+# from the YOLOX 0.1.1rc0 release) drops in here unchanged: the output
+# shape auto-selects the decode family. YOLOX-s at 640 measures 0.90
+# median person confidence vs NanoDet-320's 0.68 and keeps a zero
+# noise floor on empty-room frames (2026-11-02 benchmark), at ~250 ms
+# per frame on a 4-core laptop CPU against the 1000 ms sampling
+# cadence.
+# model_path = "models/yolox_s.onnx"
 confidence_threshold = 0.5
 interval_ms = 1000
 

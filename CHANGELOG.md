@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+### Added
+
+- **YOLOX-family detector support (2026-11-03).** The AI detector now
+  auto-detects the model family from the ONNX output shape: a
+  `[1, rows, 85]` head selects the YOLOX decode path (letterbox
+  preprocess, raw-head grid decode per the official Megvii demo,
+  greedy per-label NMS), anything else keeps the NanoDet-Plus path —
+  so upgrading is a pure `model_path` change. Motivation: NanoDet-320's
+  night weakness (the 2026-10-13 noise storm scored empty-room noise
+  0.35-0.46 as persons). Benchmark on 53 deployment frames plus 3
+  visually-verified edge-partial-person frames: YOLOX-s-640 reaches a
+  0.90 median person confidence with 53/53 correct calls and a zero
+  noise floor on empty-room frames (NanoDet: 0.68 median, 0.09-0.12
+  noise floor), at ~250 ms per frame on a 4-core laptop CPU against
+  the 1000 ms sampling cadence. YOLOX-nano-416 is faster but misses
+  all three edge-partial frames — not recommended for the away-visitor
+  pipeline.
+
 ### Changed
 
 - **Model family: Qwen3 → Qwen3.5 (2026-10-30).** The chat LLM and the
