@@ -124,7 +124,7 @@ fi
 # Waiver 2 — zip / RUSTSEC-2026-0367,0368,0369 (build-only)
 # ════════════════════════════════════════════════════════════════════════════
 
-ZIP_ADVISORIES="RUSTSEC-2026-0367/0368/0369"
+ZIP_ADVISORIES="RUSTSEC-2026-0367/0368/0369/0429"
 
 echo "check-audit-waiver: verifying the ${ZIP_ADVISORIES} (zip) waiver"
 
@@ -321,6 +321,39 @@ sys.exit(1)
         fail=1
     fi
 done
+
+# ════════════════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════════════════
+# Waiver 5 — zvariant / RUSTSEC-2026-0371 (unmaintained, via ksni → zbus 5)
+# ════════════════════════════════════════════════════════════════════════════
+
+ZV_ADVISORY="RUSTSEC-2026-0371"
+
+echo "check-audit-waiver: verifying the ${ZV_ADVISORY} (zvariant unmaintained) waiver"
+
+ZV_LOCK="$(grep -A1 '^name = "zvariant"$' Cargo.lock | grep version | cut -d'"' -f2)"
+if [[ -z "${ZV_LOCK}" ]]; then
+    echo "check-audit-waiver: zvariant left the lockfile." >&2
+    echo "  The waiver is dead config — remove ${ZV_ADVISORY} from tools/audit.toml." >&2
+    fail=1
+fi
+
+# The advisory is an unmaintained notice (the z-galaxy crates were merged
+# back into zbus 6 as modules), not a security flaw; no patched release
+# exists or can exist. The successor line is unreachable until ksni
+# publishes against zbus 6. Premise: zvariant is only pulled by the
+# zbus family under ksni (tray) — a direct product edge would need review.
+ZV_DEPS="$(cargo tree --target all --invert zvariant 2>/dev/null | grep -oE '^[a-z0-9_-]+ v' | sed -E 's/ v$//' | sort -u || true)"
+STRAY="$(printf '%s\n' "${ZV_DEPS}" | grep -vE '^(zvariant|zbus|zbus_names|zbus_macros|ksni|zclock|zlog|enumflags2|serde|serde_json|displaydoc)$' || true)"
+if [[ -n "${STRAY//[[:space:]]/}" ]]; then
+    echo "check-audit-waiver: zvariant gained unexpected dependents:" >&2
+    echo "${STRAY}" >&2
+    echo "  Review the waiver — the ksni/zbus5 premise may no longer hold." >&2
+    fail=1
+else
+    echo "check-audit-waiver: zvariant stays under the ksni/zbus family (as the waiver assumes)"
+fi
 
 # ════════════════════════════════════════════════════════════════════════════
 
