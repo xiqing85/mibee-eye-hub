@@ -9,10 +9,11 @@
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071",
-    # zip (build-only, see rationale below — one comment, three advisories)
+    # zip (build-only, see rationale below — one comment, four advisories)
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
     # webpki-roots 0.26 (build-only via ureq — see the third rationale below)
     "RUSTSEC-2026-0381",
     # zstd 0.13 / zstd-safe 7.3 (build-only via zip — see the fourth
@@ -20,6 +21,9 @@ ignore = [
     "RUSTSEC-2026-0391",
     "RUSTSEC-2026-0398",
     "RUSTSEC-2026-0403",
+    # zvariant 5.x "unmaintained" (merged back into zbus 6 as a module;
+    # transitive via ksni 0.3.6 → zbus 5 — see the fifth rationale below)
+    "RUSTSEC-2026-0371",
 ]
 
 # RUSTSEC-2023-0071 — `rsa`, Marvin Attack (timing side-channel key recovery).
