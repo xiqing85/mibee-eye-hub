@@ -237,6 +237,64 @@ impl CloudAi {
         result
     }
 
+    /// POST /chat/completions with the free-pool `reasoning` semantics.
+    ///
+    /// The caller's body carries `reasoning:{enabled:false}` (voice
+    /// posture — several OpenRouter backends otherwise route the whole
+    /// reply into the reasoning field and return empty content). A
+    /// backend that *requires* reasoning answers 400 "Reasoning is
+    /// mandatory…" (measured 2026-11-02 09:25 on the free meta-route);
+    /// that is not a hard failure — retry once without the knob and
+    /// let the model think.
+    async fn post_completion(
+        &self,
+        url: &str,
+        cfg: &CloudConfig,
+        mut body: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<(reqwest::StatusCode, serde_json::Value), CloudError> {
+        let (status, payload) = self.post_completion_once(url, cfg, &body, timeout).await?;
+        if status == reqwest::StatusCode::BAD_REQUEST
+            && body.get("reasoning").is_some()
+            && reasoning_mandatory_error(&payload)
+        {
+            tracing::debug!(
+                "cloud: backend requires reasoning — retrying without the disable knob"
+            );
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("reasoning");
+            }
+            return self.post_completion_once(url, cfg, &body, timeout).await;
+        }
+        Ok((status, payload))
+    }
+
+    async fn post_completion_once(
+        &self,
+        url: &str,
+        cfg: &CloudConfig,
+        body: &serde_json::Value,
+        timeout: Duration,
+    ) -> Result<(reqwest::StatusCode, serde_json::Value), CloudError> {
+        let resp = tokio::time::timeout(
+            timeout,
+            self.http
+                .post(url)
+                .bearer_auth(&cfg.api_key)
+                .json(body)
+                .send(),
+        )
+        .await
+        .map_err(|_| CloudError::Timeout)?
+        .map_err(|e| CloudError::Http(format!("request: {e}")))?;
+        let status = resp.status();
+        let payload: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| CloudError::Http(format!("body: {e}")))?;
+        Ok((status, payload))
+    }
+
     /// The agent variant of the raw HTTP round trip (no vision legs).
     async fn agent_request(
         &self,
@@ -293,22 +351,7 @@ impl CloudAi {
             self.base_url.read().expect("cloud base url lock")
         );
         let timeout = Duration::from_secs(timeout_secs.max(5));
-        let resp = tokio::time::timeout(
-            timeout,
-            self.http
-                .post(&url)
-                .bearer_auth(&cfg.api_key)
-                .json(&body)
-                .send(),
-        )
-        .await
-        .map_err(|_| CloudError::Timeout)?
-        .map_err(|e| CloudError::Http(format!("request: {e}")))?;
-        let status = resp.status();
-        let payload: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| CloudError::Http(format!("body: {e}")))?;
+        let (status, payload) = self.post_completion(&url, cfg, body, timeout).await?;
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(CloudError::InvalidKey);
         }
@@ -390,28 +433,17 @@ impl CloudAi {
             "model": model,
             "messages": messages,
             "max_tokens": 512,
+            // Same voice-forward posture as the agent leg (see there);
+            // this legacy path is the 2026-11-02 08:10 incident's
+            // 141 s empty-content stall — it had lost the knob.
+            "reasoning": { "enabled": false },
         });
         let url = format!(
             "{}/chat/completions",
             self.base_url.read().expect("cloud base url lock")
         );
         let timeout = timeout.unwrap_or(Duration::from_secs(cfg.timeout_secs.max(5)));
-        let resp = tokio::time::timeout(
-            timeout,
-            self.http
-                .post(&url)
-                .bearer_auth(&cfg.api_key)
-                .json(&body)
-                .send(),
-        )
-        .await
-        .map_err(|_| CloudError::Timeout)?
-        .map_err(|e| CloudError::Http(format!("request: {e}")))?;
-        let status = resp.status();
-        let payload: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| CloudError::Http(format!("body: {e}")))?;
+        let (status, payload) = self.post_completion(&url, cfg, body, timeout).await?;
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(CloudError::InvalidKey);
         }
@@ -425,7 +457,24 @@ impl CloudAi {
         let reply = payload
             .pointer("/choices/0/message/content")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| CloudError::Http("no choices/0/message/content".into()))?;
+            .ok_or_else(|| {
+                // Diagnosability: the free pool routes by meta-model, and a
+                // 200 with empty content is its overload signature. Name the
+                // concrete responder (and whether text landed in the
+                // reasoning field) so the routing guess is visible in logs.
+                let served = payload
+                    .pointer("/model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let reasoning = payload
+                    .pointer("/choices/0/message/reasoning")
+                    .and_then(|v| v.as_str())
+                    .map(|r| format!(" (reasoning field holds {} chars)", r.len()))
+                    .unwrap_or_default();
+                CloudError::Http(format!(
+                    "no choices/0/message/content (served by {served}{reasoning})"
+                ))
+            })?;
         let usage = payload
             .pointer("/usage/prompt_tokens")
             .and_then(|v| v.as_u64())
@@ -620,6 +669,16 @@ pub async fn test_cloud(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The free pool's reasoning-mandatory 400 signature (case-tolerant —
+/// measured 2026-11-02: "Reasoning is mandatory for this endpoint and
+/// cannot be disabled.").
+fn reasoning_mandatory_error(payload: &serde_json::Value) -> bool {
+    payload
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .is_some_and(|m| m.to_lowercase().contains("reasoning is mandatory"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +690,75 @@ mod tests {
         assert_eq!(base64_encode(b"f"), "Zg==");
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base256_edge(), "AAAA");
+    }
+
+    #[tokio::test]
+    async fn complete_carries_reasoning_disabled_and_retries_when_mandatory() {
+        use axum::extract::State;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Free-pool contract measured 2026-11-02: first request carries
+        // the disable knob, a reasoning-mandatory backend 400s it, the
+        // retry must strip the knob and succeed. The legacy complete
+        // path must ALSO carry the knob (the 08:10 incident's legacy
+        // leg had lost it and stalled into empty content).
+        let hits = Arc::new(AtomicUsize::new(0));
+        let state = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(
+                move |State(seen): State<Arc<AtomicUsize>>,
+                      body: axum::extract::Json<serde_json::Value>| {
+                    let n = seen.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if n == 0 {
+                            assert!(
+                                body.get("reasoning").is_some(),
+                                "first request must carry the disable knob"
+                            );
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                axum::Json(json!({
+                                    "error": { "message":
+                                        "Reasoning is mandatory for this endpoint and cannot be disabled." }
+                                })),
+                            );
+                        }
+                        assert!(
+                            body.get("reasoning").is_none(),
+                            "retry must strip the knob"
+                        );
+                        (
+                            StatusCode::OK,
+                            axum::Json(json!({
+                                "choices": [{ "message": { "content": "thoughtful reply" } }]
+                            })),
+                        )
+                    }
+                },
+            ),
+        )
+        .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let cloud = CloudAi::new(CloudConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-test".into(),
+            chat_model: "test/model-a".into(),
+            ..CloudConfig::default()
+        });
+        cloud.set_base_url(&format!("http://{addr}/v1"));
+        let turns = vec![ChatTurn {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let reply = cloud.complete(&turns, None, None, None).await.unwrap();
+        assert_eq!(reply, "thoughtful reply");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "exactly one retry");
     }
 
     fn base256_edge() -> String {
