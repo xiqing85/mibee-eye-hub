@@ -13,6 +13,9 @@ use streaming::llm::ChatTurn;
 pub struct CloudChannel {
     pub cloud: Arc<CloudAi>,
     pub timeout_secs: u64,
+    /// Reply length cap riding every agent call — voice rounds pass a
+    /// tight cap (long monologues cost 20 s+ of TTS, 2026-11-02).
+    pub max_tokens: u32,
 }
 
 impl ModelChannel for CloudChannel {
@@ -25,11 +28,12 @@ impl ModelChannel for CloudChannel {
     {
         let cloud = self.cloud.clone();
         let timeout = self.timeout_secs;
+        let max_tokens = self.max_tokens;
         let turns = turns.to_vec();
         let tools = tools.to_vec();
         Box::pin(async move {
             let (text, calls, usage) = cloud
-                .agent_complete(&turns, &tools, with_tools, timeout)
+                .agent_complete(&turns, &tools, with_tools, timeout, max_tokens)
                 .await
                 .map_err(|e| anyhow::anyhow!("cloud agent: {e:?}"))?;
             Ok(ModelOutput {

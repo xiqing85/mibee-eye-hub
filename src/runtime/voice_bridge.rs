@@ -38,6 +38,9 @@ pub struct VoiceBridge {
     pub desktop: Arc<crate::desktop::Desktop>,
     pub grounding: Arc<GroundingState>,
     pub streams: Arc<std::sync::Mutex<HashMap<String, SegmentSlot>>>,
+    /// The stream registry — the on-demand fresh-frame look (#29,
+    /// 2026-11-02) reads `latest_jpeg` from it for scene questions.
+    pub stream_manager: Arc<web::stream_manager::StreamManager>,
     pub tools: SharedTools,
     pub agent_registry: Arc<ToolRegistry>,
     pub agent_config: AgentConfig,
@@ -70,6 +73,7 @@ impl VoiceBridge {
             desktop: desktop_for_voice,
             grounding: grounding_for_voice,
             streams: streams_for_voice,
+            stream_manager: stream_manager_for_voice,
             tools: tools_for_voice,
             agent_registry: agent_registry_for_voice,
             agent_config: agent_config_for_voice,
@@ -536,13 +540,42 @@ impl VoiceBridge {
                             // the camera sees, the local clock, and (when
                             // asked + enabled) the weather, and follows the
                             // user's language.
-                            let scene = web::db::list_cameras(&records_pool)
+                            let scene_camera_id = web::db::list_cameras(&records_pool)
                                 .await
                                 .ok()
-                                .and_then(|cams| cams.first().map(|c| c.id.clone()))
-                                .and_then(|id| {
-                                    grounding_for_voice.scene_summary(&id, unix_now_ms())
-                                });
+                                .and_then(|cams| cams.first().map(|c| c.id.clone()));
+                            let mut scene = scene_camera_id.as_deref().and_then(|id| {
+                                grounding_for_voice.scene_summary(id, unix_now_ms())
+                            });
+                            // #29 freshness (2026-11-02): a scene question
+                            // deserves a fresh look when the cached describe
+                            // is stale — the alarm-driven pipeline only runs
+                            // on alarm edges (field data: a 106 s-old
+                            // describe answered "你现在看到什么"). Cloud
+                            // vision under a hard deadline; any failure
+                            // keeps the age-labeled cache (fail-open).
+                            if web::grounding::is_scene_question(&ev.transcript)
+                                && let Some(id) = scene_camera_id.as_deref()
+                                && cloud_for_voice.vision_ready()
+                                && !grounding_for_voice.scene_describe_is_fresh(
+                                    id,
+                                    unix_now_ms(),
+                                    std::time::Duration::from_secs(20),
+                                )
+                                && let Some(jpeg) = stream_manager_for_voice.latest_jpeg(id).await
+                                && let Some(text) = web::grounding::describe_fresh_frame(
+                                    Some(&cloud_for_voice),
+                                    &jpeg,
+                                    std::time::Duration::from_secs(15),
+                                )
+                                .await
+                            {
+                                tracing::info!(
+                                    chars = text.chars().count(),
+                                    "voice: fresh scene describe (on-demand)"
+                                );
+                                scene = Some(format!("画面描述（刚刚现场抓取）：{text}"));
+                            }
                             let ctx = web::routes::chat::TurnContext {
                                 scene,
                                 local: Some(web::routes::chat::local_block(&records_pool).await),
@@ -669,7 +702,17 @@ impl VoiceBridge {
                                         if cloud_first {
                                             Box::new(web::agent::channels::CloudChannel {
                                                 cloud: cloud.clone(),
-                                                timeout_secs: cloud.config().timeout_secs,
+                                                // Voice cannot wait minutes in
+                                                // silence (2026-11-02: the
+                                                // free pool queued an agent
+                                                // round 31 s; the legacy leg
+                                                // got the same clamp) — cap
+                                                // at 30 s, fail back local.
+                                                timeout_secs: cloud.config().timeout_secs.min(30),
+                                                // Spoken replies stay short —
+                                                // long monologues cost 20 s+
+                                                // of TTS playback.
+                                                max_tokens: 150,
                                             })
                                         } else {
                                             Box::new(web::agent::channels::LocalChannel {
@@ -828,11 +871,12 @@ impl VoiceBridge {
                                         cloud.config().timeout_secs.min(30),
                                     );
                                     match span
-                                        .run(cloud.complete_with_usage(
+                                        .run(cloud.complete_with_usage_capped(
                                             &turns,
                                             None,
                                             None,
                                             Some(voice_budget),
+                                            150,
                                         ))
                                         .await
                                     {
@@ -1449,6 +1493,10 @@ mod tests {
             desktop: crate::desktop::Desktop::new(&crate::config::DesktopConfig::default()),
             grounding: Arc::new(web::grounding::GroundingState::new()),
             streams: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            stream_manager: Arc::new(web::stream_manager::StreamManager::with_host_and_db(
+                String::new(),
+                sqlx::SqlitePool::connect_lazy(":memory:").expect("lazy pool"),
+            )),
             tools: Arc::new(std::sync::RwLock::new(
                 streaming::tools::ToolsConfig::default(),
             )),
