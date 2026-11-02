@@ -710,6 +710,24 @@ pub fn interrupt_content_gate(
     InterruptAction::Supersede
 }
 
+/// A mid-round utterance that addresses the assistant by name is a
+/// direct call — never a backchannel, however confidently the
+/// classifier vetoes it. Rule-matched (0 ms), like the stop words.
+///
+/// Field data from the workstation 2026-11-02: a video-noisy room made
+/// Laya confidently backchannel every mid-round utterance, so the
+/// content-gate veto swallowed "小蜜蜂我在叫你你能不能回答一下" and a bare
+/// "小蜜蜂" while the round sat in a stalled cloud call. The wake word
+/// is a direct address — the strongest signal a caller has.
+#[must_use]
+pub fn wake_word_addressed(wake_word: &str, transcript: &str) -> bool {
+    let word = wake_word.trim();
+    if word.is_empty() {
+        return false;
+    }
+    transcript.to_lowercase().contains(&word.to_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +848,50 @@ mod tests {
         assert_eq!(
             interrupt_content_gate(InterruptAction::Supersede, "嗯", None, 0.0, 0.6),
             InterruptAction::Supersede
+        );
+    }
+
+    #[test]
+    fn wake_word_addressed_covers_the_incident_transcripts() {
+        // The 2026-11-02 field data: both swallowed mid-round calls.
+        assert!(wake_word_addressed("小蜜蜂", "小蜜蜂"));
+        assert!(wake_word_addressed(
+            "小蜜蜂",
+            "小蜜蜂我在叫你你能不能回答一下"
+        ));
+        // Embedded in longer speech, mixed case, surrounding whitespace.
+        assert!(wake_word_addressed("小蜜蜂", "请问小蜜蜂在吗"));
+        assert!(wake_word_addressed("Hey Bee", "hey bee are you there"));
+        assert!(wake_word_addressed("Hey Bee", "HEY BEE"));
+        // Not addressed: unrelated speech stays classifier territory.
+        assert!(!wake_word_addressed("小蜜蜂", "你听到什么"));
+        assert!(!wake_word_addressed("小蜜蜂", "嗯嗯啊啊的背景声"));
+        // Empty/unset wake word never matches (fail-open to classifier).
+        assert!(!wake_word_addressed("", "小蜜蜂"));
+        assert!(!wake_word_addressed("   ", "小蜜蜂"));
+    }
+
+    #[test]
+    fn wake_word_beats_a_confident_backchannel_verdict() {
+        // The bridge consults wake_word_addressed BEFORE the classifier
+        // and the content gate — encode that precedence: the gate alone
+        // honors a confident backchannel veto on this transcript, but
+        // the rule arm fires first and preempts it.
+        let transcript = "小蜜蜂我在叫你你能不能回答一下";
+        assert_eq!(
+            interrupt_content_gate(
+                InterruptAction::Backchannel,
+                transcript,
+                Some("backchannel"),
+                0.9,
+                0.6
+            ),
+            InterruptAction::Backchannel,
+            "gate alone honors the veto"
+        );
+        assert!(
+            wake_word_addressed("小蜜蜂", transcript),
+            "…but the rule arm preempts it"
         );
     }
 

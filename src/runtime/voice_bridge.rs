@@ -216,8 +216,21 @@ impl VoiceBridge {
                             }
                             let interrupt_started = std::time::Instant::now();
                             let mut content_gated = false;
+                            let mut wake_rule = false;
                             let action = if streaming::decision::stop_words_match(&ev.transcript) {
                                 streaming::decision::InterruptAction::Stop
+                            } else if streaming::decision::wake_word_addressed(
+                                &wake_word_for_voice,
+                                &ev.transcript,
+                            ) {
+                                // Direct address (#45 amendment 2026-11-02):
+                                // the utterance names the assistant — a new
+                                // question by rule, before any classifier can
+                                // veto it. Field data: a video-noisy room made
+                                // Laya backchannel "小蜜蜂我在叫你…" mid-round,
+                                // swallowing direct calls for minutes.
+                                wake_rule = true;
+                                streaming::decision::InterruptAction::Supersede
                             } else {
                                 let mut action = streaming::decision::InterruptAction::Backchannel;
                                 let mut verdict: Option<(String, f32)> = None;
@@ -346,7 +359,12 @@ impl VoiceBridge {
                                     // Fall through: this utterance becomes
                                     // the new round below (the dying round
                                     // records itself as interrupted).
-                                    let (src, note) = if content_gated {
+                                    let (src, note) = if wake_rule {
+                                        (
+                                            "rule",
+                                            "直接呼叫（含唤醒词）— 按新问题处理，已取消上一轮回答",
+                                        )
+                                    } else if content_gated {
                                         ("rule", "长话语（≥5字）— 按新问题处理，已取消上一轮回答")
                                     } else {
                                         ("laya", "新问题 — 已取消上一轮回答")
@@ -798,8 +816,24 @@ impl VoiceBridge {
                                         vec![],
                                     );
                                     let leg_start = std::time::Instant::now();
+                                    // Field data 2026-11-02: the free pool
+                                    // stalled a voice call for 141 s before
+                                    // returning empty content — this leg ran
+                                    // with no deadline at all (the config
+                                    // timeout was only wired into the agent
+                                    // path). Voice cannot wait minutes in
+                                    // silence: cap at min(config, 30 s) and
+                                    // fail back to local.
+                                    let voice_budget = std::time::Duration::from_secs(
+                                        cloud.config().timeout_secs.min(30),
+                                    );
                                     match span
-                                        .run(cloud.complete_with_usage(&turns, None, None, None))
+                                        .run(cloud.complete_with_usage(
+                                            &turns,
+                                            None,
+                                            None,
+                                            Some(voice_budget),
+                                        ))
                                         .await
                                     {
                                         Ok((reply, usage)) => {
