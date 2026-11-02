@@ -333,10 +333,37 @@ pub async fn chat(
         &routing,
     );
     let tools_now = tools.read().expect("tools config lock poisoned").clone();
+    let mut scene = camera_id
+        .as_deref()
+        .and_then(|id| grounding.scene_summary(id, unix_now_ms()));
+    // #29 freshness (2026-11-02): a typed scene question deserves a
+    // fresh look when the cached describe is stale — same gate the
+    // voice path applies. The explicit `vision:true` route already
+    // answers from a fresh frame; this targets text rounds.
+    if crate::grounding::is_scene_question(&body.text)
+        && let Some(id) = camera_id.as_deref()
+        && cloud.vision_ready()
+        // Honor the operator's vision routing (§6): a `local` vision
+        // declaration must not be bypassed by the fresh look.
+        && routing.effective("vision", cloud.vision_ready())
+            == streaming::model_route::Provider::Cloud
+        && !grounding.scene_describe_is_fresh(id, unix_now_ms(), std::time::Duration::from_secs(20))
+        && let Some(jpeg) = streams.latest_jpeg(id).await
+        && let Some(text) = crate::grounding::describe_fresh_frame(
+            Some(&cloud),
+            &jpeg,
+            std::time::Duration::from_secs(15),
+        )
+        .await
+    {
+        tracing::info!(
+            chars = text.chars().count(),
+            "chat: fresh scene describe (on-demand)"
+        );
+        scene = Some(format!("画面描述（刚刚现场抓取）：{text}"));
+    }
     let ctx = TurnContext {
-        scene: camera_id
-            .as_deref()
-            .and_then(|id| grounding.scene_summary(id, unix_now_ms())),
+        scene,
         local: Some(local_block(&pool).await),
         web: web_block(&tools_now, &body.text).await,
         wake_word: wake_word.0.clone(),
@@ -371,6 +398,7 @@ pub async fn chat(
             Box::new(crate::agent::channels::CloudChannel {
                 cloud: Arc::clone(&cloud),
                 timeout_secs: cloud.config().timeout_secs,
+                max_tokens: 512,
             })
         } else {
             Box::new(crate::agent::channels::LocalChannel {

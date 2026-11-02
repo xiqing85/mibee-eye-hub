@@ -1066,6 +1066,23 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     }
     .spawn();
 
+    // Create StreamManager early so protocol handlers (ONVIF/GB28181) can
+    // reference it for runtime output attachment — and before the voice
+    // bridge, whose on-demand fresh-frame look (#29, 2026-11-02) reads
+    // `latest_jpeg` from it.
+    // Open a second DB connection for StreamManager (WAL mode supports
+    // concurrent readers; this lets StreamManager read protocol configs at
+    // stream-creation time without contending with the web server's lock).
+    let streamer_db = pool.clone();
+    let stream_manager = Arc::new(
+        web::stream_manager::StreamManager::with_host_and_db(advertised_host.clone(), streamer_db)
+            .with_recording_pause_flag(Arc::clone(&recording_paused))
+            .with_force_idr_flag(Arc::clone(&force_idr))
+            .with_gb_flips(Arc::clone(&gb_flips))
+            .with_ai(ai_engine.clone())
+            .with_segment_slots(Arc::clone(&segment_registry)),
+    );
+
     // Voice interactions → SSE `voice_transcript`; when the local LLM is
     // active, non-empty transcripts also get one auto-reply (SSE
     // `chat_reply`) — the TTS playback stage will consume these.
@@ -1080,6 +1097,7 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         desktop: Arc::clone(&desktop),
         grounding: Arc::clone(&grounding_state),
         streams: Arc::clone(&segment_registry),
+        stream_manager: Arc::clone(&stream_manager),
         tools: Arc::clone(&shared_tools),
         agent_registry: Arc::clone(&agent_registry),
         agent_config: config.agent.clone(),
@@ -1094,20 +1112,6 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     }
     .spawn();
 
-    // Create StreamManager early so protocol handlers (ONVIF/GB28181) can
-    // reference it for runtime output attachment.
-    // Open a second DB connection for StreamManager (WAL mode supports
-    // concurrent readers; this lets StreamManager read protocol configs at
-    // stream-creation time without contending with the web server's lock).
-    let streamer_db = pool.clone();
-    let stream_manager = Arc::new(
-        web::stream_manager::StreamManager::with_host_and_db(advertised_host.clone(), streamer_db)
-            .with_recording_pause_flag(Arc::clone(&recording_paused))
-            .with_force_idr_flag(Arc::clone(&force_idr))
-            .with_gb_flips(Arc::clone(&gb_flips))
-            .with_ai(ai_engine.clone())
-            .with_segment_slots(Arc::clone(&segment_registry)),
-    );
     // Agent tool/skill registry (SPEC §3.5): built-ins + MCP stdio plugin
     // servers. A warmup task connects the servers so the capabilities
     // count settles; unreachable servers simply contribute no tools.

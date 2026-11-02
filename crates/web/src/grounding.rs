@@ -213,6 +213,94 @@ impl GroundingState {
             Some(parts.join("；"))
         }
     }
+
+    /// Age of the cached VLM describe for a camera. `None` = unknown
+    /// camera or never described.
+    #[must_use]
+    pub fn scene_describe_age_ms(&self, camera_id: &str, now_ms: u64) -> Option<u64> {
+        let cams = self.cameras.lock().expect("grounding lock");
+        let cam = cams.get(camera_id)?;
+        cam.vlm_ts_ms.map(|ts| now_ms.saturating_sub(ts))
+    }
+
+    /// True only when a describe exists and is within `max_age` — the
+    /// gate for the on-demand fresh look (2026-11-02).
+    #[must_use]
+    pub fn scene_describe_is_fresh(&self, camera_id: &str, now_ms: u64, max_age: Duration) -> bool {
+        self.scene_describe_age_ms(camera_id, now_ms)
+            .is_some_and(|age| age <= max_age.as_millis() as u64)
+    }
+}
+
+/// Trilingual table for "the user is asking about what the camera sees
+/// right now". Conservative by design — a false positive only costs one
+/// deadline-guarded fresh describe.
+const SCENE_QUESTION_MARKERS: &[&str] = &[
+    // Mandarin
+    "看到",
+    "看见",
+    "画面",
+    "门口",
+    "门外",
+    "窗外",
+    "谁在",
+    "有人",
+    "屋里",
+    "房间",
+    "监控",
+    "现场",
+    "情况怎么样",
+    "什么情况",
+    // Cantonese
+    "睇到",
+    "見到",
+    "門口",
+    // English
+    "what do you see",
+    "do you see",
+    "who is",
+    "at the door",
+    "camera see",
+];
+
+/// Does this utterance ask about the current camera view? (#29
+/// freshness gate, 2026-11-02.)
+#[must_use]
+pub fn is_scene_question(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    SCENE_QUESTION_MARKERS
+        .iter()
+        .any(|m| lower.contains(&m.to_lowercase()))
+}
+
+/// Fresh on-demand describe for scene questions (#29 freshness
+/// amendment, 2026-11-02).
+///
+/// Field data: the alarm-driven describe pipeline only runs on alarm
+/// edges — in a quiet room the cached 【画面】 text goes arbitrarily
+/// stale (a 106 s-old describe answered "你现在看到什么"), and the local
+/// 4B VLM takes 60-100 s per describe: too slow for a spoken round and
+/// not safely cancellable (blocking llama eval). So the fresh look goes
+/// to the configured cloud vision model (auto-selected when an image
+/// rides the request) under a hard deadline; any failure returns `None`
+/// and the caller answers from the age-labeled cache — fail-open, no
+/// regression over the pre-existing behavior.
+pub async fn describe_fresh_frame(
+    cloud: Option<&crate::cloud::CloudAi>,
+    jpeg: &[u8],
+    timeout: Duration,
+) -> Option<String> {
+    let cloud = cloud?;
+    let turns = vec![streaming::llm::ChatTurn {
+        role: "user".into(),
+        content: "用一到两句话客观描述当前监控画面：场景、人物位置与动作。".into(),
+    }];
+    let (reply, _) = cloud
+        .complete_with_usage(&turns, Some(jpeg), None, Some(timeout))
+        .await
+        .ok()?;
+    let trimmed = reply.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Parse the pixel dimensions out of a baseline/progressive JPEG's SOF
@@ -365,5 +453,43 @@ mod tests {
         let g = GroundingState::new();
         g.record_vlm_description("0", 1000, "空房间");
         assert!(g.scene_summary("0", 2000).is_some());
+    }
+
+    #[test]
+    fn scene_describe_age_and_freshness() {
+        let g = GroundingState::new();
+        assert_eq!(g.scene_describe_age_ms("0", 1_000), None, "unknown camera");
+        g.record_detections("0", 500, 640, &[]); // creates the record, no vlm yet
+        assert_eq!(g.scene_describe_age_ms("0", 1_000), None, "never described");
+        assert!(!g.scene_describe_is_fresh("0", 1_000, Duration::from_secs(20)));
+        g.record_vlm_description("0", 900, "空房间");
+        assert_eq!(g.scene_describe_age_ms("0", 1_000), Some(100));
+        assert!(g.scene_describe_is_fresh("0", 1_000, Duration::from_secs(20)));
+        // The 2026-11-02 incident shape: 106 s old must count as stale.
+        assert!(!g.scene_describe_is_fresh("0", 106_900, Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn scene_question_markers_cover_the_field_phrases() {
+        // Phrases measured in the 2026-11-02 session.
+        for q in [
+            "你现在看到什么",
+            "帮我看看门口有人吗",
+            "画面里是什么情况",
+            "who is at the door",
+            "What do you see right now",
+        ] {
+            assert!(is_scene_question(q), "should match: {q}");
+        }
+        // Not about the view — no fresh describe is worth its latency.
+        for q in [
+            "现在几点了",
+            "广州天气怎么样",
+            "给我讲个故事",
+            "你叫什么名字",
+            "把客厅的灯打开",
+        ] {
+            assert!(!is_scene_question(q), "should NOT match: {q}");
+        }
     }
 }

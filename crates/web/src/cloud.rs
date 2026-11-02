@@ -149,12 +149,17 @@ impl CloudAi {
 
     /// [`CloudAi::complete`] plus the usage tokens reported by the
     /// provider (fed into per-model metrics and conversation traces).
-    pub async fn complete_with_usage(
+    /// [`CloudAi::complete_with_usage`] with a voice-posture reply cap
+    /// (2026-11-02): free-pool models ignore the "回答简洁" prompt and
+    /// produced 60-100 char monologues — 20-26 s of TTS playback per
+    /// round. Voice rounds call this with ~150.
+    pub async fn complete_with_usage_capped(
         &self,
         turns: &[ChatTurn],
         image_jpeg: Option<&[u8]>,
         model_override: Option<&str>,
         timeout: Option<Duration>,
+        max_tokens: u32,
     ) -> Result<(String, Option<(u64, u64)>), CloudError> {
         let cfg = self.config();
         if cfg.provider == "off" || cfg.api_key.is_empty() {
@@ -166,16 +171,13 @@ impl CloudAi {
                 if image_jpeg.is_some() && !cfg.vision_model.is_empty() {
                     Some(cfg.vision_model.clone())
                 } else {
-                    None
+                    Some(cfg.chat_model.clone())
                 }
             })
-            .unwrap_or_else(|| cfg.chat_model.clone());
-        if model.is_empty() {
+            .filter(|m| !m.is_empty());
+        let Some(model) = model else {
             return Err(CloudError::NoModel);
-        }
-        // Per-model metrics + OTel span (SPEC appendix A #39): the model
-        // id splits text/vision routing so the two route families are
-        // independently monitorable; variant = the concrete provider id.
+        };
         let model_id = if image_jpeg.is_some() {
             "cloud.vision"
         } else {
@@ -183,7 +185,7 @@ impl CloudAi {
         };
         let call = observability::model_call(model_id, &model);
         let result = self
-            .complete_request(&cfg, model, turns, image_jpeg, timeout)
+            .complete_request(&cfg, model, turns, image_jpeg, timeout, max_tokens)
             .await;
         match &result {
             Ok((_, usage)) => {
@@ -196,6 +198,19 @@ impl CloudAi {
         result
     }
 
+    pub async fn complete_with_usage(
+        &self,
+        turns: &[ChatTurn],
+        image_jpeg: Option<&[u8]>,
+        model_override: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> Result<(String, Option<(u64, u64)>), CloudError> {
+        // Per-model metrics + OTel span (SPEC appendix A #39) ride the
+        // capped variant; the historic dialogue cap stays 512.
+        self.complete_with_usage_capped(turns, image_jpeg, model_override, timeout, 512)
+            .await
+    }
+
     /// Agent tool-calling round trip (SPEC §3.5): the OpenAI-compatible
     /// `tools` array goes out with the request; the reply may carry
     /// `tool_calls` instead of (or alongside) text. `with_tools == false`
@@ -206,6 +221,7 @@ impl CloudAi {
         tools: &[crate::agent::ToolSpec],
         with_tools: bool,
         timeout_secs: u64,
+        max_tokens: u32,
     ) -> Result<
         (
             Option<String>,
@@ -224,7 +240,15 @@ impl CloudAi {
         }
         let call = observability::model_call("cloud.chat", &model);
         let result = self
-            .agent_request(&cfg, model, turns, tools, with_tools, timeout_secs)
+            .agent_request(
+                &cfg,
+                model,
+                turns,
+                tools,
+                with_tools,
+                timeout_secs,
+                max_tokens,
+            )
             .await;
         match &result {
             Ok((_, _, usage)) => {
@@ -296,6 +320,7 @@ impl CloudAi {
     }
 
     /// The agent variant of the raw HTTP round trip (no vision legs).
+    #[allow(clippy::too_many_arguments)]
     async fn agent_request(
         &self,
         cfg: &CloudConfig,
@@ -304,6 +329,7 @@ impl CloudAi {
         tools: &[crate::agent::ToolSpec],
         with_tools: bool,
         timeout_secs: u64,
+        max_tokens: u32,
     ) -> Result<
         (
             Option<String>,
@@ -319,7 +345,7 @@ impl CloudAi {
         let mut body = json!({
             "model": model,
             "messages": messages,
-            "max_tokens": 512,
+            "max_tokens": max_tokens,
             // Voice-forward posture: a security camera's spoken replies
             // want direct answers, not hidden deliberation. Several
             // OpenRouter models otherwise route the whole reply into
@@ -402,6 +428,7 @@ impl CloudAi {
     }
 
     /// The raw OpenAI-compatible HTTP round trip (no metrics wrapper).
+    #[allow(clippy::too_many_arguments)]
     async fn complete_request(
         &self,
         cfg: &CloudConfig,
@@ -409,6 +436,7 @@ impl CloudAi {
         turns: &[ChatTurn],
         image_jpeg: Option<&[u8]>,
         timeout: Option<Duration>,
+        max_tokens: u32,
     ) -> Result<(String, Option<(u64, u64)>), CloudError> {
         let messages: Vec<serde_json::Value> = turns
             .iter()
@@ -432,7 +460,7 @@ impl CloudAi {
         let body = json!({
             "model": model,
             "messages": messages,
-            "max_tokens": 512,
+            "max_tokens": max_tokens,
             // Same voice-forward posture as the agent leg (see there);
             // this legacy path is the 2026-11-02 08:10 incident's
             // 141 s empty-content stall — it had lost the knob.
@@ -865,6 +893,7 @@ mod tests {
                 &tools,
                 true,
                 5,
+                512,
             )
             .await
             .unwrap();
@@ -913,6 +942,7 @@ mod tests {
                 }],
                 false, // forced final text iteration
                 5,
+                512,
             )
             .await
             .unwrap();
@@ -934,7 +964,7 @@ mod tests {
             ..CloudConfig::default()
         });
         assert!(matches!(
-            off.agent_complete(&[], &[], true, 5).await,
+            off.agent_complete(&[], &[], true, 5, 512).await,
             Err(CloudError::NotEnabled)
         ));
         // Key present but provider off still refuses.
@@ -944,7 +974,7 @@ mod tests {
             ..CloudConfig::default()
         });
         assert!(matches!(
-            off_keyed.agent_complete(&[], &[], true, 5).await,
+            off_keyed.agent_complete(&[], &[], true, 5, 512).await,
             Err(CloudError::NotEnabled)
         ));
         // No chat model configured.
@@ -955,7 +985,7 @@ mod tests {
             ..CloudConfig::default()
         });
         assert!(matches!(
-            nomodel.agent_complete(&[], &[], true, 5).await,
+            nomodel.agent_complete(&[], &[], true, 5, 512).await,
             Err(CloudError::NoModel)
         ));
     }
