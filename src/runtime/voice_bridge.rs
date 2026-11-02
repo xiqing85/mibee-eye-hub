@@ -557,6 +557,13 @@ impl VoiceBridge {
                             if web::grounding::is_scene_question(&ev.transcript)
                                 && let Some(id) = scene_camera_id.as_deref()
                                 && cloud_for_voice.vision_ready()
+                                // Honor the operator's vision routing (§6):
+                                // a `local` vision declaration must not be
+                                // bypassed by the fresh look.
+                                && routing.read().expect("models routing lock").effective(
+                                    "vision",
+                                    cloud_for_voice.vision_ready(),
+                                ) == streaming::model_route::Provider::Cloud
                                 && !grounding_for_voice.scene_describe_is_fresh(
                                     id,
                                     unix_now_ms(),

@@ -343,6 +343,10 @@ pub async fn chat(
     if crate::grounding::is_scene_question(&body.text)
         && let Some(id) = camera_id.as_deref()
         && cloud.vision_ready()
+        // Honor the operator's vision routing (§6): a `local` vision
+        // declaration must not be bypassed by the fresh look.
+        && routing.effective("vision", cloud.vision_ready())
+            == streaming::model_route::Provider::Cloud
         && !grounding.scene_describe_is_fresh(id, unix_now_ms(), std::time::Duration::from_secs(20))
         && let Some(jpeg) = streams.latest_jpeg(id).await
         && let Some(text) = crate::grounding::describe_fresh_frame(
