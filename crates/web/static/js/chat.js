@@ -19,8 +19,45 @@ let vision = localStorage.getItem('mibee_chat_vision') === '1'; // explicit VLM 
 const seenTurnIds = new Set();   // SSE conversation turns already rendered
 let lastHttpUserText = '';       // dedupe the record event of own sends
 
+// Model routing switch (design §6, M5): maps the device's
+// per-capability routing onto one three-way selector. Auto = the
+// historic posture (chat cloud-first, vision local); Online = chat and
+// vision both cloud; Local = everything on-device. Hidden when the
+// device has no routing API (Pi products) — negative compat by
+// endpoint absence.
+const ENGINE_DOC = {
+  auto:  { chat: { provider: 'cloud', fallback: 'local' },  vision: { provider: 'local', fallback: 'local' } },
+  cloud: { chat: { provider: 'cloud', fallback: 'local' },  vision: { provider: 'cloud', fallback: 'local' } },
+  local: { chat: { provider: 'local', fallback: 'local' },  vision: { provider: 'local', fallback: 'local' } },
+};
+function routingToMode(doc) {
+  if (!doc) return 'auto';
+  if (doc.vision?.provider === 'cloud') return 'cloud';
+  if (doc.chat?.provider === 'local') return 'local';
+  return 'auto';
+}
+async function initEngineSwitch() {
+  const sel = $('chat-engine');
+  if (!sel) return;
+  let doc = null;
+  try { doc = (await api.get('/api/models/routing')).data; }
+  catch (_) { return; }   // no routing API on this device — keep hidden
+  sel.classList.remove('hidden');
+  sel.value = routingToMode(doc);
+  sel.addEventListener('change', async () => {
+    const mode = sel.value;
+    try {
+      await api.put('/api/models/routing', ENGINE_DOC[mode]);
+      toast(t('engineApplied'), 'ok');
+    } catch (e) {
+      toast(t('engineApplyFailed') + (e?.message ? `: ${e.message}` : ''), 'err');
+    }
+  });
+}
+
 export function initChat() {
   renderChatHints();
+  initEngineSwitch();
   const send = $('chat-send');
   if (send) send.addEventListener('click', sendChat);
   const clear = $('chat-clear');

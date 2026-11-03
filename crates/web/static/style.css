@@ -1777,6 +1777,13 @@ input[type="range"]::-moz-range-thumb {
 .chat-card-head { display: flex; align-items: center; gap: 10px; }
 .chat-card-head h3 { flex: 1; }
 .chat-toolbar { display: flex; align-items: center; gap: 10px; }
+/* Model-routing selector in the chat card head (design §6, M5). */
+.engine-select {
+  font: inherit; font-size: 12px; padding: 2px 6px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--card); color: var(--text-primary);
+  cursor: pointer;
+}
+.engine-select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .chat-count { font-size: 11px; color: var(--text-faint); }
 .chat-log {
   height: clamp(240px, calc(100vh - var(--nav-h) - 380px), 460px);
@@ -2470,3 +2477,12 @@ input[type="range"]::-moz-range-thumb {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: .8rem;
 }
+/* Thermal card (SPEC §3.7) */
+.thermal-body{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+.thermal-image-wrap{flex:1 1 320px;min-width:260px}
+.thermal-image-wrap img{width:100%;border:1px solid var(--border,#444);border-radius:6px;display:block}
+.thermal-stats{flex:0 1 220px;display:grid;gap:8px}
+.thermal-stat{display:flex;justify-content:space-between;gap:8px;font-size:14px}
+.thermal-stat b{font-variant-numeric:tabular-nums}
+.thermal-stat small{color:var(--muted,#999);align-self:center}
+#thermal-trusted-badge{background:#1d6f42;color:#fff;border-radius:10px;padding:2px 10px;font-size:12px}
