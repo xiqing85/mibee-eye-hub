@@ -27,6 +27,7 @@ import { initTraces, startTracesPolling, refreshTraces, tracesCap } from './trac
 import { renderDevices, initDevices } from './devices.js';
 import { renderRecords, renderSpeakers, renderMeetings, initRecords, updateRecordsVisibility, recordsSseHook } from './records.js';
 import { initAway, updateAwayVisibility, refreshAwayStatus, renderAwayEvents, handleAwayEvent, handleAwayState } from './away.js';
+import { updateThermalVisibility, handleThermalEvent } from './thermal.js';
 import { renderModels, initModels, updateModelsVisibility, handleModelTask } from './models.js';
 
 // Routable views. settings/status/devices are sub-views of the System
@@ -122,6 +123,7 @@ async function enterApp() {
   updateRecordsVisibility();
   initAway();
   updateAwayVisibility();
+  updateThermalVisibility();
   refreshAwayStatus();
   initModels();
   updateModelsVisibility();
@@ -156,6 +158,7 @@ async function enterApp() {
     agent_step: handleAgentStep,
     away_event: handleAwayEvent,
     away_state: handleAwayState,
+    'thermal.temperature': handleThermalEvent,
     scale: handleScaleEvent,
     zone_event: () => { /* zone events ride the alarm/toast path */ },
     param_changed: handleParamChanged,
@@ -225,6 +228,7 @@ function applyCapsVisibility() {
   updateChatVisibility();
   updateWaveformVisibility();
   updateModelFlowVisibility();
+  updateThermalVisibility();
 }
 
 function initShell() {

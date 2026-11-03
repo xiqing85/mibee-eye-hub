@@ -231,6 +231,26 @@
         </div>
       </div>
 
+      <!-- Thermal card (extension: thermal, SPEC §3.7) — primary surface on
+           a thermal camera: pseudo-color image + absolute readings. -->
+      <div class="card hidden" id="thermal-card">
+        <div class="imaging-header-row">
+          <h3 class="panel-title"><span data-i18n="thermalTitle">Thermal imaging</span></h3>
+          <span class="badge hidden" id="thermal-trusted-badge" data-i18n="thermalTrusted">absolute °C</span>
+        </div>
+        <div class="thermal-body">
+          <div class="thermal-image-wrap">
+            <img id="thermal-image" alt="thermal" aria-label="thermal image">
+          </div>
+          <div class="thermal-stats">
+            <div class="thermal-stat"><span data-i18n="thermalTa">Sensor temp</span><b id="thermal-ta">—</b></div>
+            <div class="thermal-stat"><span data-i18n="thermalMax">Max</span><b id="thermal-max">—</b><small id="thermal-max-pos"></small></div>
+            <div class="thermal-stat"><span data-i18n="thermalMin">Min</span><b id="thermal-min">—</b><small id="thermal-min-pos"></small></div>
+            <div class="thermal-stat"><span data-i18n="thermalFps">Sensor rate</span><b id="thermal-fps">—</b></div>
+          </div>
+        </div>
+      </div>
+
       <!-- Imaging controls (extension: imaging) -->
       <div class="card imaging-section hidden" id="imaging-section">
         <div class="imaging-header-row">
@@ -290,6 +310,11 @@
               <span id="chat-count" class="mono chat-count"></span>
               <button type="button" id="chat-clear" class="btn-small btn-ghost" data-i18n="convClear">Clear all</button>
             </div>
+            <select id="chat-engine" class="engine-select hidden" data-i18n-title="engineTitle" aria-label="model routing">
+              <option value="auto" data-i18n="engineAuto">Auto</option>
+              <option value="cloud" data-i18n="engineCloud">Online AI</option>
+              <option value="local" data-i18n="engineLocal">Local</option>
+            </select>
           </div>
           <div id="chat-log" class="chat-log"></div>
           <div class="chat-input-row">
