@@ -612,6 +612,15 @@ impl VoiceBridge {
                             };
                             let mut turns =
                                 vec![web::routes::chat::build_system_turn(&ctx, &ev.transcript)];
+                            // Spoken-posture instruction (2026-11-04): free
+                            // models ignore the shared "回答简洁" hint and
+                            // produced 48-150-token monologues — 30-97 s of
+                            // TTS. The hard cap is 50 tokens; this makes the
+                            // model aim even lower.
+                            if let Some(sys) = turns.first_mut() {
+                                sys.content
+                                    .push_str("\n播报形态：像对话助手一样口语回答，最多两句话。");
+                            }
                             turns.extend(history_turns.iter().take(4).cloned());
                             turns.push(streaming::llm::ChatTurn {
                                 role: "user".into(),
@@ -717,9 +726,12 @@ impl VoiceBridge {
                                                 // at 30 s, fail back local.
                                                 timeout_secs: cloud.config().timeout_secs.min(30),
                                                 // Spoken replies stay short —
-                                                // long monologues cost 20 s+
-                                                // of TTS playback.
-                                                max_tokens: 150,
+                                                // 2026-11-04 field data: 48
+                                                // tokens already cost 30 s of
+                                                // TTS playback, 150 hit 97 s;
+                                                // 50 tokens ≈ two spoken
+                                                // sentences.
+                                                max_tokens: 50,
                                             })
                                         } else {
                                             Box::new(web::agent::channels::LocalChannel {
@@ -883,7 +895,7 @@ impl VoiceBridge {
                                             None,
                                             None,
                                             Some(voice_budget),
-                                            150,
+                                            50,
                                         ))
                                         .await
                                     {
