@@ -239,14 +239,51 @@
           <span class="badge hidden" id="thermal-trusted-badge" data-i18n="thermalTrusted">absolute °C</span>
         </div>
         <div class="thermal-body">
-          <div class="thermal-image-wrap">
+          <div class="thermal-image-wrap" id="thermal-wrap">
             <img id="thermal-image" alt="thermal" aria-label="thermal image">
+            <canvas id="thermal-canvas" aria-hidden="true"></canvas>
           </div>
           <div class="thermal-stats">
             <div class="thermal-stat"><span data-i18n="thermalTa">Sensor temp</span><b id="thermal-ta">—</b></div>
             <div class="thermal-stat"><span data-i18n="thermalMax">Max</span><b id="thermal-max">—</b><small id="thermal-max-pos"></small></div>
             <div class="thermal-stat"><span data-i18n="thermalMin">Min</span><b id="thermal-min">—</b><small id="thermal-min-pos"></small></div>
             <div class="thermal-stat"><span data-i18n="thermalFps">Sensor rate</span><b id="thermal-fps">—</b></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hardware bring-up card (extension: thermal.hardware, SPEC §3.7) —
+           pins/bus/address configuration + on-device discovery scan. -->
+      <div class="card hidden" id="hardware-card">
+        <div class="imaging-header-row">
+          <h3 class="panel-title"><span data-i18n="hardwareTitle">Hardware access</span></h3>
+        </div>
+        <div class="hardware-body">
+          <div class="hardware-current">
+            <span data-i18n="hardwareCurrent">Current wiring</span>
+            <b id="hardware-current-value">—</b>
+          </div>
+          <div class="hardware-actions">
+            <button type="button" id="hardware-scan-btn" class="btn-small" data-i18n="hardwareScan">Scan</button>
+            <span id="hardware-scan-status" class="muted"></span>
+          </div>
+          <div id="hardware-scan-results" class="hardware-results"></div>
+          <hr>
+          <div class="hardware-manual">
+            <span class="muted" data-i18n="hardwareManual">Manual wiring</span>
+            <div class="hardware-form">
+              <select id="hardware-bus-type" aria-label="bus type">
+                <option value="gpio">GPIO</option>
+                <option value="twi">TWI</option>
+                <option value="auto">auto</option>
+              </select>
+              <input id="hardware-sda" type="number" min="1" placeholder="SDA 226" aria-label="SDA pin">
+              <input id="hardware-scl" type="number" min="1" placeholder="SCL 227" aria-label="SCL pin">
+              <input id="hardware-device" type="text" placeholder="/dev/i2c-2" aria-label="i2c device" class="hidden">
+              <input id="hardware-addr" type="text" placeholder="0x33" aria-label="i2c address">
+              <button type="button" id="hardware-apply-btn" class="btn-small" data-i18n="hardwareApplyBtn">Apply</button>
+            </div>
+            <div id="hardware-msg" class="muted"></div>
           </div>
         </div>
       </div>
