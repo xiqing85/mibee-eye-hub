@@ -2479,10 +2479,28 @@ input[type="range"]::-moz-range-thumb {
 }
 /* Thermal card (SPEC §3.7) */
 .thermal-body{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
-.thermal-image-wrap{flex:1 1 320px;min-width:260px}
+.thermal-image-wrap{flex:1 1 320px;min-width:260px;position:relative}
 .thermal-image-wrap img{width:100%;border:1px solid var(--border,#444);border-radius:6px;display:block}
+#thermal-canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair;border-radius:6px}
+#thermal-tip{position:fixed;z-index:50;background:var(--card,#111);color:var(--text,#eee);
+border:1px solid var(--border,#555);border-radius:6px;padding:4px 10px;font-size:13px;
+font-variant-numeric:tabular-nums;pointer-events:none;display:none;box-shadow:0 2px 8px #0008}
 .thermal-stats{flex:0 1 220px;display:grid;gap:8px}
 .thermal-stat{display:flex;justify-content:space-between;gap:8px;font-size:14px}
 .thermal-stat b{font-variant-numeric:tabular-nums}
 .thermal-stat small{color:var(--muted,#999);align-self:center}
 #thermal-trusted-badge{background:#1d6f42;color:#fff;border-radius:10px;padding:2px 10px;font-size:12px}
+
+/* Hardware bring-up card (thermal.hardware, SPEC §3.7) */
+.hardware-body { display: flex; flex-direction: column; gap: 10px; }
+.hardware-current { display: flex; justify-content: space-between; align-items: baseline; }
+.hardware-actions { display: flex; align-items: center; gap: 10px; }
+.hardware-results { display: flex; flex-direction: column; gap: 6px; }
+.hardware-hit { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.hardware-hit-error { font-size: 12px; }
+.hardware-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.hardware-form input, .hardware-form select {
+  width: 110px; padding: 4px 8px;
+  background: var(--bg, #161a22); color: var(--fg, #e6e9ef);
+  border: 1px solid var(--border, #2a3040); border-radius: 6px;
+}

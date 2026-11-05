@@ -28,6 +28,7 @@ import { renderDevices, initDevices } from './devices.js';
 import { renderRecords, renderSpeakers, renderMeetings, initRecords, updateRecordsVisibility, recordsSseHook } from './records.js';
 import { initAway, updateAwayVisibility, refreshAwayStatus, renderAwayEvents, handleAwayEvent, handleAwayState } from './away.js';
 import { updateThermalVisibility, handleThermalEvent } from './thermal.js';
+import { updateHardwareVisibility } from './hardware.js';
 import { renderModels, initModels, updateModelsVisibility, handleModelTask } from './models.js';
 
 // Routable views. settings/status/devices are sub-views of the System
@@ -124,6 +125,7 @@ async function enterApp() {
   initAway();
   updateAwayVisibility();
   updateThermalVisibility();
+  updateHardwareVisibility();
   refreshAwayStatus();
   initModels();
   updateModelsVisibility();
@@ -229,6 +231,7 @@ function applyCapsVisibility() {
   updateWaveformVisibility();
   updateModelFlowVisibility();
   updateThermalVisibility();
+  updateHardwareVisibility();
 }
 
 function initShell() {
