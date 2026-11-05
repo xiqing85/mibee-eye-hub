@@ -240,7 +240,13 @@ export async function startLive() {
   // show the honest empty state instead.
   const camsKnownEmpty = hasCap('camera_management') && Array.isArray(store.cameras)
     && store.cameras.length === 0;
-  if (!hasCap('camera_management') || camsKnownEmpty) {
+  // Family regression guard: single-camera devices (rs/go thermal cams)
+  // never advertise camera_management — that key means multi-camera
+  // management. The honest empty state needs either a confirmed-empty
+  // camera list on a management device, or no video capability at all
+  // (mic/talk form factors).
+  const noVideoCaps = !hasCap('mse') && !hasCap('mjpeg');
+  if (camsKnownEmpty || noVideoCaps) {
     $('stream-loading').classList.add('hidden');
     const iconHost = $('stream-empty-icon');
     if (iconHost && !iconHost.innerHTML) iconHost.innerHTML = icon('video', 40);

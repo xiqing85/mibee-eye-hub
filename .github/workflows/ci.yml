@@ -10,7 +10,7 @@ env:
 
 jobs:
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned 2026-11-04: ubuntu-latest rolled to 26.04 (image 20261101) — the static sherpa-onnx test binaries abort with std::bad_alloc at startup there; revisit when the toolchain incompatibility is understood
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -19,7 +19,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned 2026-11-04: ubuntu-latest rolled to 26.04 (image 20261101) — the static sherpa-onnx test binaries abort with std::bad_alloc at startup there; revisit when the toolchain incompatibility is understood
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,7 +31,7 @@ jobs:
       - run: cargo ci-clippy
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned 2026-11-04: ubuntu-latest rolled to 26.04 (image 20261101) — the static sherpa-onnx test binaries abort with std::bad_alloc at startup there; revisit when the toolchain incompatibility is understood
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -46,7 +46,7 @@ jobs:
     # 新模块 ≥85% 起步由评审执行。口径 = --workspace --lib 默认 feature，
     # feature 门控模块（ocr/webrtc/mse/faces 等）的执行面在 feature-matrix
     # job，本口径下计 0 不换算。
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned 2026-11-04: ubuntu-latest rolled to 26.04 (image 20261101) — the static sherpa-onnx test binaries abort with std::bad_alloc at startup there; revisit when the toolchain incompatibility is understood
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -63,7 +63,7 @@ jobs:
     # 一遍。voice+llm 腿抓跨 feature 静态初始化回归（e02c2a6 一类）。
     # 注意 workspace 级 --no-default-features 不传导给成员 crate 的
     # 默认特性，no-ai 腿须按 -p streaming 指定。
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned 2026-11-04: ubuntu-latest rolled to 26.04 (image 20261101) — the static sherpa-onnx test binaries abort with std::bad_alloc at startup there; revisit when the toolchain incompatibility is understood
     strategy:
       fail-fast: false
       matrix:
@@ -114,14 +114,14 @@ jobs:
           SHERPA_ONNX_LIB_DIR: ${{ github.workspace }}/tmp/sherpa-libs/sherpa-onnx-v1.13.8-linux-x64-static-lib/lib
 
   hygiene:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned 2026-11-04: ubuntu-latest rolled to 26.04 (image 20261101) — the static sherpa-onnx test binaries abort with std::bad_alloc at startup there; revisit when the toolchain incompatibility is understood
     steps:
       - uses: actions/checkout@v4
       - name: Repo hygiene gate (junk/secret files must not be tracked)
         run: tools/check-repo-hygiene.sh
 
   hardcode:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned 2026-11-04: ubuntu-latest rolled to 26.04 (image 20261101) — the static sherpa-onnx test binaries abort with std::bad_alloc at startup there; revisit when the toolchain incompatibility is understood
     steps:
       - uses: actions/checkout@v4
       - name: Hardcoded-value gate (configurable values must come from config)
@@ -130,7 +130,7 @@ jobs:
   identity:
     # 身份门禁（2026-09-27）：公开历史只允许已验证的 xiqing85 noreply 身份
     # （324791119）。捏造的 noreply 数字 ID 曾把陌生账号挂上贡献者列表。
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned 2026-11-04: ubuntu-latest rolled to 26.04 (image 20261101) — the static sherpa-onnx test binaries abort with std::bad_alloc at startup there; revisit when the toolchain incompatibility is understood
     steps:
       - uses: actions/checkout@v4
         with:

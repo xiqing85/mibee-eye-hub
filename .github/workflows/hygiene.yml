@@ -6,7 +6,7 @@ on:
 
 jobs:
   hygiene:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned 2026-11-04: ubuntu-latest rolled to 26.04 (image 20261101) — the static sherpa-onnx test binaries abort with std::bad_alloc at startup there; revisit when the toolchain incompatibility is understood
     steps:
       - uses: actions/checkout@v4
       - name: Repo hygiene gate (junk/secret files must not be tracked)
@@ -32,7 +32,7 @@ jobs:
   # fails on a read-only GITHUB_TOKEN. So the waiver is written to the
   # global config in a step here and `cargo audit` is invoked directly.
   audit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # pinned 2026-11-04: ubuntu-latest rolled to 26.04 (image 20261101) — the static sherpa-onnx test binaries abort with std::bad_alloc at startup there; revisit when the toolchain incompatibility is understood
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
