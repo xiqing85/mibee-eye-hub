@@ -584,10 +584,17 @@ enabled = false
 | `udp_port_max` | u16 | `0` | UDP 端口段终点（含；0 = 系统自选） |
 | `stun_servers` | String | `""` | 逗号分隔的 STUN URL（如 `stun:stun.l.google.com:19302`）；空 = 仅局域网 host candidates |
 
-### [ai] - 目标检测（NanoDet-Plus）
+### [ai] - 目标检测（NanoDet-Plus / YOLOX / CPAI 远端）
 
 视觉目标检测，喂给告警、区域与离家看家。默认关——与出站协议同为
-opt-in。
+opt-in。解码族按模型 ONNX 输出形状自动判型（NanoDet 与 YOLOX 族导出
+只改 `model_path` 即接入）。也可改用 **CPAI 兼容远端端点**
+（CodeProject.AI 线格式——任何 CPAI 服务器皆可，如 MiBeeVision）把推理
+放到设备外：`cpai_endpoint` 非空时启动期优先生效，`/api/detections`
+上报 `"model":"cpai-remote"`；端点失效时按指数退避重探（1s → 60s 封顶）
+回落本地模型（fail-open；本地模型不可加载时探测间隙如实返回空帧）。
+运行时经 §4.6 activate 切到任意本地模型即回到设备端检测；切回远端需
+重启。
 
 ```toml
 [ai]
@@ -601,9 +608,12 @@ enabled = false
 | `enabled` | bool | `false` | 总开关 |
 | `model` | String | `"nanodet-plus-m-320"` | 启动模型注册表 id（SPEC §4.6）；非缺省 `model_path` 覆盖它 |
 | `allow_upload` | bool | `false` | 允许运行时上传模型（SPEC §4.6 能力 `ai_upload`；模型文件属不可信输入） |
-| `model_path` | String | `"models/nanodet-m.onnx"` | NanoDet-Plus ONNX 路径（相对工作目录或绝对） |
-| `confidence_threshold` | f32 | `0.5` | 检测上报的最小置信度（0..=1）。**热键**：`PUT /api/config` 改动即刻生效（运行中的采样工作器下一帧起读取新值） |
+| `model_path` | String | `"models/nanodet-m.onnx"` | NanoDet-Plus ONNX 路径（相对工作目录或绝对）；也是远端后端的 fail-open 回落模型 |
+| `confidence_threshold` | f32 | `0.5` | 检测上报的最小置信度（0..=1）。**热键**：`PUT /api/config` 改动即刻生效（运行中的采样工作器下一帧起读取新值）。同时作为远端端点 `minConfidence` 表单字段下发 |
 | `interval_ms` | u64 | `1000` | 每相机两次推理的最小间隔。**热键**：同上，改动即刻生效 |
+| `cpai_endpoint` | String | `""` | 远端 CPAI 检测端点 URL（如 `http://nvr.lan:32168/v1/vision/detection`）。空 = 本地 ONNX 检测器。启动期生效 |
+| `cpai_token` | String | `""` | 端点的 Bearer token；空 = 不带 Authorization 头（兼容无鉴权 LAN 服务器）。配置 API 中脱敏——写回 `"****"` 表示"保留已存 token" |
+| `cpai_timeout_ms` | u64 | `5000` | 远端端点的单请求超时 |
 
 ### [audio_ai] - 声音事件检测
 

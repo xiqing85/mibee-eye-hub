@@ -627,10 +627,21 @@ enabled = false
 | `udp_port_max` | u16 | `0` | UDP port range end (inclusive; 0 = OS chooses) |
 | `stun_servers` | String | `""` | Comma-separated STUN URLs (e.g. `stun:stun.l.google.com:19302`); empty = LAN-only host candidates |
 
-### [ai] - Object Detection (NanoDet-Plus)
+### [ai] - Object Detection (NanoDet-Plus / YOLOX / CPAI remote)
 
 Visual object detection feeding alarms, zones and the away watch. Off by
-default — inference is opt-in like the outbound protocols.
+default — inference is opt-in like the outbound protocols. The decode
+family is auto-detected from the model's ONNX output shape (NanoDet and
+YOLOX-family exports drop in via `model_path` alone). Alternatively, a
+**CPAI-compatible remote endpoint** (CodeProject.AI wire contract — any
+CPAI server works, e.g. MiBeeVision) can run the inference off-device:
+when `cpai_endpoint` is set it takes precedence at boot,
+`/api/detections` reports `"model":"cpai-remote"`, and a failed endpoint
+degrades to the local model with exponential re-probe backoff (1s → 60s
+cap; without a loadable local model the frames answer empty between
+probes). Runtime activation of any local model (§4.6) switches back to
+on-device detection; switching back to the remote endpoint requires a
+restart.
 
 ```toml
 [ai]
@@ -644,9 +655,12 @@ enabled = false
 | `enabled` | bool | `false` | Master switch |
 | `model` | String | `"nanodet-plus-m-320"` | Registry id of the startup model (SPEC §4.6); a non-default `model_path` overrides it |
 | `allow_upload` | bool | `false` | Allow runtime model uploads (SPEC §4.6 capability `ai_upload`; model files are untrusted input) |
-| `model_path` | String | `"models/nanodet-m.onnx"` | NanoDet-Plus ONNX path (cwd-relative or absolute) |
-| `confidence_threshold` | f32 | `0.5` | Minimum confidence for a detection to be reported (0..=1). **Hot key**: changes via `PUT /api/config` apply immediately (running sampling workers read the new value from the next frame) |
+| `model_path` | String | `"models/nanodet-m.onnx"` | NanoDet-Plus ONNX path (cwd-relative or absolute); also the fail-open fallback model for the remote backend |
+| `confidence_threshold` | f32 | `0.5` | Minimum confidence for a detection to be reported (0..=1). **Hot key**: changes via `PUT /api/config` apply immediately (running sampling workers read the new value from the next frame). Forwarded to the remote endpoint as its `minConfidence` form part |
 | `interval_ms` | u64 | `1000` | Minimum spacing between inferences per camera. **Hot key**: same — applies immediately |
+| `cpai_endpoint` | String | `""` | Remote CPAI detection endpoint URL (e.g. `http://nvr.lan:32168/v1/vision/detection`). Empty = local ONNX detector. Applied at boot |
+| `cpai_token` | String | `""` | Bearer token for the endpoint; empty = no Authorization header (unauthenticated LAN servers). Redacted from the config API — a `"****"` write-back means "keep the stored token" |
+| `cpai_timeout_ms` | u64 | `5000` | Per-request timeout for the remote endpoint |
 
 ### [audio_ai] - Sound-Event Detection
 

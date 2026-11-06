@@ -4,6 +4,22 @@
 
 ### Added
 
+- **CPAI-compatible remote detection backend (2026-11-06).** `[ai]
+  cpai_endpoint` (plus `cpai_token` / `cpai_timeout_ms`) points the
+  detector at any CPAI-compatible server (CodeProject.AI wire
+  contract; anchored on the public convention so the hub carries no
+  vendor-specific protocol). Multipart `image` + `minConfidence` form
+  parts, `Authorization: Bearer` only when a token is configured,
+  loose response read (unknown fields ignored, pixel coordinates
+  clamped to the frame). A failed endpoint degrades to the local model
+  with exponential re-probe backoff (1s → 60s cap — fail-open, no
+  retry bombardment); `/api/detections` reports the honest
+  `"model":"cpai-remote"` while the remote backend is active, and §4.6
+  activation of any local model is the runtime path back to on-device
+  detection. The token is redacted from the config API (`SECRET_KEYS`)
+  with the `"****"` = keep-stored write-back semantics. Works in every
+  build (no ONNX involvement on the remote path).
+
 - **YOLOX-family detector support (2026-11-03).** The AI detector now
   auto-detects the model family from the ONNX output shape: a
   `[1, rows, 85]` head selects the YOLOX decode path (letterbox

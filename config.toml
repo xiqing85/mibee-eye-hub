@@ -128,6 +128,15 @@ model_path = "models/nanodet-m.onnx"
 # model_path = "models/yolox_s.onnx"
 confidence_threshold = 0.5
 interval_ms = 1000
+# Remote CPAI-compatible detection endpoint (CodeProject.AI wire
+# contract — any CPAI server works). Non-empty takes precedence at
+# boot; /api/detections reports "model":"cpai-remote"; a failed
+# endpoint degrades to the local model above with exponential re-probe
+# backoff (fail-open). The confidence threshold is forwarded as the
+# request's minConfidence part.
+# cpai_endpoint = "http://nvr.lan:32168/v1/vision/detection"
+# cpai_token = ""       # Bearer token; empty = no auth header (LAN)
+# cpai_timeout_ms = 5000
 
 # ─────────────────────────────────────────────────────────────────────────────
 # On-device sound-event detection (YAMNet + Silero VAD, `[audio_ai]`).
