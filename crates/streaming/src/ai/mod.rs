@@ -22,6 +22,7 @@
 //! per camera stream; the worker exits when the JPEG broadcast closes
 //! (stream stopped).
 
+pub mod cpai;
 #[cfg(feature = "ai")]
 pub mod ort;
 pub mod postprocess;
@@ -108,6 +109,26 @@ pub struct AiConfig {
     /// Minimum spacing between inferences per camera in milliseconds.
     #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
+    /// Remote CPAI-compatible detection endpoint (CodeProject.AI wire
+    /// contract; any CPAI server works). Empty = local ONNX detector
+    /// (default). Non-empty takes precedence at boot; a failed endpoint
+    /// degrades to the local model with exponential re-probe backoff
+    /// (fail-open, appendix A #52).
+    #[serde(default)]
+    pub cpai_endpoint: String,
+    /// Bearer token for `cpai_endpoint`; empty = no Authorization header
+    /// (unauthenticated LAN servers). Never logged; redacted from the
+    /// config API surface (config_api `SECRET_KEYS`) and restored under
+    /// the `"****"` write-back convention.
+    #[serde(default)]
+    pub cpai_token: String,
+    /// Per-request timeout for the remote endpoint, in milliseconds.
+    #[serde(default = "default_cpai_timeout_ms")]
+    pub cpai_timeout_ms: u64,
+}
+
+fn default_cpai_timeout_ms() -> u64 {
+    5_000
 }
 
 pub(crate) fn default_model_path() -> String {
@@ -132,6 +153,9 @@ impl Default for AiConfig {
             model_path: default_model_path(),
             confidence_threshold: default_confidence_threshold(),
             interval_ms: default_interval_ms(),
+            cpai_endpoint: String::new(),
+            cpai_token: String::new(),
+            cpai_timeout_ms: default_cpai_timeout_ms(),
         }
     }
 }
@@ -277,6 +301,11 @@ impl AiEngine {
     #[must_use]
     pub fn from_config(config: &AiConfig) -> Self {
         let detector = Self::load_detector(config);
+        // Remote backend boots as the active detector: surface the honest
+        // id (not a registry entry) — §4.6 activation of any local model
+        // is the runtime path back to on-device detection. Only when the
+        // detector actually loaded (a disabled AI stays disabled).
+        let remote_loaded = detector.is_some() && !config.cpai_endpoint.is_empty();
         let registry = Registry::load(std::path::Path::new(registry::MODELS_DIR));
         let model_id = registry
             .resolve_active(&config.model, &config.model_path)
@@ -287,6 +316,9 @@ impl AiEngine {
             });
         let mut engine = Self::from_parts(config.clone(), detector);
         *engine.active_model.write() = model_id;
+        if remote_loaded {
+            *engine.active_model.write() = cpai::MODEL_ID.to_string();
+        }
         engine.registry = Arc::new(RwLock::new(registry));
         #[cfg(feature = "ai")]
         {
@@ -307,6 +339,30 @@ impl AiEngine {
         if !config.enabled {
             return None;
         }
+        // Remote CPAI backend (appendix A #52): no ONNX involvement, so
+        // it works in every build. A local model — when loadable — rides
+        // along as the fail-open fallback.
+        if !config.cpai_endpoint.is_empty() {
+            let remote = match cpai::CpaiDetector::new(
+                &config.cpai_endpoint,
+                &config.cpai_token,
+                config.cpai_timeout_ms,
+                Some(config.confidence_threshold).filter(|c| *c > 0.0),
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(error = %e, endpoint = %config.cpai_endpoint, "ai: CPAI endpoint unusable, AI stays disabled (fail-open)");
+                    return None;
+                }
+            };
+            let fallback: Option<Arc<dyn AiDetector>> = Self::load_local_fallback(config);
+            info!(
+                endpoint = %config.cpai_endpoint,
+                local_fallback = fallback.is_some(),
+                "ai: CPAI remote detector loaded"
+            );
+            return Some(Arc::new(cpai::FailoverDetector::new(remote, fallback)));
+        }
         #[cfg(feature = "ai")]
         {
             match ort::OrtDetector::new(&config.model_path) {
@@ -323,6 +379,29 @@ impl AiEngine {
         #[cfg(not(feature = "ai"))]
         {
             warn!("ai: enabled in config but this binary was built without the `ai` feature");
+            None
+        }
+    }
+
+    /// Best-effort local detector for the CPAI fail-open path. Absent
+    /// (None) in non-`ai` builds or when the local model cannot load —
+    /// the remote backend then answers empty between probes (honest
+    /// silence) instead of erroring per frame.
+    #[allow(clippy::unused_self)]
+    fn load_local_fallback(config: &AiConfig) -> Option<Arc<dyn AiDetector>> {
+        #[cfg(feature = "ai")]
+        {
+            match ort::OrtDetector::new(&config.model_path) {
+                Ok(d) => Some(Arc::new(d)),
+                Err(e) => {
+                    info!(error = %e, "ai: CPAI local fallback unavailable");
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "ai"))]
+        {
+            let _ = config;
             None
         }
     }
@@ -722,6 +801,10 @@ pub(crate) mod tests {
         assert_eq!(cfg.model_path, "models/nanodet-m.onnx");
         assert!((cfg.confidence_threshold - 0.5).abs() < f32::EPSILON);
         assert_eq!(cfg.interval_ms, 1000);
+        // Remote CPAI backend defaults: empty endpoint = local detector.
+        assert_eq!(cfg.cpai_endpoint, "");
+        assert_eq!(cfg.cpai_token, "");
+        assert_eq!(cfg.cpai_timeout_ms, 5_000);
 
         let cfg: AiConfig = serde_json::from_str(
             "{\"enabled\":true,\"model_path\":\"/opt/m.onnx\",\"interval_ms\":250}",
@@ -731,6 +814,33 @@ pub(crate) mod tests {
         assert_eq!(cfg.model_path, "/opt/m.onnx");
         assert_eq!(cfg.interval_ms, 250);
         assert!((cfg.confidence_threshold - 0.5).abs() < f32::EPSILON);
+    }
+
+    /// Remote CPAI endpoint configured at boot: the detector loads
+    /// without ONNX (works in every build) and the active model id
+    /// surfaces as `cpai-remote` (appendix A #52). Registry stays local
+    /// — §4.6 activation is the runtime path back to on-device.
+    #[test]
+    fn cpai_endpoint_boots_as_active_detector() {
+        let cfg = AiConfig {
+            enabled: true,
+            cpai_endpoint: "http://127.0.0.1:9/v1/vision/detection".to_string(),
+            cpai_timeout_ms: 300,
+            ..AiConfig::default()
+        };
+        let engine = AiEngine::from_config(&cfg);
+        assert_eq!(
+            *engine.active_model.read(),
+            cpai::MODEL_ID,
+            "remote backend reports the honest cpai-remote id"
+        );
+        // The same config without the endpoint keeps the local id.
+        let local_cfg = AiConfig {
+            cpai_endpoint: String::new(),
+            ..cfg
+        };
+        let engine = AiEngine::from_config(&local_cfg);
+        assert_ne!(*engine.active_model.read(), cpai::MODEL_ID);
     }
 
     #[tokio::test]

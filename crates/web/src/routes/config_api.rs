@@ -649,11 +649,13 @@ pub const REDACTED: &str = "****";
 ///   usually the userinfo too (`rtmp://user:pass@host/app/key`).
 /// - `api_key` — the OpenRouter-compatible cloud key (SPEC §4.10), if it
 ///   ever appears in the config surface rather than only the dedicated table.
+/// - `cpai_token` — the remote CPAI detection endpoint's Bearer token
+///   (`[ai] cpai_token`, appendix A #52).
 ///
 /// ONVIF `username` is deliberately NOT redacted: SPEC treats it as
 /// configuration the settings UI renders, and the device's ONVIF credentials
 /// are already discoverable from the device itself by anyone on the LAN.
-const SECRET_KEYS: &[&str] = &["password", "push_url", "api_key"];
+const SECRET_KEYS: &[&str] = &["password", "push_url", "api_key", "cpai_token"];
 
 /// Replace every secret leaf value with [`REDACTED`], recursing through
 /// objects and arrays. Non-string values under a secret key are redacted too
@@ -745,12 +747,19 @@ pub(crate) mod tests {
             "nested": { "password": "deep-secret", "port": 5060 },
             "list": [{ "password": "in-array" }],
             "push_url": "rtmp://user:pw@ingest.example/live/key",
+            "ai": { "cpai_token": "cpai-bearer-secret", "cpai_endpoint": "http://nvr.lan:32168/v1/vision/detection" },
         });
         let redacted = redact_secrets(doc);
         assert_eq!(redacted["password"], serde_json::json!(REDACTED));
         assert_eq!(redacted["nested"]["password"], serde_json::json!(REDACTED));
         assert_eq!(redacted["list"][0]["password"], serde_json::json!(REDACTED));
         assert_eq!(redacted["push_url"], serde_json::json!(REDACTED));
+        assert_eq!(redacted["ai"]["cpai_token"], serde_json::json!(REDACTED));
+        // The endpoint URL is configuration, not a credential — it renders.
+        assert_eq!(
+            redacted["ai"]["cpai_endpoint"],
+            serde_json::json!("http://nvr.lan:32168/v1/vision/detection")
+        );
         // Non-secret siblings survive intact — the settings UI renders them.
         assert_eq!(
             redacted["device_id"],
@@ -783,6 +792,7 @@ pub(crate) mod tests {
             "password": "real-sip-secret",
             "device_id": "old-id",
             "push_url": "rtmp://u:p@host/live/key",
+            "ai": { "cpai_token": "real-cpai-bearer" },
         });
         let mut submitted = redact_secrets(stored.clone());
         // The user flips one unrelated setting.
@@ -793,6 +803,11 @@ pub(crate) mod tests {
         assert_eq!(
             submitted["push_url"],
             serde_json::json!("rtmp://u:p@host/live/key")
+        );
+        assert_eq!(
+            submitted["ai"]["cpai_token"],
+            serde_json::json!("real-cpai-bearer"),
+            "cpai_token rides the same read-modify-write keep semantics"
         );
         assert_eq!(submitted["device_id"], serde_json::json!("new-id"));
     }
