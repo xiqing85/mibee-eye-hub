@@ -815,6 +815,7 @@ no_think = true
 | `no_think` | bool | `true` | Append `/no_think` to user turns (Qwen3 thinking mode off — faster, conversational). |
 | `model_path_mid` | String | `""` | Mid-tier GGUF for `[resources] auto_tier` (empty = tier unavailable) |
 | `model_path_lite` | String | `""` | Lite-tier GGUF for `[resources] auto_tier` (empty = tier unavailable) |
+| `voice_model_path` | String | `""` | Dedicated small model for voice-round local replies (SPEC appendix A #53) while HTTP chat keeps `model_path`. Empty = share the main engine. Measured 4-6× decode speed at the 0.8B tier with chat/tool quality on par; its file bytes bill into the `llm` feature cost, and a load failure falls back to sharing (fail-open). |
 
 **Notes:**
 

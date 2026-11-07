@@ -761,6 +761,7 @@ no_think = true
 | `no_think` | bool | `true` | user 轮追加 `/no_think`（关闭 Qwen3 思考模式——更快、对话向）。 |
 | `model_path_mid` | String | `""` | `[resources] auto_tier` 的中档 GGUF（空 = 该档不可用） |
 | `model_path_lite` | String | `""` | `[resources] auto_tier` 的轻档 GGUF（空 = 该档不可用） |
+| `voice_model_path` | String | `""` | 语音轮本地回复的专属小模型（SPEC 附录 A #53）——HTTP 网页聊天保持 `model_path`。空 = 与主引擎共用。0.8B 档实测解码提速 4-6 倍、闲聊/工具质量持平；其文件字节省入 `llm` 功能成本，加载失败回落共用主引擎（fail-open）。 |
 
 **注意事项：**
 
