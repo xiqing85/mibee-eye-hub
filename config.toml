@@ -196,6 +196,13 @@ enabled = false
 # n_threads = 2
 # max_tokens = 200
 # no_think = true
+# Voice-tier split (SPEC appendix A #53): a dedicated small model for
+# voice-round local replies while HTTP chat keeps the full model.
+# Spoken answers are short and conversational — the small tier measured
+# 4-6× faster with chat/tool quality on par (2026-10-31 A/B). Empty =
+# share the main engine. Bills its file bytes into the llm feature cost
+# ([resources]); a load failure falls back to sharing (fail-open).
+# voice_model_path = "models/llm/Qwen3.5-0.8B-Q4_K_M.gguf"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TTS playback (`[tts]`): the sherpa-onnx-offline-tts CLI as a subprocess

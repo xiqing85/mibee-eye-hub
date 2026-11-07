@@ -28,6 +28,14 @@ pub struct LlmConfig {
     pub model_path_mid: String,
     /// Lite-tier model for auto_tier (<4 GiB; empty = reuse `model_path`).
     pub model_path_lite: String,
+    /// Dedicated model for voice-round local replies (SPEC appendix A
+    /// #53). Spoken answers are short and conversational — a small model
+    /// cuts the decode wall (~1 s/token on a 4-core host for the full
+    /// model) with minimal quality cost, while HTTP chat keeps the full
+    /// model. Empty = share the main engine (single-engine behaviour).
+    /// The engine is built at boot; if the file cannot load the voice
+    /// bridge fails open to the main engine (one warn).
+    pub voice_model_path: String,
 }
 
 impl Default for LlmConfig {
@@ -47,6 +55,7 @@ impl Default for LlmConfig {
             no_think: true,
             model_path_mid: String::new(),
             model_path_lite: String::new(),
+            voice_model_path: String::new(),
         }
     }
 }
@@ -669,6 +678,19 @@ mod tests {
             ..LlmConfig::default()
         });
         assert!(!e.is_active(), "missing model must not fake activity");
+    }
+
+    #[test]
+    fn voice_model_path_defaults_empty_and_parses() {
+        // Default: empty = share the main engine (single-engine shape).
+        let cfg: LlmConfig = serde_json::from_str("{}").expect("empty defaults");
+        assert_eq!(cfg.voice_model_path, "");
+        // Deployed shape: explicit voice tier.
+        let cfg: LlmConfig = serde_json::from_str(
+            r#"{"enabled":true,"voice_model_path":"models/llm/Qwen3.5-0.8B-Q4_K_M.gguf"}"#,
+        )
+        .expect("parse voice tier");
+        assert_eq!(cfg.voice_model_path, "models/llm/Qwen3.5-0.8B-Q4_K_M.gguf");
     }
 
     #[test]

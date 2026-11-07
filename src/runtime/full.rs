@@ -324,7 +324,15 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
             FeatureInput {
                 name: "llm",
                 enabled: config.llm.enabled,
-                model_paths: vec![config.llm.model_path.clone()],
+                // The voice-tier engine (#53) is a second resident
+                // weights set — bill it so tight-memory hosts shed the
+                // split honestly (fail-open at runtime falls back to
+                // sharing, but the budget should assume the resident
+                // cost).
+                model_paths: vec![
+                    config.llm.model_path.clone(),
+                    config.llm.voice_model_path.clone(),
+                ],
                 overhead_mib: 80,
                 depends_on: None,
             },
@@ -795,6 +803,38 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         tracing::info!(reason = %chat_engine.inactive_reason(), "llm: chat disabled");
     }
 
+    // Voice-tier split (SPEC appendix A #53): spoken answers ride a
+    // dedicated small model while HTTP chat keeps the full one — the
+    // decode wall (~1 s/token for the full model on a 4-core host) is
+    // the voice round's dominant cost and short conversational answers
+    // lose almost nothing at the small tier (2026-10-31 A/B: tools and
+    // chat on par, 4-6× faster). Fail-open: any load problem falls back
+    // to sharing the main engine.
+    let voice_chat_engine: Arc<streaming::llm::ChatEngine> = if chat_engine.is_active()
+        && !config.llm.voice_model_path.is_empty()
+        && config.llm.voice_model_path != config.llm.model_path
+    {
+        let mut voice_cfg = config.llm.clone();
+        voice_cfg.model_path = config.llm.voice_model_path.clone();
+        let engine = Arc::new(streaming::llm::ChatEngine::from_config(&voice_cfg));
+        if engine.is_active() {
+            tracing::info!(
+                model = %config.llm.voice_model_path,
+                "llm: voice-tier engine loaded (HTTP chat keeps the full model)"
+            );
+            engine
+        } else {
+            tracing::warn!(
+                model = %config.llm.voice_model_path,
+                reason = %engine.inactive_reason(),
+                "llm: voice-tier engine unavailable — voice rounds share the main engine (fail-open)"
+            );
+            Arc::clone(&chat_engine)
+        }
+    } else {
+        Arc::clone(&chat_engine)
+    };
+
     // Elastic controller (SPEC appendix A #48): runtime signals → tier
     // decisions with hysteresis; spawns when the heavy features it
     // governs are present. Initial tier = what this boot admitted. With
@@ -1090,7 +1130,10 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     crate::runtime::voice_bridge::VoiceBridge {
         events: voice_engine.subscribe_events(),
         bridge_tx: event_tx.clone(),
-        chat: chat_engine.clone(),
+        // Voice-tier split (#53): the bridge's local legs (legacy
+        // streaming + agent LocalChannel) get the dedicated voice model;
+        // the HTTP chat route keeps the main engine.
+        chat: voice_chat_engine.clone(),
         cloud: cloud_ai.clone(),
         decision: decision_engine.clone(),
         convlog: Arc::clone(&conversations_log),

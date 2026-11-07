@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Voice-tier LLM split (2026-11-07).** `[llm] voice_model_path`
+  runs voice-round local replies on a dedicated small model while
+  HTTP chat keeps the full one — spoken answers are short and
+  conversational, and the decode wall (~1 s/token for a 4B model on
+  a 4-core host) is the voice round's dominant cost. Measured on the
+  deployment host (2026-10-31 A/B): the 0.8B tier answered chat and
+  executed tools on par with 4B at 4-6× the speed. Every voice
+  local leg (legacy streaming pipeline — sentence streaming, barge-in
+  and history truncation semantics unchanged — plus the agent
+  LocalChannel) reads the voice engine; the HTTP route keeps the
+  main engine. Fail-open: a voice-tier load failure shares the main
+  engine (one warn); pointing `voice_model_path` at `model_path`
+  keeps the single-engine shape; the split's file bytes bill into
+  the `llm` feature cost so tight-memory hosts shed it honestly
+  ([resources] auto gate).
+
 - **CPAI-compatible remote detection backend (2026-11-06).** `[ai]
   cpai_endpoint` (plus `cpai_token` / `cpai_timeout_ms`) points the
   detector at any CPAI-compatible server (CodeProject.AI wire
