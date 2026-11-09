@@ -74,6 +74,74 @@ pub struct WindowAudit {
     pub speech_ratio: f32,
 }
 
+/// One ASR text replacement rule (`[[voice.replacements]]`): `from` →
+/// `to` applied to transcripts before any consumer runs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceReplacement {
+    pub from: String,
+    pub to: String,
+}
+
+/// Apply the replacement rules to a transcript (SPEC appendix A #56):
+/// longest `from` first so overlapping rules resolve explicitly, every
+/// occurrence replaced, and an ASCII-lettered `from` only matches at
+/// non-alphanumeric boundaries (hex's phrase-boundary-aware compile —
+/// `cat` must not fire inside `concatenate`). CJK rules match as plain
+/// substrings (Chinese has no word spacing to respect).
+pub fn apply_replacements(text: &str, rules: &[VoiceReplacement]) -> String {
+    if rules.is_empty() || text.is_empty() {
+        return text.to_string();
+    }
+    let mut ordered: Vec<&VoiceReplacement> = rules.iter().collect();
+    ordered.sort_by_key(|r| std::cmp::Reverse(r.from.chars().count()));
+    let mut out = text.to_string();
+    for rule in ordered {
+        if rule.from.is_empty() {
+            continue;
+        }
+        let ascii_word = rule
+            .from
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if ascii_word {
+            out = replace_ascii_bounded(&out, &rule.from, &rule.to);
+        } else {
+            out = out.replace(&rule.from, &rule.to);
+        }
+    }
+    out
+}
+
+/// Replace `from`→`to` only where `from` neither starts mid-word nor
+/// ends mid-word (alphanumeric context on either side blocks the match).
+fn replace_ascii_bounded(text: &str, from: &str, to: &str) -> String {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut result = String::with_capacity(text.len());
+    let mut last = 0usize;
+    for (idx, _) in text.match_indices(from) {
+        let left_ok = text[..idx].chars().next_back().is_none_or(|c| !is_word(c));
+        let end = idx + from.len();
+        let right_ok = text[end..].chars().next().is_none_or(|c| !is_word(c));
+        if left_ok && right_ok {
+            result.push_str(&text[last..idx]);
+            result.push_str(to);
+            last = end;
+        }
+    }
+    result.push_str(&text[last..]);
+    result
+}
+
+/// Endpointing floor: a VAD segment shorter than 0.5 s of 16 kHz audio
+/// is noise, not an utterance (both the capture branch and the follow-up
+/// branch enforce this). The paired rule is [`MIN_SPEECH_SAMPLES`]:
+/// the capture window may only END once the utterance accumulated ≥1.2 s
+/// of actual speech — together they are the 2026-10-10 fix for
+/// mid-sentence cuts (synthesized speech with ≥0.6 s word gaps used to
+/// end segments early; the floor alone was not enough).
+#[cfg(feature = "voice")]
+const MIN_SEGMENT_SAMPLES: usize = 8_000;
+
 /// Frame length for [`speech_ratio`] (20 ms at 16 kHz).
 const AUDIT_FRAME: usize = 320;
 /// A frame counts as speech-level above this RMS, dBFS. Quiet mics
@@ -192,6 +260,13 @@ pub struct VoiceConfig {
     pub paraformer_tokens: String,
     /// Seconds of audio captured after a wake word before transcription.
     pub capture_secs: u32,
+    /// ASR text replacements (SPEC appendix A #56): phrase-level
+    /// corrections applied to every transcript before anything
+    /// consumes it — the wake word the acoustic model keeps
+    /// mishearing (姚蜜蜂→小蜜蜂), domain terms, names. Longest match
+    /// first; ASCII rules only match on non-alphanumeric boundaries.
+    #[serde(default)]
+    pub replacements: Vec<VoiceReplacement>,
     /// Inference threads (the target hosts are small).
     pub num_threads: i32,
     /// Speaker-embedding model (3D-Speaker CAM++ ONNX). The file being
@@ -252,6 +327,7 @@ impl Default for VoiceConfig {
             paraformer_model: "models/voice/paraformer/model.int8.onnx".into(),
             paraformer_tokens: "models/voice/paraformer/tokens.txt".into(),
             capture_secs: 4,
+            replacements: Vec::new(),
             num_threads: 1,
             speaker_embedding_model: "models/voice/speaker/campplus.onnx".into(),
             speaker_verify: false,
@@ -922,8 +998,9 @@ impl VoiceEngine {
                 let capture_vad = internals.capture_vad.clone();
                 let mut captured_speech_samples: usize = 0;
                 const CAPTURE_HEADROOM_SECS: u64 = 6;
-                /// Minimum accumulated speech before a completed segment
-                /// may end the capture (16 kHz samples).
+                /// Minimum accumulated speech (1.2 s at 16 kHz) before a completed
+                /// segment may end the wake capture (see
+                /// [`MIN_SEGMENT_SAMPLES`] for the paired floor).
                 const MIN_SPEECH_SAMPLES: usize = 16_000 * 6 / 5;
                 let capture_hard_cap = tokio::time::Instant::now()
                     + Duration::from_secs(u64::from(capture_secs.max(1)) + CAPTURE_HEADROOM_SECS);
@@ -1008,7 +1085,7 @@ impl VoiceEngine {
                                         while let Some(seg) = vad.front() {
                                             let waveform = seg.samples().to_vec();
                                             vad.pop();
-                                            if waveform.len() < 8_000 {
+                                            if waveform.len() < MIN_SEGMENT_SAMPLES {
                                                 // < 0.5 s — noise, keep listening.
                                                 // (Was 1 s; a real spoken stop
                                                 // word — 别说了 — lands at
@@ -1072,7 +1149,7 @@ impl VoiceEngine {
                                         // A real question segment (≥0.5 s) ends
                                         // the capture only once the utterance
                                         // accumulated enough speech overall.
-                                        if len >= 8_000
+                                        if len >= MIN_SEGMENT_SAMPLES
                                             && captured_speech_samples >= MIN_SPEECH_SAMPLES
                                         {
                                             segment_ended = true;
@@ -1466,6 +1543,153 @@ fn unix_now_ms() -> u64 {
 /// # Errors
 ///
 /// File/parse errors, missing models, or a build without `voice`.
+/// One fixed-corpus round for [`bench_voice`] (P1-4): a WAV plus the
+/// expected transcript and (optional) expected wake keyword.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BenchRound {
+    pub wav: String,
+    pub expect: String,
+    #[serde(default)]
+    pub label: String,
+    /// Expected wake keyword ("" = this round has no wake word).
+    #[serde(default)]
+    pub expect_keyword: String,
+}
+
+/// Fixed-corpus voice benchmark (hex's `benchmark-transcription` shape):
+/// drive KWS + ASR over every round, measure per-stage wall time, and
+/// score the transcript against `expect` with character error rate
+/// (edit distance / expected length). Deterministic same-process runs
+/// are comparable; the manifest pins the corpus so before/after A/B is
+/// honest. `Err` only for an unreadable manifest/round file — a wrong
+/// transcript is a scored round, not a failure.
+pub fn bench_voice(manifest_path: &str) -> anyhow::Result<serde_json::Value> {
+    let manifest: std::collections::BTreeMap<String, Vec<BenchRound>> = serde_json::from_str(
+        &std::fs::read_to_string(manifest_path)
+            .map_err(|e| anyhow::anyhow!("read {manifest_path}: {e}"))?,
+    )
+    .map_err(|e| anyhow::anyhow!("manifest must be {{\"rounds\": [...]}}: {e}"))?;
+    let rounds = manifest
+        .get("rounds")
+        .ok_or_else(|| anyhow::anyhow!("manifest has no \"rounds\" array"))?;
+    #[cfg(feature = "voice")]
+    {
+        let started_all = std::time::Instant::now();
+        let mut config = VoiceConfig {
+            enabled: true,
+            ..VoiceConfig::default()
+        };
+        // Same env overrides as the selftest so a bench run reproduces
+        // the deployment's threshold/ASR exactly.
+        if let Ok(t) = std::env::var("VOICE_SELFTEST_THRESHOLD")
+            && let Ok(t) = t.parse::<f32>()
+        {
+            config.keywords_threshold = t;
+        }
+        if let Ok(m) = std::env::var("VOICE_SELFTEST_PARAFORMER") {
+            config.paraformer_model = m;
+        }
+        if let Ok(t) = std::env::var("VOICE_SELFTEST_PARAFORMER_TOKENS") {
+            config.paraformer_tokens = t;
+        }
+        let kws = build_kws(&config)?;
+        let recognizer = build_recognizer_for(&config)?;
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        let mut cer_sum = 0.0f64;
+        let mut asr_ms_sum = 0.0f64;
+        for (i, r) in rounds.iter().enumerate() {
+            let bytes = std::fs::read(&r.wav)
+                .map_err(|e| anyhow::anyhow!("round {}: read {}: {e}", i + 1, r.wav))?;
+            let wav = super::audio_ai::wav::parse_wav(&bytes)?;
+            let mut resampler = capture::audio_monitor::LinearResampler::new(
+                f64::from(wav.sample_rate) / f64::from(capture::audio_monitor::TARGET_RATE),
+            );
+            let samples = resampler.process(&wav.samples);
+            // KWS pass.
+            let kws_started = std::time::Instant::now();
+            let stream = kws.create_stream();
+            let mut wake: Option<String> = None;
+            let mut pos = 0_usize;
+            while pos < samples.len() {
+                let take = (samples.len() - pos).min(512);
+                let chunk = &samples[pos..pos + take];
+                pos += take;
+                stream.accept_waveform(16_000, chunk);
+                while kws.is_ready(&stream) {
+                    kws.decode(&stream);
+                }
+                if let Some(hit) = kws.get_result(&stream)
+                    && !hit.keyword.is_empty()
+                {
+                    wake = Some(hit.keyword);
+                    break;
+                }
+            }
+            let kws_ms = kws_started.elapsed().as_millis() as u64;
+            // ASR pass over the whole clip (fixed corpus scores the
+            // full utterance, wake or not).
+            let asr_started = std::time::Instant::now();
+            let transcript = transcribe(&recognizer, &samples);
+            let asr_ms = asr_started.elapsed().as_millis() as u64;
+            let dist = char_edit_distance(&transcript, &r.expect);
+            let cer = if r.expect.is_empty() {
+                0.0
+            } else {
+                dist as f64 / r.expect.chars().count() as f64
+            };
+            let keyword_ok = if r.expect_keyword.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(wake.as_deref() == Some(r.expect_keyword.as_str()))
+            };
+            cer_sum += cer;
+            asr_ms_sum += asr_ms as f64;
+            out.push(serde_json::json!({
+                "label": if r.label.is_empty() { format!("round-{}", i + 1) } else { r.label.clone() },
+                "wav": r.wav,
+                "wake": wake,
+                "keyword_ok": keyword_ok,
+                "transcript": transcript,
+                "expect": r.expect,
+                "cer": (cer * 1000.0).round() / 1000.0,
+                "kws_ms": kws_ms,
+                "asr_ms": asr_ms,
+            }));
+        }
+        let n = rounds.len().max(1) as f64;
+        Ok(serde_json::json!({
+            "rounds": rounds.len(),
+            "mean_cer": ((cer_sum / n) * 1000.0).round() / 1000.0,
+            "mean_asr_ms": (asr_ms_sum / n).round(),
+            "total_ms": started_all.elapsed().as_millis() as u64,
+            "detail": out,
+        }))
+    }
+    #[cfg(not(feature = "voice"))]
+    {
+        let _ = rounds;
+        anyhow::bail!("voice benchmark requires a build with the `voice` feature");
+    }
+}
+
+/// Character-level Levenshtein distance (CER denominator).
+#[cfg(feature = "voice")]
+fn char_edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 pub fn selftest_voice(path: &str) -> anyhow::Result<serde_json::Value> {
     let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?;
     #[cfg_attr(not(feature = "voice"), allow(unused_variables))]
@@ -1818,6 +2042,43 @@ mod tests {
         let mut full = s.clone();
         full.embeddings.push(vec![0.25; 4]);
         assert!(!enrollment_accepts(&full), "no samples past `needed`");
+    }
+
+    #[test]
+    fn replacements_correct_asr_mishearings_with_longest_first() {
+        use super::{VoiceReplacement, apply_replacements};
+        let rules = |pairs: &[(&str, &str)]| -> Vec<VoiceReplacement> {
+            pairs
+                .iter()
+                .map(|(f, t)| VoiceReplacement {
+                    from: (*f).into(),
+                    to: (*t).into(),
+                })
+                .collect()
+        };
+        // The wake-word mishearing this exists for.
+        let r = rules(&[("姚蜜蜂", "小蜜蜂"), ("杨蜜蜂", "小蜜蜂")]);
+        assert_eq!(
+            apply_replacements("姚蜜蜂现在几点了", &r),
+            "小蜜蜂现在几点了"
+        );
+        assert_eq!(apply_replacements("杨蜜蜂", &r), "小蜜蜂");
+        // No rules, no touch.
+        assert_eq!(apply_replacements("原样", &[]), "原样");
+        // Longest first: the longer rule wins explicitly.
+        let r = rules(&[("小蜜蜂", "bee"), ("小蜜蜂管家", "hub")]);
+        assert_eq!(apply_replacements("小蜜蜂管家你好", &r), "hub你好");
+        assert_eq!(apply_replacements("小蜜蜂你好", &r), "bee你好");
+        // ASCII rules respect word boundaries.
+        let r = rules(&[("cat", "狗")]);
+        assert_eq!(
+            apply_replacements("a cat and a concatenate", &r),
+            "a 狗 and a concatenate"
+        );
+        assert_eq!(apply_replacements("cat, cat!", &r), "狗, 狗!");
+        // Empty `from` never fires (config typo guard).
+        let r = rules(&[("", "x")]);
+        assert_eq!(apply_replacements("abc", &r), "abc");
     }
 
     #[test]

@@ -706,6 +706,7 @@ barge_in = "off"
 | `vad_model` | String | `"models/voice/vad/silero_vad.onnx"` | 断句/监听窗用的 Silero VAD |
 | `capture_endpointing` | bool | `true` | 采音期 VAD 断句：说话中软死线顺延，~0.6s 尾静音即切段转写 |
 | `capture_secs` | u32 | `4` | 唤醒词识别后采集音频的秒数。 |
+| `replacements` | table 数组 | `[]` | ASR 转写纠错表（`[[voice.replacements]]`，`from`/`to`）：最长匹配优先，全大写字母规则只在词边界命中；转写进入任何消费方（记录/决策/agent）之前应用（#56）。 |
 | `num_threads` | i32 | `1` | 推理线程数（目标主机较小）。 |
 | `speaker_embedding_model` | String | `models/voice/speaker/campplus.onnx` | 说话人声纹嵌入模型（3D-Speaker CAM++ zh_en）。**文件缺失只禁用声纹特性**，唤醒+转写照常。 |
 | `speaker_verify` | bool | `false` | 声纹验证门控：开启后唤醒词须匹配已注册说话人才开采集窗（无注册档案时 fail-open 放行并 WARN 一次）。 |

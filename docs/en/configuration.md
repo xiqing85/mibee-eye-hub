@@ -762,6 +762,7 @@ barge_in = "off"
 | `vad_model` | String | `"models/voice/vad/silero_vad.onnx"` | Silero VAD for endpointing / listen windows |
 | `capture_endpointing` | bool | `true` | VAD-based endpointing while capturing a question: soft deadline extends while speaking, ~0.6 s trailing silence ends the segment |
 | `capture_secs` | u32 | `4` | Seconds of audio captured after a wake word. |
+| `replacements` | table array | `[]` | ASR transcript corrections (`[[voice.replacements]]`, `from`/`to`): longest match first, all-ASCII rules only at word boundaries; applied before any consumer sees the transcript (#56). |
 | `num_threads` | i32 | `1` | Inference threads (target hosts are small). |
 | `speaker_embedding_model` | String | `models/voice/speaker/campplus.onnx` | Speaker-embedding model (3D-Speaker CAM++ zh_en). **A missing file only disables voiceprint features** — wake + ASR keep working. |
 | `speaker_verify` | bool | `false` | Voiceprint gate: wake words must match an enrolled speaker before the capture window opens (fail-open with a one-time WARN when no profiles exist). |

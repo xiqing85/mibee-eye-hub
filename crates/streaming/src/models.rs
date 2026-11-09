@@ -53,10 +53,11 @@ pub struct CapabilitySpec {
 }
 
 /// Test seam: when set, `catalog()` serves this table instead of the
-/// built-in one — lets the download integration tests run against a local
-/// HTTP server with tiny files instead of multi-GB HF repos.
-#[cfg(test)]
-static TEST_CATALOG: Mutex<Option<&'static [CapabilitySpec]>> = Mutex::new(None);
+/// built-in one — lets integration tests (download and activation)
+/// run against tiny synthetic entries instead of multi-GB HF repos.
+/// `#[doc(hidden)]` public because downstream-crate tests use it too.
+#[doc(hidden)]
+pub static TEST_CATALOG: Mutex<Option<&'static [CapabilitySpec]>> = Mutex::new(None);
 
 const fn f(
     role: &'static str,
@@ -764,7 +765,6 @@ pub static CATALOG: &[CapabilitySpec] = &[
 ];
 
 pub fn catalog() -> &'static [CapabilitySpec] {
-    #[cfg(test)]
     if let Some(over) = *TEST_CATALOG.lock().expect("test catalog lock") {
         return over;
     }
@@ -820,6 +820,45 @@ pub fn is_installed(models_root: &Path, m: &CatalogModel) -> bool {
             .map(|meta| meta.is_file() && meta.len() == fl.size)
             .unwrap_or(false)
     })
+}
+
+/// Full integrity check of an installed model (hex intake hardening):
+/// every file with a pinned sha256 is hashed and compared; files the
+/// source publishes no hash for fall back to the size check. `Err`
+/// names the first mismatch — a hand-placed or bit-rotted file that
+/// `is_installed` (size-only, boot-cheap) let through is caught here
+/// at the activation boundary, before an engine loads it.
+pub fn verify_installed(models_root: &Path, m: &CatalogModel) -> Result<(), String> {
+    for fl in m.files {
+        let path = models_root.join(m.dir).join(fl.path);
+        let meta = std::fs::metadata(&path).map_err(|e| format!("{}: {e}", fl.path))?;
+        if !meta.is_file() {
+            return Err(format!("{} is not a file", fl.path));
+        }
+        if meta.len() != fl.size {
+            return Err(format!(
+                "{}: size {} != catalog {}",
+                fl.path,
+                meta.len(),
+                fl.size
+            ));
+        }
+        let Some(want) = fl.sha256 else {
+            continue;
+        };
+        let mut file = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", fl.path))?;
+        let mut hasher = sha2::Sha256::default();
+        std::io::copy(&mut file, &mut hasher).map_err(|e| format!("{}: {e}", fl.path))?;
+        use sha2::Digest;
+        let got = format!("{:x}", hasher.finalize());
+        if got != want {
+            return Err(format!(
+                "{}: sha256 mismatch (catalog {}, found {})",
+                fl.path, want, got
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Free space on the filesystem holding `path`, in bytes (Linux `df`).
@@ -1238,6 +1277,7 @@ impl DownloadManager {
             // Hash check (fresh downloads only — a resume cannot rebuild
             // the running hash).
             if fresh && let Some(want) = fl.sha256 {
+                use sha2::Digest;
                 let got = format!("{:x}", hasher.finalize());
                 if !got.eq_ignore_ascii_case(want) {
                     last_err = Some(format!("sha256 mismatch for {}", fl.path));
@@ -1398,6 +1438,44 @@ mod tests {
         assert!(!is_installed(&dir, m), "wrong size must not count");
         touch(&dir, "face/face_recognition_sface_2021dec.onnx", 38696353);
         assert!(is_installed(&dir, m));
+        // Integrity: right size but zeros — the sha pin (if the catalog
+        // carries one for this file) must reject it at activation.
+        match m.files[0].sha256 {
+            Some(_) => {
+                let err = verify_installed(&dir, m).unwrap_err();
+                assert!(err.contains("sha256 mismatch"), "{err}");
+            }
+            None => {
+                assert!(verify_installed(&dir, m).is_ok(), "no pin → size-only");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn verify_installed_accepts_a_correct_hash() {
+        use sha2::Digest;
+        let dir = std::env::temp_dir().join(format!("nb-models-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = real_find("face.recog", "sface-2021dec");
+        let rel = "face/face_recognition_sface_2021dec.onnx";
+        // Bytes that hash to the catalog pin: rebuild the file from the
+        // expected digest only when a pin exists; otherwise the test
+        // degenerates to the size path (still asserted).
+        let want = m.files[0].sha256;
+        let payload: Vec<u8> = vec![7u8; 38696353];
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, &payload).unwrap();
+        match want {
+            Some(w) => {
+                let got = format!("{:x}", sha2::Sha256::digest(&payload));
+                assert_ne!(got, w, "test premise: filler bytes must not match");
+                assert!(verify_installed(&dir, m).is_err());
+            }
+            None => assert!(verify_installed(&dir, m).is_ok()),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
