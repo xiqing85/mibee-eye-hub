@@ -48,6 +48,12 @@ impl McpClient {
         }
     }
 
+    /// The server's config (trust-gate fingerprinting and the trust
+    /// endpoint need the command line as configured).
+    pub fn config(&self) -> &super::McpServerConfig {
+        &self.cfg
+    }
+
     pub fn name(&self) -> &str {
         &self.cfg.name
     }
@@ -527,6 +533,14 @@ main()
         };
         let registry = Arc::new(ToolRegistry::new(shared_tools(), &cfg));
         registry.attach_streams(Arc::new(crate::stream_manager::StreamManager::new()));
+        // Trust gate (#43 amendment): confirm the fake server's launch
+        // line the way the endpoint would, or refresh refuses it.
+        let mut trust = crate::agent::McpTrustMap::new();
+        trust.insert(
+            "fake".into(),
+            crate::agent::mcp_fingerprint(&cfg.mcp_servers[0]),
+        );
+        registry.set_trust(trust);
         registry.refresh_mcp().await;
         let specs = registry.cached_specs();
         assert!(

@@ -4,6 +4,22 @@
 
 ### Added
 
+- **MCP configuration trust gate (2026-11-10).** `[[agent.mcp_servers]]`
+  entries are fingerprinted (sha256 over command+args+env) and an
+  unconfirmed — new or edited — launch line is REFUSED at refresh with
+  a warning naming the confirm endpoint. `POST /api/tools/mcp/{name}/trust`
+  confirms the current fingerprint (settings bag `agent.mcp_trust`),
+  immediate on refresh; stale fingerprints are never grandfathered.
+  Fail-open for the service, fail-closed for trust.
+
+### Changed
+
+- **Unreadable config no longer blocks launch (2026-11-10).** A config
+  file that exists but cannot be parsed is preserved beside itself as
+  `<config>.unreadable-<sha256[0..12]>` (identical originals share one
+  copy) and the service boots on defaults with the reason in the
+  startup log (hex's settings invariant, adapted).
+
 - **ASR replacement table (2026-11-09).** `[[voice.replacements]]`
   (from/to) corrects transcripts before any consumer — records,
   decisions, wake-word matching, the agent — sees them. Longest

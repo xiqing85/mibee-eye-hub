@@ -466,6 +466,10 @@ pub fn build_app_with_state(state: AppRouterState) -> Router {
         // Tool/skill registry (SPEC v1 §3.5) — the model-facing tool
         // list: built-ins + MCP plugin servers.
         .route("/api/tools", get(crate::agent::tools_api::list_tools))
+        .route(
+            "/api/tools/mcp/{name}/trust",
+            axum::routing::post(crate::agent::tools_api::trust_mcp_server),
+        )
         // Protocol runtime status stays as a device extension (dialect A7).
         .route(
             "/api/protocols/runtime-status",
