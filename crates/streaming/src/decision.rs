@@ -613,6 +613,98 @@ pub fn triage_skips_reply(label: &str, transcript: &str) -> bool {
         && !triage_substantive(transcript)
 }
 
+/// Bare time/date questions answerable from the local clock — the
+/// deterministic short-circuit set (2026-11-09). True only for a
+/// short utterance that asks for the time or date AND nothing else:
+/// the 0.8B voice tier verbatim-copied the previous round's stale
+/// time from history instead of calling `time.now` (the agent loop
+/// and tool gate were fine; prompt-level directives did not move
+/// it), so the voice bridge answers these straight from the clock.
+/// Compound requests ("几点了，天气怎么样") fall through to the
+/// agent loop, like every other tool-shaped question.
+#[must_use]
+pub fn time_question(text: &str) -> bool {
+    const TIME_NEEDLES: &[&str] = &[
+        "几点",
+        "幾點",
+        "几时",
+        "幾時",
+        "什么时间",
+        "啥时间",
+        "时间了",
+        "现在时间",
+        "几号",
+        "幾號",
+        "几多号",
+        "星期几",
+        "星期幾",
+        "礼拜几",
+        "禮拜幾",
+        "今天几",
+        "今天幾",
+        "日期",
+        "what time",
+        "what's the time",
+        "what day",
+        "what's the date",
+        "date is it",
+    ];
+    const OTHER_TOOL_NEEDLES: &[&str] = &[
+        // weather
+        "天气",
+        "氣",
+        "气温",
+        "几度",
+        "幾度",
+        "下雨",
+        "落雨",
+        "台风",
+        "天氣",
+        "weather",
+        "rain",
+        "forecast",
+        "temperature",
+        // snapshot / camera
+        "画面",
+        "快照",
+        "截图",
+        "看看",
+        "看到",
+        "监控",
+        "snapshot",
+        "camera",
+        // device control
+        "开灯",
+        "关灯",
+        "灯",
+        "開燈",
+        "關燈",
+        "燈",
+        "light",
+        "switch",
+    ];
+    // Bare-question length bounds: tight for CJK (the away-command
+    // precedent keeps zh keyword intents ≤8 chars; bare clock
+    // questions measure 3-7), looser for English whose phrasing is
+    // naturally longer ("what's the date today" is 21).
+    const MAX_CJK_CHARS: usize = 12;
+    const MAX_LATIN_CHARS: usize = 24;
+    let t = text.trim();
+    let chars = t.chars().count();
+    let has_cjk = t.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c));
+    let max = if has_cjk {
+        MAX_CJK_CHARS
+    } else {
+        MAX_LATIN_CHARS
+    };
+    if chars == 0 || chars > max {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    TIME_NEEDLES.iter().any(|n| lower.contains(n))
+        && !OTHER_TOOL_NEEDLES.iter().any(|n| lower.contains(n))
+}
+
 /// What to do with an utterance that arrives while an answer round is
 /// still running (SPEC appendix A #45, conservative direction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1075,5 +1167,31 @@ mod tests {
         );
         assert_eq!(clamp_temperature(f32::NAN), 1.0);
         assert_eq!(clamp_temperature(0.0), 1.0);
+    }
+
+    #[test]
+    fn time_question_matches_bare_clock_questions_only() {
+        // Bare questions in the three product languages.
+        assert!(time_question("现在几点了"));
+        assert!(time_question("几点了"));
+        assert!(time_question("现在几点钟了呀"));
+        assert!(time_question("今天几号"));
+        assert!(time_question("星期几"));
+        assert!(time_question("而家幾點"));
+        assert!(time_question("今天礼拜几"));
+        assert!(time_question("what time is it"));
+        assert!(time_question("  what's the date today  "));
+        // Compound tool questions fall through to the agent loop.
+        assert!(!time_question("现在几点了，广州天气怎么样"));
+        assert!(!time_question("几点了帮我看看门口画面"));
+        assert!(!time_question("几点了把客厅的灯打开"));
+        assert!(!time_question("what's the weather like"));
+        // Non-time content and long utterances never match.
+        assert!(!time_question("讲个笑话"));
+        assert!(!time_question(""));
+        assert!(!time_question("   "));
+        assert!(!time_question(
+            "帮我记一下明天早上八点叫我起床然后出门前提醒我带伞"
+        ));
     }
 }

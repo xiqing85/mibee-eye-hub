@@ -39,6 +39,9 @@ pub struct AudioMonitor {
     device_name: String,
     sample_rate: u32,
     native_16k: bool,
+    /// Set when the audio fixture replaces the microphone (see
+    /// [`fixture_path`]): the decoded mono samples and their rate.
+    fixture: Option<std::sync::Arc<Vec<f32>>>,
 }
 
 impl AudioMonitor {
@@ -46,7 +49,29 @@ impl AudioMonitor {
     ///
     /// `device = "default"` selects the host default input; any other value
     /// is matched by substring against the device description.
+    ///
+    /// With `MIBEE_EYE_AUDIO_FIXTURE=<wav>` set, no device is enumerated
+    /// or opened: the monitor plays that file through the whole
+    /// normalize→chunk pipeline instead (see [`fixture_path`]). An
+    /// unreadable fixture is a hard error — a test facility must never
+    /// silently fall back to a live microphone.
     pub fn open(device: &str) -> Result<Self> {
+        if let Some(path) = fixture_path() {
+            let (samples, rate) = decode_fixture(&path)?;
+            info!(
+                file = %path.display(),
+                samples = samples.len(),
+                sample_rate = rate,
+                "audio monitor fixture active (no device opened)"
+            );
+            return Ok(Self {
+                stream: None,
+                device_name: format!("audio-fixture({})", path.display()),
+                sample_rate: rate,
+                native_16k: rate == TARGET_RATE,
+                fixture: Some(std::sync::Arc::new(samples)),
+            });
+        }
         let host = cpal::default_host();
         let dev = if device.eq_ignore_ascii_case("default") {
             host.default_input_device()
@@ -82,6 +107,7 @@ impl AudioMonitor {
             device_name,
             sample_rate,
             native_16k,
+            fixture: None,
         })
     }
 
@@ -105,6 +131,9 @@ impl AudioMonitor {
         broadcast::Receiver<AudioChunk>,
         broadcast::Sender<AudioChunk>,
     )> {
+        if let Some(samples) = self.fixture.clone() {
+            return self.start_fixture(samples);
+        }
         // Re-resolve the device: cpal devices are not clonable, and the
         // config we picked must belong to a live device handle.
         let dev = resolve_device(&self.device_name)?;
@@ -267,6 +296,96 @@ impl AudioMonitor {
         );
         Ok((chunk_rx, chunk_tx))
     }
+
+    /// Fixture variant of [`Self::start`]: a pacing thread plays the decoded
+    /// samples through the same normalize→chunk pipeline at real-time pace —
+    /// one [`CHUNK_SAMPLES`]-sample (32 ms) window per tick, looping from the
+    /// start when the file runs out. A late wake on a busy machine delivers
+    /// the chunk late, never early: the deadline advances on the clock, not
+    /// on the previous sleep (drift-free over long runs).
+    fn start_fixture(
+        &mut self,
+        samples: std::sync::Arc<Vec<f32>>,
+    ) -> Result<(
+        broadcast::Receiver<AudioChunk>,
+        broadcast::Sender<AudioChunk>,
+    )> {
+        let rate = self.sample_rate;
+        let (chunk_tx, chunk_rx) = broadcast::channel::<AudioChunk>(32);
+        let worker_tx = chunk_tx.clone();
+        let ratio = f64::from(rate) / f64::from(TARGET_RATE);
+        // Source samples consumed per emitted 32 ms chunk (rounded up; the
+        // stateful resampler absorbs the rounding).
+        let window = (CHUNK_SAMPLES as f64 * ratio).ceil() as usize;
+        let period = std::time::Duration::from_millis(
+            (CHUNK_SAMPLES as u64 * 1000) / u64::from(TARGET_RATE),
+        );
+        std::thread::Builder::new()
+            .name("audio-monitor-fixture".into())
+            .spawn(move || {
+                let mut resampler = LinearResampler::new(ratio);
+                let mut acc: Vec<i16> = Vec::with_capacity(CHUNK_SAMPLES * 2);
+                let mut pos = 0usize;
+                // Absolute pacing: the first window is due immediately.
+                let mut next_due = std::time::Instant::now();
+                // Boot grace: `start()` returns the receiver before the
+                // engine workers subscribe (µs later on the caller side);
+                // a send with zero subscribers would error and kill this
+                // worker before anyone listens. The real cpal path never
+                // hits this — its first chunk waits 32 ms+ of device
+                // warmup. Wait for the first subscriber, then a drop to
+                // zero really means "everyone left".
+                let mut seen_subscriber = false;
+                loop {
+                    if worker_tx.receiver_count() == 0 {
+                        if seen_subscriber {
+                            return; // every receiver dropped — stop
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        next_due = std::time::Instant::now();
+                        continue;
+                    }
+                    seen_subscriber = true;
+                    let mut input = Vec::with_capacity(window);
+                    while input.len() < window {
+                        let remaining = &samples[pos..];
+                        let take = remaining.len().min(window - input.len());
+                        input.extend_from_slice(&remaining[..take]);
+                        pos += take;
+                        if pos >= samples.len() {
+                            pos = 0; // loop the clip from its start
+                        }
+                    }
+                    for s in resampler.process(&input) {
+                        let v = (s.clamp(-1.0, 1.0) * 32_767.0) as i16;
+                        acc.push(v);
+                    }
+                    while acc.len() >= CHUNK_SAMPLES {
+                        let rest = acc.split_off(CHUNK_SAMPLES);
+                        let chunk = AudioChunk {
+                            samples: Arc::from(acc.as_slice()),
+                        };
+                        acc = rest;
+                        if worker_tx.send(chunk).is_err() {
+                            return;
+                        }
+                    }
+                    next_due += period;
+                    let now = std::time::Instant::now();
+                    if next_due > now {
+                        std::thread::sleep(next_due - now);
+                    }
+                }
+            })
+            .context("failed to spawn audio monitor fixture worker")?;
+        info!(
+            device = %self.device_name,
+            sample_rate = rate,
+            "audio monitor fixture started ({} chunks/s)",
+            TARGET_RATE / CHUNK_SAMPLES as u32
+        );
+        Ok((chunk_rx, chunk_tx))
+    }
 }
 
 impl Drop for AudioMonitor {
@@ -276,6 +395,59 @@ impl Drop for AudioMonitor {
             debug!(device = %self.device_name, "audio monitor stream stopped");
         }
     }
+}
+
+/// `MIBEE_EYE_AUDIO_FIXTURE`: a WAV file that stands in for the microphone,
+/// so tests and benchmarks drive the real normalize→chunk pipeline (and
+/// everything downstream: KWS, ASR, VAD, the level meter) without recording
+/// anyone and without audio hardware. Read once per process; empty unsets.
+fn fixture_path() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    {
+        // Tests swap fixtures; the process-wide env cache below is for
+        // production determinism only.
+        if let Some(p) = tests::fixture_override() {
+            return Some(p);
+        }
+    }
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        std::env::var_os("MIBEE_EYE_AUDIO_FIXTURE")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    })
+    .clone()
+}
+
+/// Decode a fixture WAV to mono f32 at its source rate. Any bit depth
+/// hound reads is accepted; stereo+ is averaged down to mono.
+fn decode_fixture(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
+    let mut reader = hound::WavReader::open(path)
+        .with_context(|| format!("fixture open failed: {}", path.display()))?;
+    let spec = reader.spec();
+    let channels = spec.channels as usize;
+    if channels == 0 {
+        bail!("audio fixture has zero channels: {}", path.display());
+    }
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("fixture decode failed (f32)")?,
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / max))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("fixture decode failed (int)")?
+        }
+    };
+    if samples.is_empty() {
+        bail!("audio fixture is empty: {}", path.display());
+    }
+    let mono = downmix(&samples, spec.channels);
+    Ok((mono, spec.sample_rate))
 }
 
 fn resolve_device(name: &str) -> Result<Device> {
@@ -468,5 +640,134 @@ mod tests {
         // (callers treat this as "monitor disabled").
         let r = AudioMonitor::open("definitely-not-a-device-xyz");
         assert!(r.is_err());
+    }
+
+    // ─── Audio fixture (MIBEE_EYE_AUDIO_FIXTURE) ────────────────────────
+
+    /// Test seam for [`fixture_path`]. `FIXTURE` is touched only briefly
+    /// (never held across an `open()` call — `fixture_override` locks it
+    /// again internally); `SERIAL` serializes the fixture tests
+    /// themselves.
+    pub(super) static FIXTURE: std::sync::Mutex<Option<std::path::PathBuf>> =
+        std::sync::Mutex::new(None);
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn fixture_override() -> Option<std::path::PathBuf> {
+        FIXTURE.lock().map(|g| g.clone()).unwrap_or(None)
+    }
+
+    fn set_fixture(path: Option<std::path::PathBuf>) {
+        *FIXTURE.lock().unwrap() = path;
+    }
+
+    /// Write a sine WAV at 16 kHz mono 16-bit; returns its path.
+    fn write_sine_wav(dir: &std::path::Path, secs: f32, freq: f32) -> std::path::PathBuf {
+        let path = dir.join(format!("fixture-{freq}.wav"));
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: TARGET_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        let n = (f64::from(TARGET_RATE) * f64::from(secs)) as u32;
+        for i in 0..n {
+            let t = i as f32 / TARGET_RATE as f32;
+            let v = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.5;
+            writer.write_sample((v * 32_767.0) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        path
+    }
+
+    #[test]
+    fn fixture_open_bypasses_devices_and_bad_paths_fail_hard() {
+        let _serial = SERIAL.lock().unwrap();
+        let dir = std::env::temp_dir().join("mibee-audio-fixture-test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A nonexistent fixture is a hard error — never a silent mic.
+        set_fixture(Some(dir.join("missing.wav")));
+        let err = AudioMonitor::open("default");
+        assert!(err.is_err(), "missing fixture must fail open()");
+
+        // A valid fixture replaces the device entirely.
+        let wav = write_sine_wav(&dir, 0.2, 440.0);
+        set_fixture(Some(wav.clone()));
+        let monitor = AudioMonitor::open("definitely-not-a-device-xyz").unwrap();
+        assert!(
+            monitor.device_name().starts_with("audio-fixture("),
+            "{}",
+            monitor.device_name()
+        );
+        assert!(monitor.is_native_16k());
+        set_fixture(None);
+    }
+
+    #[test]
+    fn fixture_start_streams_512_sample_chunks_at_realtime_pace() {
+        let _serial = SERIAL.lock().unwrap();
+        let dir = std::env::temp_dir().join("mibee-audio-fixture-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = write_sine_wav(&dir, 0.2, 440.0);
+        set_fixture(Some(wav));
+        let mut monitor = AudioMonitor::open("default").unwrap();
+        let (mut rx, _tx) = monitor.start().unwrap();
+        // First chunk arrives within a couple of 32 ms windows.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        let first = loop {
+            match rx.try_recv() {
+                Ok(chunk) => break chunk,
+                Err(broadcast::error::TryRecvError::Empty)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    panic!("first fixture chunk within 300 ms")
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Closed) => panic!("fixture worker exited"),
+            }
+        };
+        assert_eq!(first.samples.len(), CHUNK_SAMPLES);
+        let peak = first.samples.iter().map(|&s| s.abs()).max().unwrap_or(0);
+        assert!(peak > 8_000, "sine at 0.5 amplitude, peak={peak}");
+        set_fixture(None);
+        drop(monitor);
+    }
+
+    /// Loop proof: a 0.3 s clip keeps producing chunks well past its own
+    /// duration (real-time pacing + restart-from-beginning). Ignored by
+    /// default because it costs ~1.2 s of wall clock.
+    #[test]
+    #[ignore = "wall-clock pacing test (~1.2 s)"]
+    fn fixture_loops_past_the_clip_end() {
+        let _serial = SERIAL.lock().unwrap();
+        let dir = std::env::temp_dir().join("mibee-audio-fixture-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = write_sine_wav(&dir, 0.3, 880.0);
+        set_fixture(Some(wav));
+        let mut monitor = AudioMonitor::open("default").unwrap();
+        let (mut rx, _tx) = monitor.start().unwrap();
+        let started = std::time::Instant::now();
+        let mut chunks = 0usize;
+        while started.elapsed() < std::time::Duration::from_millis(1_150) {
+            match rx.try_recv() {
+                Ok(_) => chunks += 1,
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(broadcast::error::TryRecvError::Closed) => panic!("fixture worker exited"),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            }
+        }
+        // 0.3 s of audio = ~9 chunks; 1.15 s at 31 chunks/s ≈ 36 expected
+        // past the loop point. Demand comfortably more than the clip holds.
+        assert!(
+            chunks > 25,
+            "expected looped streaming, got {chunks} chunks"
+        );
+        set_fixture(None);
     }
 }

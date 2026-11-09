@@ -225,7 +225,7 @@ pub fn qwen_tools_section(specs: &[ToolSpec]) -> String {
         })
         .collect();
     format!(
-        "\n\n# Tools\n\n如需外部信息或设备能力，可调用下列函数（签名见 <tools>）：\n<tools>\n{}\n</tools>\n\n调用时仅输出：\n<tool_call>\n<function=名称>\n<parameter=参数名>值</parameter>\n</function>\n</tool_call>",
+        "\n\n# Tools\n\n如需外部信息或设备能力，可调用下列函数（签名见 <tools>）。时间/日期/天气等时效信息必须调用工具实时获取，禁止沿用历史对话中的旧数值：\n<tools>\n{}\n</tools>\n\n调用时仅输出：\n<tool_call>\n<function=名称>\n<parameter=参数名>值</parameter>\n</function>\n</tool_call>",
         serde_json::to_string(&defs).unwrap_or_default()
     )
 }
@@ -330,6 +330,92 @@ mod tests {
         assert!(s.contains("\"weather.current\""));
         assert!(s.contains("<tool_call>"));
         assert!(s.contains("<function="));
+        // Freshness directive (2026-11-07 session finding): small voice-tier
+        // models copy a stale time answer from history instead of calling
+        // time.now unless the instruction is imperative.
+        assert!(s.contains("必须调用工具实时获取"));
+        assert!(s.contains("禁止沿用历史对话中的旧数值"));
+    }
+
+    /// Diagnostic against a real model (2026-11-09): the stale-history
+    /// repro from the voice-tier A/B — the exact failure mode was a 0.8B
+    /// model answering "现在几点了" by repeating the previous round's
+    /// time from context (verbatim, even with the freshness directive
+    /// in the tools section — observed 2026-11-09, which is why the
+    /// voice bridge short-circuits bare time questions to the local
+    /// clock instead). This probe classifies the model's behavior; it
+    /// deliberately does not gate on a tool call. Skipped unless
+    /// `AGENT_DIAG_MODEL=/path/to/model.gguf` points at the engine to
+    /// interrogate (e.g. models/llm/Qwen3.5-0.8B-Q4_K_M.gguf).
+    #[test]
+    #[ignore = "needs a real model file: AGENT_DIAG_MODEL=/path/to/gguf"]
+    fn diag_small_model_calls_time_tool_despite_stale_history() {
+        let Ok(path) = std::env::var("AGENT_DIAG_MODEL") else {
+            return;
+        };
+        let cfg = streaming::llm::LlmConfig {
+            enabled: true,
+            model_path: path,
+            ..streaming::llm::LlmConfig::default()
+        };
+        let engine = Arc::new(streaming::llm::ChatEngine::from_config(&cfg));
+        assert!(
+            engine.is_active(),
+            "diag model failed to load: {}",
+            engine.inactive_reason()
+        );
+        let channel = crate::agent::channels::LocalChannel {
+            engine: engine.clone(),
+        };
+        let shared = std::sync::Arc::new(std::sync::RwLock::new(
+            streaming::tools::ToolsConfig::default(),
+        ));
+        let specs = crate::agent::builtin::specs(&shared);
+        assert!(
+            specs.iter().any(|t| t.name == "time.now"),
+            "time.now must be among the builtin specs"
+        );
+        let turns = vec![
+            streaming::llm::ChatTurn {
+                role: "system".into(),
+                content: "你是小蜜蜂，家里的语音助手。".into(),
+            },
+            streaming::llm::ChatTurn {
+                role: "user".into(),
+                content: "现在几点了".into(),
+            },
+            streaming::llm::ChatTurn {
+                role: "assistant".into(),
+                // Stale answer from a previous round (the observed repro:
+                // the 0.8B tier copied this verbatim instead of calling).
+                content: "现在是上午10点05分。".into(),
+            },
+            streaming::llm::ChatTurn {
+                role: "user".into(),
+                content: "现在几点了".into(),
+            },
+        ];
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("diag runtime");
+        let out = rt
+            .block_on(channel.complete(&turns, &specs, true))
+            .expect("diag complete failed");
+        if let Some(call) = out.tool_calls.iter().find(|c| c.name.contains("time")) {
+            println!(
+                "diag: model calls the time tool despite stale history: {}",
+                call.name
+            );
+        } else {
+            // The documented 0.8B behavior — the voice bridge's
+            // deterministic time short-circuit is the correctness
+            // guarantee for that tier, not this prompt.
+            println!(
+                "diag: model copied stale context instead of calling (expected on the 0.8B voice tier): text={:?}",
+                out.text
+            );
+        }
     }
 
     #[test]
