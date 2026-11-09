@@ -4,6 +4,26 @@
 
 ### Added
 
+- **Audio fixture for tests and benchmarks (2026-11-09).**
+  `MIBEE_EYE_AUDIO_FIXTURE=<wav>` replaces the microphone entirely: the
+  always-on audio monitor plays the WAV through the real
+  normalize→chunk pipeline (32 ms pacing, restarts from the clip start
+  on loop) so KWS/ASR/VAD/level-meter end-to-end runs are deterministic
+  and need no audio hardware — no more speaker-to-mic A/B guessing. An
+  unreadable fixture fails hard rather than silently opening a live
+  mic.
+- **Deterministic time answer on the voice path (2026-11-09).** Bare
+  time questions ("现在几点了", "what time is it") are answered straight
+  from the local clock before any model runs. The 0.8B voice tier was
+  observed verbatim-copying the previous round's stale time from
+  history instead of calling `time.now` (the tool gate matched; even an
+  imperative freshness directive in the tools section did not move it —
+  preserved as a diagnostic probe in the agent runner). The
+  deterministic path is always fresh and spends zero model tokens;
+  compound questions (time + weather/camera/device) keep going through
+  the agent loop. Recorded as a normal §3.4 turn
+  (`builtin.time` / engine `builtin`).
+
 - **Voice-tier LLM split (2026-11-07).** `[llm] voice_model_path`
   runs voice-round local replies on a dedicated small model while
   HTTP chat keeps the full one — spoken answers are short and

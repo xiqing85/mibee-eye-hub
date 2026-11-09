@@ -452,6 +452,57 @@ impl VoiceBridge {
                         }
                         // Decision triage (SPEC appendix A #26): one Laya
                         // typed decision classifies the transcript before
+                        // Deterministic time answer (2026-11-09, takeover
+                        // of the 0.8B stale-history finding): a bare time
+                        // question gets the clock straight from the
+                        // builtin — the small voice tier verbatim-copied
+                        // the previous round's time from history instead
+                        // of calling time.now (the agent loop and tool
+                        // gate were fine; prompt-level directives did not
+                        // move a 0.8B — see the runner diag test). Always
+                        // fresh, zero model tokens; compound questions
+                        // (time + weather/camera/device) fall through to
+                        // the agent loop.
+                        if !ev.transcript.trim().is_empty()
+                            && streaming::decision::time_question(&ev.transcript)
+                        {
+                            let time_started = std::time::Instant::now();
+                            let reply = web::agent::builtin::time_reply(streaming::lang::detect(
+                                &ev.transcript,
+                            ));
+                            let _ = bridge_tx.send(web::routes::events::CameraEvent::ChatReply {
+                                source: "voice".into(),
+                                reply: reply.clone(),
+                                grounded: "builtin-clock".into(),
+                                timestamp_ms: unix_now_ms(),
+                            });
+                            if tts_for_away_cmd.is_active() {
+                                voice_engine_for_arming.begin_playback_mute();
+                                let tts = Arc::clone(&tts_for_away_cmd);
+                                let text = reply.clone();
+                                if let Err(e) =
+                                    tokio::task::spawn_blocking(move || tts.speak(&text)).await
+                                {
+                                    tracing::warn!(error = %e, "voice: time answer speak failed");
+                                }
+                                voice_engine_for_arming.end_playback_mute();
+                            }
+                            voice_engine_for_arming.arm_follow_up();
+                            desktop_for_voice.notify_conversation(&reply);
+                            convlog_for_voice
+                                .finish(
+                                    draft
+                                        .think(
+                                            "builtin.time",
+                                            "clock",
+                                            "时间问题 — 本地时钟直答（未走模型）",
+                                            time_started.elapsed().as_millis() as u64,
+                                        )
+                                        .reply(reply, "builtin"),
+                                )
+                                .await;
+                            continue;
+                        }
                         // any local-LLM tokens are spent. `ignore` skips
                         // the auto-reply; inactive/low-confidence fails
                         // open to the previous behavior (always answer).

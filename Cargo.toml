@@ -53,6 +53,7 @@ bcrypt = "0.17"
 rand = "0.8"
 nokhwa = { version = "0.10", features = ["input-native"] }
 cpal = "0.18"
+hound = "3.5"
 # ── Native codec stack (replaces ffmpeg subprocesses) ────────────────────────
 # H.264 software encoder (Cisco BSD-2, vendored C++ compiled via cc/build.rs).
 # `source` feature bundles a prebuilt Cisco library blob for the host target,

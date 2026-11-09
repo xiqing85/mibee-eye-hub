@@ -73,20 +73,51 @@ pub async fn dispatch(
     }
 }
 
-fn time_now() -> ToolOutput {
-    let now = chrono::Local::now();
+/// Chinese weekday for the given local time (shared by the tool
+/// output and the spoken short-circuit reply).
+fn weekday_zh(now: &chrono::DateTime<chrono::Local>) -> &'static str {
     const WEEKDAYS: [&str; 7] = ["一", "二", "三", "四", "五", "六", "日"];
-    let weekday_idx: usize = now
+    let idx: usize = now
         .format("%u")
         .to_string()
         .parse()
         .unwrap_or(1)
         .clamp(1, 7);
+    WEEKDAYS[idx - 1]
+}
+
+/// Spoken time answer for the voice short-circuit (2026-11-09): bare
+/// time questions ([`streaming::decision::time_question`]) get
+/// the clock straight from here — always fresh, zero model tokens.
+/// The 0.8B voice tier copied the previous round's stale time from
+/// history instead of calling `time.now` (prompt directives didn't
+/// move it; see the runner diag test), so the deterministic path is
+/// the correctness guarantee and this reply mirrors `time_now`'s
+/// clock in spoken posture.
+pub fn time_reply(lang: streaming::lang::SpokenLang) -> String {
+    let now = chrono::Local::now();
+    match lang {
+        streaming::lang::SpokenLang::English => {
+            format!("It's {}.", now.format("%-I:%M %p on %A, %B %-d"))
+        }
+        _ => format!(
+            "现在是{}月{}日 星期{} {}点{:02}分。",
+            now.format("%-m"),
+            now.format("%-d"),
+            weekday_zh(&now),
+            now.format("%-H"),
+            now.format("%-M")
+        ),
+    }
+}
+
+fn time_now() -> ToolOutput {
+    let now = chrono::Local::now();
     ToolOutput {
         text: format!(
             "{}（星期{}，UTC{}）",
             now.format("%Y-%m-%d %H:%M:%S"),
-            WEEKDAYS[weekday_idx - 1],
+            weekday_zh(&now),
             now.format("%:z"),
         ),
         media_url: None,
@@ -192,5 +223,19 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn time_reply_is_spoken_posture_per_language() {
+        let zh = time_reply(streaming::lang::SpokenLang::Mandarin);
+        assert!(zh.starts_with("现在是"), "{zh}");
+        assert!(zh.contains("星期"), "{zh}");
+        assert!(zh.contains("点"), "{zh}");
+        assert!(zh.ends_with("。"), "{zh}");
+        let yue = time_reply(streaming::lang::SpokenLang::Cantonese);
+        assert!(yue.starts_with("现在是"), "{yue}");
+        let en = time_reply(streaming::lang::SpokenLang::English);
+        assert!(en.starts_with("It's "), "{en}");
+        assert!(en.ends_with('.'), "{en}");
     }
 }
