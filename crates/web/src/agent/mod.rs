@@ -71,6 +71,58 @@ pub struct McpServerConfig {
     pub env: HashMap<String, String>,
 }
 
+/// Content fingerprint of one MCP server config (trust gate, SPEC
+/// appendix A #43 amendment): sha256 over the name, command, args and
+/// the env map (sorted by key so map ordering never changes a
+/// fingerprint). Any edit to the launch line changes the fingerprint
+/// and re-arms the confirmation requirement.
+pub fn mcp_fingerprint(s: &McpServerConfig) -> String {
+    use sha2::Digest;
+    let mut env_keys: Vec<&String> = s.env.keys().collect();
+    env_keys.sort();
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(s.name.as_bytes());
+    hasher.update([0]);
+    hasher.update(s.command.as_bytes());
+    hasher.update([0]);
+    for a in &s.args {
+        hasher.update(a.as_bytes());
+        hasher.update([0]);
+    }
+    for k in env_keys {
+        hasher.update(k.as_bytes());
+        hasher.update([1]);
+        hasher.update(s.env[k].as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// The confirmed-trust map persisted as settings key `agent.mcp_trust`
+/// (`{"<name>": "<fingerprint>"}`). A server runs only when its CURRENT
+/// fingerprint matches its entry — hex's content-hash trust for config
+/// scripts; an MCP server is arbitrary local code, so a new or edited
+/// launch line stays REFUSED until the operator confirms.
+pub type McpTrustMap = std::collections::HashMap<String, String>;
+
+/// Pure gate: split the configured servers into (allowed, blocked).
+pub fn mcp_trust_split<'a>(
+    servers: &'a [McpServerConfig],
+    trust: &McpTrustMap,
+) -> (Vec<&'a McpServerConfig>, Vec<(&'a McpServerConfig, String)>) {
+    let mut allowed = Vec::new();
+    let mut blocked = Vec::new();
+    for s in servers {
+        let fp = mcp_fingerprint(s);
+        if trust.get(&s.name).is_some_and(|t| t == &fp) {
+            allowed.push(s);
+        } else {
+            blocked.push((s, fp));
+        }
+    }
+    (allowed, blocked)
+}
+
 /// A tool as exposed to the model and `GET /api/tools`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSpec {
@@ -150,6 +202,9 @@ pub struct ToolRegistry {
     streams: RwLock<Option<Arc<StreamManager>>>,
     mcp: Vec<mcp::McpClient>,
     mcp_tools: RwLock<Vec<ToolSpec>>,
+    /// Confirmed MCP fingerprints (see [`mcp_trust_split`]); loaded at
+    /// boot from settings, updated by the trust endpoint.
+    trust: RwLock<McpTrustMap>,
 }
 
 impl ToolRegistry {
@@ -164,7 +219,23 @@ impl ToolRegistry {
             streams: RwLock::new(None),
             mcp,
             mcp_tools: RwLock::new(Vec::new()),
+            trust: RwLock::new(McpTrustMap::new()),
         }
+    }
+
+    /// Replace the confirmed-trust map (boot load + trust endpoint).
+    pub fn set_trust(&self, trust: McpTrustMap) {
+        *self.trust.write() = trust;
+    }
+
+    /// The confirmed-truth map (the trust endpoint merges into it).
+    pub fn trust_map(&self) -> McpTrustMap {
+        self.trust.read().clone()
+    }
+
+    /// The configured MCP server configs (fingerprinting/UI).
+    pub fn mcp_configs(&self) -> Vec<McpServerConfig> {
+        self.mcp.iter().map(|c| c.config().clone()).collect()
     }
 
     /// Attach the stream manager once it exists (camera.snapshot needs
@@ -192,9 +263,30 @@ impl ToolRegistry {
 
     /// Connect/initialize every MCP server and re-list its tools.
     /// Server-level failures log and contribute nothing (fail-open).
+    /// Unconfirmed servers (trust gate, SPEC appendix A #43 amendment)
+    /// are REFUSED — an MCP server is arbitrary local code; a new or
+    /// edited launch line stays down until the operator confirms it
+    /// (`POST /api/tools/mcp/{name}/trust`).
     pub async fn refresh_mcp(&self) {
+        let trust = self.trust.read().clone();
+        let configs: Vec<McpServerConfig> = self.mcp.iter().map(|c| c.config().clone()).collect();
+        let (allowed, blocked) = mcp_trust_split(&configs, &trust);
+        for (cfg, fp) in &blocked {
+            tracing::warn!(
+                server = %cfg.name,
+                command = %cfg.command,
+                fingerprint = %fp,
+                "agent: MCP server not confirmed — refusing to start it                  (POST /api/tools/mcp/{}/trust with the current fingerprint                  to confirm; edited launch lines re-arm this gate)",
+                cfg.name
+            );
+        }
+        let allowed_names: std::collections::HashSet<&str> =
+            allowed.iter().map(|c| c.name.as_str()).collect();
         let mut listed = Vec::new();
         for client in &self.mcp {
+            if !allowed_names.contains(client.name()) {
+                continue; // unconfirmed — refused above
+            }
             match client.ensure_initialized().await {
                 Ok(()) => match client.list_tools().await {
                     Ok(tools) => listed.extend(tools),
@@ -252,6 +344,15 @@ impl ToolRegistry {
 mod tests {
     use super::*;
 
+    fn srv(name: &str, command: &str, args: &[&str]) -> McpServerConfig {
+        McpServerConfig {
+            name: name.into(),
+            command: command.into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            env: std::collections::HashMap::new(),
+        }
+    }
+
     #[test]
     fn absent_section_parses_to_defaults() {
         let cfg: AgentConfig = serde_json::from_str("{}").unwrap();
@@ -259,6 +360,62 @@ mod tests {
         assert_eq!(cfg.max_steps, 3);
         assert_eq!(cfg.step_timeout_ms, 15_000);
         assert!(cfg.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_fingerprint_is_stable_and_sensitive() {
+        let a = srv("home", "python3", &["/opt/home_tools.py"]);
+        let b = srv("home", "python3", &["/opt/home_tools.py"]);
+        assert_eq!(
+            mcp_fingerprint(&a),
+            mcp_fingerprint(&b),
+            "identical configs match"
+        );
+        // Any launch-line edit re-arms the gate.
+        let c = srv("home", "python3", &["/opt/other.py"]);
+        assert_ne!(
+            mcp_fingerprint(&a),
+            mcp_fingerprint(&c),
+            "arg edit changes fp"
+        );
+        let d = srv("home2", "python3", &["/opt/home_tools.py"]);
+        assert_ne!(
+            mcp_fingerprint(&a),
+            mcp_fingerprint(&d),
+            "name edit changes fp"
+        );
+        // Env map ordering never matters.
+        let mut e1 = srv("home", "python3", &[]);
+        e1.env.insert("B".into(), "2".into());
+        e1.env.insert("A".into(), "1".into());
+        let mut e2 = srv("home", "python3", &[]);
+        e2.env.insert("A".into(), "1".into());
+        e2.env.insert("B".into(), "2".into());
+        assert_eq!(mcp_fingerprint(&e1), mcp_fingerprint(&e2));
+    }
+
+    #[test]
+    fn trust_split_confirms_only_matching_fingerprints() {
+        let servers = vec![srv("a", "/bin/a", &[]), srv("b", "/bin/b", &[])];
+        let mut trust = McpTrustMap::new();
+        trust.insert("a".into(), mcp_fingerprint(&servers[0]));
+        let (allowed, blocked) = mcp_trust_split(&servers, &trust);
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].name, "a");
+        assert_eq!(blocked.len(), 1, "unconfirmed b refused");
+        assert_eq!(blocked[0].0.name, "b");
+        // A STALE fingerprint (server edited since confirmation) is
+        // refused, not grandfathered.
+        let mut stale = McpTrustMap::new();
+        stale.insert("a".into(), "deadbeef".into());
+        let (allowed, blocked) = mcp_trust_split(&servers, &stale);
+        assert!(allowed.is_empty(), "stale fp must not run");
+        assert_eq!(blocked.len(), 2);
+        // Empty map = everything needs confirmation (fail-closed for
+        // trust, fail-open for the service itself).
+        let (allowed, blocked) = mcp_trust_split(&servers, &McpTrustMap::new());
+        assert!(allowed.is_empty());
+        assert_eq!(blocked.len(), 2);
     }
 
     #[test]

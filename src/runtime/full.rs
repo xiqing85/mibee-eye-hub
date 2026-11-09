@@ -154,7 +154,20 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         return selftest_cli("tts", || streaming::tts::selftest_tts(text));
     }
 
-    let mut config = crate::config::AppConfig::load(&args.config)?;
+    // Resilient config load (hex's "settings errors never prevent
+    // launch"): an unparseable file is preserved beside itself and the
+    // service boots on defaults — a broken config must not take the
+    // camera agent down with it. The issue (and backup path) is
+    // reported in the startup log.
+    let resilient = crate::config::AppConfig::load_resilient(&args.config);
+    if let Some(issue) = &resilient.issue {
+        tracing::error!(
+            issue = %issue,
+            backup = resilient.backup.as_ref().map(|b| b.display().to_string()),
+            "config: unreadable — booting on defaults (original preserved if parseable-bytes existed)"
+        );
+    }
+    let mut config = resilient.config;
     config.validate()?;
 
     // Resolve advertised host: use configured value or auto-detect LAN IP
@@ -650,6 +663,20 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         Arc::clone(&shared_tools),
         &config.agent,
     ));
+    // MCP trust gate (SPEC appendix A #43 amendment): load the
+    // confirmed fingerprints before the warmup refresh; unconfirmed
+    // servers are refused there with a warning naming the confirm
+    // endpoint. Corrupt persisted maps fail open to an EMPTY map —
+    // i.e. every server needs confirmation, never silently trusted.
+    {
+        let mut map = web::agent::McpTrustMap::new();
+        if let Ok(Some(v)) = web::db::get_setting(&pool, "agent.mcp_trust").await
+            && let Ok(parsed) = serde_json::from_str::<web::agent::McpTrustMap>(&v)
+        {
+            map = parsed;
+        }
+        agent_registry.set_trust(map);
+    }
 
     // Desktop integration (SPEC appendix A #42): tray icon + desktop
     // notifications — no-ops without a desktop session (fail-open).

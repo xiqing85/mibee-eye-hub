@@ -440,6 +440,38 @@ impl Default for ConversationsConfig {
     }
 }
 
+/// The result of [`AppConfig::load_resilient`]: the config to boot on
+/// (parsed or defaults) plus what went wrong, if anything, and where
+/// the unreadable original was preserved.
+pub struct ResilientLoad {
+    pub config: AppConfig,
+    /// Path of the `unreadable-<sha>` backup written for an unparseable
+    /// file (None on success/missing file/read failure).
+    pub backup: Option<std::path::PathBuf>,
+    /// Human-readable reason when the service is running on defaults.
+    pub issue: Option<String>,
+}
+
+/// Preserve an unparseable config beside itself as
+/// `<path>.unreadable-<sha256[0..12]>`. Identical originals share one
+/// backup (the name is content-addressed); the write is best-effort —
+/// a backup failure must not block the boot-on-defaults path.
+fn backup_unreadable(path: &Path, contents: &str) -> std::path::PathBuf {
+    use sha2::Digest;
+    let digest = format!("{:x}", sha2::Sha256::digest(contents.as_bytes()));
+    let backup = path.with_file_name(format!(
+        "{}.unreadable-{}",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config"),
+        &digest[..12]
+    ));
+    if !backup.exists() {
+        let _ = std::fs::write(&backup, contents);
+    }
+    backup
+}
+
 impl AppConfig {
     /// Load configuration from a TOML file.
     ///
@@ -449,6 +481,49 @@ impl AppConfig {
         let contents = std::fs::read_to_string(path)?;
         let config: AppConfig = toml::from_str(&contents)?;
         Ok(config)
+    }
+
+    /// Resilient load (hex's "settings errors never prevent launch"
+    /// invariant): a file that exists but cannot be parsed is preserved
+    /// as `<path>.unreadable-<sha256[0..12]>` (identical originals share
+    /// one backup — no pile-up across restarts) and the service boots on
+    /// defaults with the reason reported. A MISSING file is a normal
+    /// first run (defaults, no backup). Read failures (permissions)
+    /// also boot on defaults but cannot back up what they cannot read —
+    /// reported distinctly.
+    pub fn load_resilient(path: &Path) -> ResilientLoad {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return ResilientLoad {
+                    config: AppConfig::default(),
+                    backup: None,
+                    issue: None,
+                };
+            }
+            Err(e) => {
+                return ResilientLoad {
+                    config: AppConfig::default(),
+                    backup: None,
+                    issue: Some(format!("config read failed: {e}")),
+                };
+            }
+        };
+        match toml::from_str::<AppConfig>(&contents) {
+            Ok(config) => ResilientLoad {
+                config,
+                backup: None,
+                issue: None,
+            },
+            Err(e) => {
+                let backup = backup_unreadable(path, &contents);
+                ResilientLoad {
+                    config: AppConfig::default(),
+                    backup: Some(backup),
+                    issue: Some(format!("config parse failed: {e}")),
+                }
+            }
+        }
     }
 
     /// Validate the configuration at startup.
@@ -1185,6 +1260,65 @@ port = 9090
         assert_eq!(cfg.web.host, "0.0.0.0");
         // rtsp should fall back to default
         assert_eq!(cfg.rtsp.server_port, 8554);
+    }
+
+    // --- load_resilient (unreadable-config backups) ---
+
+    fn write_cfg(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let p = dir.join("config.toml");
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn unreadable_config_backs_up_and_boots_on_defaults() {
+        let dir = std::env::temp_dir().join(format!("nb-cfg-resilient-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Valid TOML but not a valid config table shape.
+        let p = write_cfg(&dir, "this is = [[not a valid config");
+        let r = AppConfig::load_resilient(&p);
+        assert!(r.issue.is_some(), "parse failure reported");
+        assert!(r.backup.is_some(), "original preserved");
+        let backup = r.backup.unwrap();
+        assert!(
+            backup
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("config.toml.unreadable-")),
+            "content-addressed backup name: {backup:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "this is = [[not a valid config",
+            "backup holds the exact original bytes"
+        );
+        // Defaults booted (validate must pass on them).
+        r.config.validate().unwrap();
+        // Re-loading the same junk does NOT stack another backup.
+        let r2 = AppConfig::load_resilient(&p);
+        assert!(r2.backup.is_some());
+        assert_eq!(
+            r2.backup.unwrap(),
+            backup,
+            "identical original shares one backup"
+        );
+        // A DIFFERENT junk payload gets its own backup.
+        let p3 = write_cfg(&dir, "different = [junk");
+        let r3 = AppConfig::load_resilient(&p3);
+        assert_ne!(r3.backup.unwrap(), backup, "new content, new backup");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_config_is_normal_first_run() {
+        let dir = std::env::temp_dir().join(format!("nb-cfg-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = AppConfig::load_resilient(&dir.join("absent.toml"));
+        assert!(r.issue.is_none(), "a missing file is not an error");
+        assert!(r.backup.is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // --- AppConfig::load ---
