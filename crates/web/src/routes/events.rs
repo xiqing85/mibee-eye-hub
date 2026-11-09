@@ -69,6 +69,10 @@ pub enum CameraEvent {
         /// Captured inside a follow-up window (#30-B).
         follow_up: bool,
         timestamp_ms: u64,
+        /// Capture-window level audit (#54): peak/RMS dBFS + speech
+        /// ratio of the audio the round saw. Absent on pre-#54 events.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audit: Option<streaming::voice::WindowAudit>,
     },
     /// One Laya typed decision over a voice transcript (SPEC appendix A
     /// #26): how the device classified the utterance before answering.
@@ -307,6 +311,7 @@ fn event_wire(event: &CameraEvent) -> (&'static str, String) {
             scene,
             follow_up,
             timestamp_ms,
+            audit,
         } => (
             "voice_transcript",
             serde_json::json!({
@@ -315,6 +320,7 @@ fn event_wire(event: &CameraEvent) -> (&'static str, String) {
                 "speaker": speaker,
                 "scene": scene,
                 "follow_up": follow_up,
+                "audit": audit,
                 "timestamp": timestamp_ms,
             })
             .to_string(),
@@ -630,6 +636,11 @@ mod wire_tests {
             scene: "室内".into(),
             follow_up: false,
             timestamp_ms: 8,
+            audit: Some(streaming::voice::WindowAudit {
+                peak_dbfs: -6.0,
+                rms_dbfs: -20.5,
+                speech_ratio: 0.62,
+            }),
         });
         assert_eq!(n, "voice_transcript");
         assert_eq!(j["keyword"], "小蜜蜂");
@@ -637,6 +648,8 @@ mod wire_tests {
         assert_eq!(j["speaker"], "");
         assert_eq!(j["scene"], "室内");
         assert_eq!(j["follow_up"], false);
+        assert_eq!(j["audit"]["peak_dbfs"], -6.0);
+        assert!((j["audit"]["speech_ratio"].as_f64().unwrap() - 0.62).abs() < 1e-6);
 
         let (n, j) = wire(CameraEvent::VoiceDecision {
             camera_id: "0".into(),

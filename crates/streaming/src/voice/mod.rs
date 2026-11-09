@@ -51,6 +51,78 @@ pub struct VoiceEvent {
     /// SPEC appendix A #30-B continuous dialogue).
     #[serde(default)]
     pub follow_up: bool,
+    /// Capture-window audit (SPEC appendix A #54): level statistics of
+    /// the audio the round actually saw. `None` only on events from
+    /// builds predating the field.
+    #[serde(default)]
+    pub audit: Option<WindowAudit>,
+}
+
+/// Level statistics for one voice round's captured window (SPEC
+/// appendix A #54). Computed from the raw i16 samples — before any
+/// model ran — so a "wake with no answer" round still tells whether
+/// the mic heard speech (level present, ASR missed it), silence
+/// (nothing was said), or clipping-level noise.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowAudit {
+    /// Absolute peak of the window, dBFS (0 = full scale; -90 floor).
+    pub peak_dbfs: f32,
+    /// RMS of the whole window, dBFS (-90 floor).
+    pub rms_dbfs: f32,
+    /// Fraction of 20 ms frames whose RMS sits above -45 dBFS —
+    /// "how much of the window carried speech-level energy" in [0,1].
+    pub speech_ratio: f32,
+}
+
+/// Frame length for [`speech_ratio`] (20 ms at 16 kHz).
+const AUDIT_FRAME: usize = 320;
+/// A frame counts as speech-level above this RMS, dBFS. Quiet mics
+/// carry whole dictations under -55 dBFS (#841-style); -45 keeps the
+/// estimate useful without counting room noise.
+const AUDIT_SPEECH_DBFS: f32 = -45.0;
+/// Reporting floor for dBFS values.
+const AUDIT_FLOOR_DB: f32 = -90.0;
+
+/// Compute the audit for a captured window. Pure — unit-testable
+/// without any audio hardware.
+#[must_use]
+pub fn window_audit(samples: &[f32]) -> Option<WindowAudit> {
+    if samples.is_empty() {
+        return None;
+    }
+    let dbfs = |amp: f32| -> f32 {
+        if amp <= 0.0 {
+            AUDIT_FLOOR_DB
+        } else {
+            (20.0 * amp.log10()).max(AUDIT_FLOOR_DB)
+        }
+    };
+    let amp = |s: &f32| -> f32 { s.abs().max(1e-6) };
+    let peak = samples.iter().map(&amp).fold(0.0_f32, f32::max);
+    let sum_sq: f64 = samples
+        .iter()
+        .map(|s| f64::from(amp(s)) * f64::from(amp(s)))
+        .sum();
+    let rms = ((sum_sq / samples.len() as f64).sqrt() as f32).max(1e-6);
+    let speech_frames = samples
+        .chunks(AUDIT_FRAME)
+        .filter(|frame| {
+            let fs: f64 = frame
+                .iter()
+                .map(|s| {
+                    let a = f64::from(amp(s));
+                    a * a
+                })
+                .sum();
+            dbfs(((fs / frame.len() as f64).sqrt() as f32).max(1e-6)) > AUDIT_SPEECH_DBFS
+        })
+        .count();
+    let frames = samples.chunks(AUDIT_FRAME).count();
+    Some(WindowAudit {
+        peak_dbfs: dbfs(peak),
+        rms_dbfs: dbfs(rms),
+        speech_ratio: speech_frames as f32 / frames as f32,
+    })
 }
 
 /// `[voice]` configuration section.
@@ -949,6 +1021,11 @@ impl VoiceEngine {
                                             let recognizer = Arc::clone(&internals.recognizer);
                                             let tx = event_tx.clone();
                                             let extend = now_ms + 2_000;
+                                            // Latency-critical too (SPEC
+                                            // appendix A #55): the user is
+                                            // mid-dialogue without a wake
+                                            // word.
+                                            crate::voice_round_begin(4_000);
                                             follow_until_ms
                                                 .store(extend, std::sync::atomic::Ordering::SeqCst);
                                             tokio::task::spawn_blocking(move || {
@@ -963,6 +1040,7 @@ impl VoiceEngine {
                                                     timestamp_ms: unix_now_ms(),
                                                     speaker: String::new(),
                                                     follow_up: true,
+                                                    audit: window_audit(&waveform),
                                                 });
                                             });
                                         }
@@ -1040,6 +1118,7 @@ impl VoiceEngine {
                                             timestamp_ms: now_ms,
                                             speaker,
                                             follow_up: false,
+                                            audit: window_audit(&waveform),
                                         });
                                     });
                                     keyword_pending = None;
@@ -1060,6 +1139,13 @@ impl VoiceEngine {
                                     info!(keyword = %hit.keyword, "voice: wake word detected");
                                     internals.kws.reset(&kws_stream);
                                     captured.clear();
+                                    // Latency-critical window opens (SPEC
+                                    // appendix A #55): capture + ASR are
+                                    // about to compete with the decoders —
+                                    // heavy inference yields until the
+                                    // transcript lands (bounded, self-
+                                    // expiring).
+                                    crate::voice_round_begin(12_000);
 
                                     // Enrollment has priority: the wake-word
                                     // utterance becomes a voiceprint sample
@@ -1732,5 +1818,37 @@ mod tests {
         let mut full = s.clone();
         full.embeddings.push(vec![0.25; 4]);
         assert!(!enrollment_accepts(&full), "no samples past `needed`");
+    }
+
+    #[test]
+    fn window_audit_classifies_silence_speech_and_clipping() {
+        use super::window_audit;
+        // Empty window: no audit at all.
+        assert!(window_audit(&[]).is_none());
+        // Digital silence floors out and carries no speech.
+        let silence = vec![0.0f32; 16_000];
+        let a = window_audit(&silence).unwrap();
+        assert_eq!(a.peak_dbfs, -90.0);
+        assert_eq!(a.rms_dbfs, -90.0);
+        assert_eq!(a.speech_ratio, 0.0);
+        // Half-scale sine in the first half, silence in the second:
+        // speech-level frames only in the voiced half, peak ≈ -6 dBFS.
+        let mut mixed = Vec::with_capacity(16_000);
+        for i in 0..8_000 {
+            let t = i as f32 / 16_000.0;
+            mixed.push((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5);
+        }
+        mixed.extend(std::iter::repeat_n(0.0f32, 8_000));
+        let a = window_audit(&mixed).unwrap();
+        assert!((a.peak_dbfs - (-6.0)).abs() < 0.5, "peak {a:?}");
+        assert!(a.rms_dbfs > -90.0 && a.rms_dbfs < a.peak_dbfs);
+        assert!((a.speech_ratio - 0.5).abs() < 0.08, "speech ratio {a:?}");
+        // Near-full-scale noise reads as clipping-level peak.
+        let loud: Vec<f32> = (0..16_000)
+            .map(|i| if i % 2 == 0 { 0.92f32 } else { -0.92f32 })
+            .collect();
+        let a = window_audit(&loud).unwrap();
+        assert!(a.peak_dbfs > -1.0, "loud peak {a:?}");
+        assert_eq!(a.speech_ratio, 1.0);
     }
 }

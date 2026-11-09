@@ -224,6 +224,12 @@ impl VlmEngine {
             let inner_for_thread = std::sync::Arc::clone(&inner);
             let spawned = std::thread::Builder::new().name("vlm-bg".into()).spawn(
                 move || -> anyhow::Result<String> {
+                    // Voice-round yielding (SPEC appendix A #55): starting
+                    // a full-tilt encode mid-utterance is exactly what
+                    // starved KWS in the field (2026-10-12: five wake
+                    // words unheard). Wait a bounded beat for the round to
+                    // finish; past the bound, run anyway (fail-open).
+                    crate::wait_voice_idle(std::time::Duration::from_secs(3));
                     // SAFETY: `setpriority` with `which = PRIO_PROCESS` and
                     // `who = 0` addresses the calling thread; raising one's
                     // own nice is always permitted.

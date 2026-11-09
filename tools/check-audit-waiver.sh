@@ -356,6 +356,53 @@ else
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
+# Waiver 6 — libsqlite3-sys / RUSTSEC-2026-0459 (local-file-write-only)
+# ════════════════════════════════════════════════════════════════════════════
+
+SQLITE_ADVISORY="RUSTSEC-2026-0459"
+
+echo "check-audit-waiver: verifying the ${SQLITE_ADVISORY} (libsqlite3-sys bundled SQLite) waiver"
+
+SQLITE_LOCK="$(grep -A1 '^name = "libsqlite3-sys"$' Cargo.lock | grep version | cut -d'"' -f2)"
+
+# 6c. Still in the lock at all?
+if [[ -z "${SQLITE_LOCK}" ]]; then
+    echo "check-audit-waiver: libsqlite3-sys left the lockfile." >&2
+    echo "  The waiver is dead config — remove ${SQLITE_ADVISORY} from tools/audit.toml." >&2
+    fail=1
+fi
+
+# 6b. Has the fix line been reached (rusqlite 0.41 upgrade done)?
+if python3 -c "
+import sys
+ver = '${SQLITE_LOCK}'.split('.')
+for i, part in enumerate([0, 39, 0]):
+    cur = int(ver[i]) if i < len(ver) and ver[i].isdigit() else 0
+    if cur != part:
+        sys.exit(0 if cur > part else 1)
+sys.exit(0)
+"; then
+    echo "check-audit-waiver: libsqlite3-sys ${SQLITE_LOCK} >= 0.39.0 — advisory no longer applies." >&2
+    echo "  The waiver is dead config — remove ${SQLITE_ADVISORY} from tools/audit.toml." >&2
+    fail=1
+else
+    echo "check-audit-waiver: libsqlite3-sys ${SQLITE_LOCK} pre-fix (waiver premise holds)"
+fi
+
+# 6a. Premise guard: the vulnerable bundled copy must come via the known
+# product deps (rusqlite / sqlx). A stray new dependent changes the story.
+SQLITE_DEPS="$(cargo tree --target all --invert "libsqlite3-sys@${SQLITE_LOCK}" 2>/dev/null | grep -oE '^[a-z0-9_-]+ v' | sed -E 's/ v$//' | sort -u || true)"
+SQLITE_STRAY="$(printf '%s\n' "${SQLITE_DEPS}" | grep -vE '^(libsqlite3-sys|rusqlite|sqlx|sqlx-sqlite|hashlink|fallible-iterator|fallible-streaming-iterator|smallvec|mibee-eye|web|security)$' || true)"
+if [[ -n "${SQLITE_STRAY//[[:space:]]/}" ]]; then
+    echo "check-audit-waiver: libsqlite3-sys gained unexpected dependents:" >&2
+    echo "${SQLITE_STRAY}" >&2
+    echo "  Review the waiver — the rusqlite/sqlx premise may no longer hold." >&2
+    fail=1
+else
+    echo "check-audit-waiver: libsqlite3-sys stays under rusqlite/sqlx (as the waiver assumes)"
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
 
 if [[ "${fail}" -ne 0 ]]; then
     exit 1

@@ -446,7 +446,17 @@ impl ChatEngine {
         let mut reply = String::new();
         let mut generated_tokens: u64 = 0;
         let mut logits_at = n_prompt as i32 - 1;
+        // Voice-round yielding (SPEC appendix A #55): a wake word or
+        // follow-up mid-dialogue is latency-critical KWS/ASR work on
+        // the same cores; sleep between tokens so those threads get
+        // the CPU. Voice rounds' own generations never overlap their
+        // capture window, so this cannot self-throttle.
+        let mut yielded_ms: u64 = 0;
         for pos in (n_prompt as i32..).take(self.config.max_tokens as usize) {
+            if crate::voice_round_active() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                yielded_ms += 2;
+            }
             generated_tokens += 1;
             let logits = ctx.get_logits_ith(logits_at);
             logits_at = 0;
@@ -479,6 +489,13 @@ impl ChatEngine {
             let mut next = LlamaBatch::new(1, 1);
             next.add(token, pos, &[0], true)?;
             ctx.decode(&mut next)?;
+        }
+        if yielded_ms > 0 {
+            tracing::info!(
+                yielded_ms,
+                tokens = generated_tokens,
+                "llm: decode yielded to a voice round"
+            );
         }
         // Qwen3 chatml: /no_think still emits an empty <think> block —
         // strip think sections, keep the visible answer.

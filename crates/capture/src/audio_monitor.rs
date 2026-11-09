@@ -636,6 +636,10 @@ mod tests {
 
     #[test]
     fn open_fails_cleanly_without_device_name_match() {
+        // Serialized with the fixture tests: the override is
+        // process-global, and a parallel `set_fixture` would route
+        // this through the fixture path (CI caught the race).
+        let _serial = SERIAL.lock().unwrap();
         // A device substring that cannot exist fails open with an error
         // (callers treat this as "monitor disabled").
         let r = AudioMonitor::open("definitely-not-a-device-xyz");
