@@ -16,6 +16,9 @@
 pub struct LevelMeter {
     /// Samples accumulated since the last emit window.
     pending: usize,
+    /// Sum of samples (for the window mean — RMS is AC-coupled so a DC
+    /// offset from a cheap capture path never reads as voice level).
+    pending_sum: f64,
     pending_sq: f64,
     /// Samples at/near full scale accumulated in the pending window.
     pending_clips: usize,
@@ -95,6 +98,7 @@ impl LevelMeter {
     pub fn new() -> Self {
         Self {
             pending: 0,
+            pending_sum: 0.0,
             pending_sq: 0.0,
             pending_clips: 0,
             clips: ClipDetector::default(),
@@ -108,6 +112,7 @@ impl LevelMeter {
     pub fn update(&mut self, samples: &[i16], now_ms: u64) -> Option<f32> {
         for s in samples {
             let f = f64::from(*s) / 32768.0;
+            self.pending_sum += f;
             self.pending_sq += f * f;
             if s.unsigned_abs() >= ClipDetector::CLIP_SAMPLE.unsigned_abs() {
                 self.pending_clips += 1;
@@ -125,7 +130,11 @@ impl LevelMeter {
             // just spans slightly more than 100 ms — harmless).
             return None;
         }
-        let rms = (self.pending_sq / self.pending as f64).sqrt() as f32;
+        // AC-coupled RMS: variance = E[x²] − E[x]² (clamped ≥0 against
+        // fp cancellation) — a constant DC offset measures as silence.
+        let n = self.pending as f64;
+        let var = (self.pending_sq / n - (self.pending_sum / n).powi(2)).max(0.0);
+        let rms = var.sqrt() as f32;
         if self.clips.feed(self.pending_clips, self.pending) {
             tracing::warn!(
                 "audio: mic input clipping sustained — check the OS source gain \
@@ -133,6 +142,7 @@ impl LevelMeter {
             );
         }
         self.pending = 0;
+        self.pending_sum = 0.0;
         self.pending_sq = 0.0;
         self.pending_clips = 0;
         self.last_emit_ms = Some(now_ms);
@@ -146,7 +156,31 @@ impl LevelMeter {
         }
         Some(self.level)
     }
+
+    /// Whether the monitor stream has gone quiet on us: no window
+    /// completed for `STALE_MS` (hex's "a stale peak reads as no
+    /// audio" — a frozen waveform mid-level means the tap died, not
+    /// that speech is ongoing). The caller should publish a zero.
+    #[must_use]
+    pub fn stale(&self, now_ms: u64) -> bool {
+        self.last_emit_ms
+            .is_some_and(|t| now_ms.saturating_sub(t) > STALE_MS)
+            && self.level > FLOOR
+    }
+
+    /// Publish the stale floor (0.0) and re-arm staleness. Returns the
+    /// value to emit.
+    pub fn expire(&mut self, now_ms: u64) -> f32 {
+        self.level = 0.0;
+        self.last_emit_ms = Some(now_ms);
+        self.level
+    }
 }
+
+/// How long without a completed window before the held level is stale.
+/// Windows complete every ~100–200 ms while the monitor runs; 600 ms
+/// covers two missed emits plus clock slack.
+const STALE_MS: u64 = 600;
 
 #[cfg(test)]
 mod tests {
@@ -231,6 +265,41 @@ mod tests {
     fn silent_start_emits_zero_not_noise() {
         let mut m = LevelMeter::new();
         assert_eq!(m.update(&silence(3200), 0), Some(0.0));
+    }
+
+    #[test]
+    fn dc_offset_measures_as_silence() {
+        // A cheap capture path stuck at half-scale DC must not light the
+        // bar: AC-coupled RMS floors it out. (hex's input_level measures
+        // "around the chunk's mean so a DC offset never reads as a
+        // level".)
+        let mut m = LevelMeter::new();
+        let dc: Vec<i16> = vec![16_384; 3200];
+        assert_eq!(m.update(&dc, 0), Some(0.0));
+        // AC riding on the same offset still measures.
+        let mixed: Vec<i16> = (0..3200)
+            .map(|i| 16_384 + (2400.0 * (i as f32 * 0.25).sin()) as i16)
+            .collect();
+        let mut m2 = LevelMeter::new();
+        let l = m2.update(&mixed, 0).unwrap();
+        assert!(l > 0.2, "AC content above the offset reads: {l}");
+    }
+
+    #[test]
+    fn stale_stream_expires_to_zero_once() {
+        let mut m = LevelMeter::new();
+        m.update(&loud(1600), 0);
+        // Fresh: not stale.
+        assert!(!m.stale(200));
+        // Quiet for 700 ms with a held level → stale, expire publishes 0.
+        assert!(m.stale(900));
+        assert_eq!(m.expire(900), 0.0);
+        // Re-armed: not stale again until another silent gap.
+        assert!(!m.stale(1_000));
+        // A silent-but-alive meter (level already 0) never reads stale.
+        let mut q = LevelMeter::new();
+        q.update(&silence(3200), 0);
+        assert!(!q.stale(5_000));
     }
 
     #[test]

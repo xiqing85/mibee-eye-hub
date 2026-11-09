@@ -4,6 +4,36 @@
 
 ### Added
 
+- **ASR replacement table (2026-11-09).** `[[voice.replacements]]`
+  (from/to) corrects transcripts before any consumer — records,
+  decisions, wake-word matching, the agent — sees them. Longest
+  match first; all-ASCII rules only fire on word boundaries. Zero
+  LLM cost for the mishearings the acoustic model keeps making
+  (姚蜜蜂→小蜜蜂).
+- **Model integrity gate at activation (2026-11-09).**
+  `POST /api/models/{cap}/{id}/activate` now full-hashes every file
+  with a pinned sha256 before switching: a hand-placed or bit-rotted
+  file of the right SIZE fails with the offending file named,
+  instead of failing inside an engine load (boots stay size-only —
+  multi-GB hashes belong at the explicit operator action).
+- **Fixed-corpus voice benchmark (2026-11-09).** `--bench-voice
+  <manifest.json>` scores pinned WAV rounds: per-round KWS/ASR wall
+  time, wake-hit check, and character error rate against expected
+  text, plus means — honest before/after A/B over a fixed corpus
+  (hex benchmark-transcription shape).
+- **Waveform meter hardening (2026-11-09).** The audio_level meter
+  is now AC-coupled (a DC-offset capture reads as silence, not
+  voice) and expires to zero when the monitor stream goes quiet —
+  a frozen mid-level bar meant the tap died, not ongoing speech.
+
+### Changed
+
+- **Inter-form IPC contract published (2026-11-09).**
+  `docs/ipc-contract.md` pins the voice-session seam for the M2 form
+  split (discovery/auth/session lifecycle/#55 priority/limits) BEFORE
+  the split — designed once, hex streams.md style; clearly marked
+  not-yet-implemented.
+
 - **Voice round audit trail (2026-11-09).** Every voice round (wake
   capture and follow-up windows) now carries a capture-window level
   audit — peak/RMS dBFS plus the fraction of 20 ms frames at

@@ -262,6 +262,23 @@ pub async fn activate_model(
     if !models::is_installed(&mgr.root, model) {
         return Err(ApiError::conflict("model not installed"));
     }
+    // Integrity gate at the activation boundary (hex intake hardening):
+    // `is_installed` is size-only so boots stay cheap; activation is the
+    // explicit operator action where a multi-GB hash is worth paying —
+    // a hand-placed or bit-rotted file fails HERE with the offending
+    // file named, instead of inside an engine load.
+    {
+        let root = mgr.root.clone();
+        let verify = tokio::task::spawn_blocking(move || models::verify_installed(&root, model))
+            .await
+            .map_err(|e| ApiError::internal(format!("verify join: {e}")))?;
+        if let Err(mismatch) = verify {
+            tracing::warn!(capability = %capability, model = %model_id, mismatch = %mismatch, "models: activation blocked by integrity check");
+            return Err(ApiError::conflict(format!(
+                "integrity check failed: {mismatch}"
+            )));
+        }
+    }
     if cap.apply == "immediate" {
         // The detection capability: §4.6 hot switch via the registry.
         return hot_switch(ai, event_tx, &model_id).await;
@@ -444,6 +461,59 @@ mod tests {
         .unwrap();
     }
 
+    /// A minimal catalog mirroring the yunet entry with NO sha pin —
+    /// synthetic fixtures are dummy bytes, so tests that expect a
+    /// successful activation use this (the integrity gate then runs
+    /// size-only). The pinned mismatch path is covered by
+    /// `activate_blocks_on_integrity_mismatch` against the REAL catalog.
+    fn local_catalog() -> &'static [streaming::models::CapabilitySpec] {
+        &[streaming::models::CapabilitySpec {
+            id: "face.detect",
+            label: "face detection",
+            apply: "restart",
+            models: &[streaming::models::CatalogModel {
+                id: "yunet-2023mar",
+                name: "YuNet 2023-03",
+                dir: "face",
+                languages: &["zh", "en"],
+                license: "Apache-2.0",
+                notes: "synthetic test entry",
+                files: &[streaming::models::CatalogFile {
+                    role: "weights",
+                    path: "face_detection_yunet_2023mar.onnx",
+                    remote: "face_detection_yunet_2023mar.onnx",
+                    size: 232_589,
+                    sha256: None,
+                    repo: None,
+                }],
+            }],
+        }]
+    }
+
+    /// Scoped TEST_CATALOG override guard (the override is
+    /// process-global; tests that swap the catalog hold the guard).
+    static CATALOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CatalogOverride;
+
+    impl CatalogOverride {
+        fn set() -> Self {
+            let _guard = CATALOG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            *streaming::models::TEST_CATALOG
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(local_catalog());
+            CatalogOverride
+        }
+    }
+
+    impl Drop for CatalogOverride {
+        fn drop(&mut self) {
+            *streaming::models::TEST_CATALOG
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
     #[tokio::test]
     async fn catalog_lists_installed_state_and_tasks() {
         let dir = fake_root(&format!("{}-{}", std::module_path!(), line!()));
@@ -510,6 +580,10 @@ mod tests {
         let dir = fake_root(&format!("{}-{}", std::module_path!(), line!()));
         install_yunet(&dir);
         let (app, pool, _mgr) = app_with(&dir).await;
+        // The pin-less local catalog: synthetic bytes must activate.
+        // Plain await under the override — never block_on: the inner
+        // future needs the tokio reactor the test runtime provides.
+        let _cat = CatalogOverride::set();
         let res = app
             .clone()
             .oneshot(
@@ -541,6 +615,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+        // Back to the REAL catalog for the negative paths.
+        drop(_cat);
         // Not installed → 409.
         let res = app
             .oneshot(
@@ -551,6 +627,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::CONFLICT);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The integrity gate (#4.9 amendment): against the REAL catalog
+    /// (yunet's file carries a sha pin), synthetic bytes of the right
+    /// size must NOT activate — 409 with the mismatching file named.
+    #[tokio::test]
+    async fn activate_blocks_on_integrity_mismatch() {
+        // RAII hold of the REAL catalog (override cleared) across the
+        // awaits — a plain guard would trip await_holding_lock.
+        struct RealCatalog;
+        impl RealCatalog {
+            fn hold() -> Self {
+                let _guard = CATALOG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                *streaming::models::TEST_CATALOG
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+                RealCatalog
+            }
+        }
+        impl Drop for RealCatalog {
+            fn drop(&mut self) {
+                *streaming::models::TEST_CATALOG
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+            }
+        }
+        let _real = RealCatalog::hold();
+        let dir = fake_root(&format!("{}-{}", std::module_path!(), line!()));
+        install_yunet(&dir);
+        let (app, _pool, _mgr) = app_with(&dir).await;
+        let res = app
+            .oneshot(
+                Request::post("/api/models/face.detect/yunet-2023mar/activate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 65536).await.unwrap())
+                .unwrap();
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("integrity"),
+            "body: {body}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

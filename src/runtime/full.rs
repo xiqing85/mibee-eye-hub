@@ -57,6 +57,13 @@ pub struct Args {
     #[arg(long)]
     selftest_voice: Option<PathBuf>,
 
+    /// Fixed-corpus voice benchmark: a JSON manifest
+    /// `{"rounds":[{"wav":"…","expect":"…","label":"…","expect_keyword":"…"}]}`
+    /// — per-round KWS/ASR wall time + character error rate, plus means
+    /// (P1-4; before/after A/B over a pinned corpus).
+    #[arg(long)]
+    bench_voice: Option<PathBuf>,
+
     /// Run one greedy LLM completion and print the JSON result.
     #[arg(long)]
     selftest_llm: Option<String>,
@@ -125,6 +132,11 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     if let Some(path) = &args.selftest_voice {
         return selftest_cli("voice", || {
             streaming::voice::selftest_voice(&path.to_string_lossy())
+        });
+    }
+    if let Some(path) = &args.bench_voice {
+        return selftest_cli("bench-voice", || {
+            streaming::voice::bench_voice(&path.to_string_lossy())
         });
     }
     if let Some(prompt) = &args.selftest_llm {
@@ -995,13 +1007,41 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
                     tagger.spawn_observer(&voice_engine);
                     tokio::spawn(async move {
                         let mut meter = streaming::audio_level::LevelMeter::new();
+                        // Staleness tick (SPEC #54 kin): if the monitor
+                        // stream goes quiet mid-level, publish a zero
+                        // instead of freezing the waveform — a frozen bar
+                        // means the tap died, not ongoing speech.
+                        let mut stale_tick =
+                            tokio::time::interval(std::time::Duration::from_millis(300));
+                        stale_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
-                            let chunk = match level_rx.recv().await {
-                                Ok(c) => c,
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let chunk = tokio::select! {
+                                c = level_rx.recv() => match c {
+                                    Ok(c) => c,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                },
+                                _ = stale_tick.tick() => {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    if meter.stale(now) {
+                                        let level = meter.expire(now);
+                                        let (capture_mode, source) = tagger.tag(now);
+                                        let _ = events.send(
+                                            web::routes::events::CameraEvent::AudioLevel {
+                                                level,
+                                                timestamp_ms: now,
+                                                capture_mode,
+                                                source,
+                                            },
+                                        );
+                                    }
                                     continue;
                                 }
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             };
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1151,6 +1191,7 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
         pool: pool.clone(),
         interrupt_enabled: config.voice.interrupt_enable,
         interrupt_confidence: config.voice.interrupt_confidence,
+        replacements: config.voice.replacements.clone(),
         routing: Arc::clone(&models_routing),
     }
     .spawn();

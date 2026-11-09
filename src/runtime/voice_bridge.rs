@@ -51,6 +51,11 @@ pub struct VoiceBridge {
     pub pool: sqlx::SqlitePool,
     pub interrupt_enabled: bool,
     pub interrupt_confidence: f32,
+    /// ASR text corrections (`[[voice.replacements]]`, SPEC appendix A
+    /// #56) — applied to every transcript at the bridge's entry, before
+    /// any consumer (records, decisions, wake-word matching, the agent)
+    /// sees it.
+    pub replacements: Vec<streaming::voice::VoiceReplacement>,
     /// Per-capability model routing (design §6, M5) — shared with the
     /// HTTP chat route and hot-swapped by `PUT /api/models/routing`.
     /// The voice legs consult the `chat` capability: `local` pins the
@@ -84,6 +89,7 @@ impl VoiceBridge {
             pool: records_pool,
             interrupt_enabled,
             interrupt_confidence,
+            replacements: replacements_for_voice,
             routing,
         } = self;
         let tts_for_away_cmd = Arc::clone(&tts_engine);
@@ -120,7 +126,18 @@ impl VoiceBridge {
         tokio::spawn(async move {
             loop {
                 match voice_events.recv().await {
-                    Ok(ev) => {
+                    Ok(mut ev) => {
+                        // ASR corrections first (SPEC appendix A #56): the
+                        // acoustic model keeps mishearing the wake word
+                        // (姚/杨蜜蜂); every downstream consumer — records,
+                        // decisions, wake-word matching, the agent — sees
+                        // the corrected transcript only.
+                        if !replacements_for_voice.is_empty() {
+                            ev.transcript = streaming::voice::apply_replacements(
+                                &ev.transcript,
+                                &replacements_for_voice,
+                            );
+                        }
                         // Persistent hearing record (SPEC appendix A #24)
                         // with the correlated scene (#30-C).
                         let camera = web::db::list_cameras(&records_pool)
@@ -1614,6 +1631,7 @@ mod tests {
             pool: pool.clone(),
             interrupt_enabled: true,
             interrupt_confidence: 0.6,
+            replacements: Vec::new(),
         }
         .spawn();
         let bus_rx = bus_tx.subscribe();
