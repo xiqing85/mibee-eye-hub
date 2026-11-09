@@ -449,6 +449,10 @@ impl MeetingEngine {
         }
         #[cfg(feature = "voice")]
         {
+            // Voice-round yielding (SPEC appendix A #55): meeting batch
+            // transcription is pure background work; a live utterance
+            // outranks it. Bounded wait, fail-open past the bound.
+            crate::wait_voice_idle(std::time::Duration::from_secs(3));
             // One span for the whole batch pipeline (diarize → ASR →
             // punctuate → name-vote; SPEC appendix A #39: model id
             // `meeting` — a long-running composite job, not per-frame).

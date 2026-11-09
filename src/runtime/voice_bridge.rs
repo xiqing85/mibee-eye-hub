@@ -157,12 +157,13 @@ impl VoiceBridge {
                             tracing::warn!(error = %e, "hearing record: insert failed");
                         }
                         let _ = bridge_tx.send(web::routes::events::CameraEvent::VoiceTranscript {
-                            keyword: ev.keyword,
+                            keyword: ev.keyword.clone(),
                             transcript: ev.transcript.clone(),
                             speaker: ev.speaker.clone(),
                             scene: scene.clone(),
                             follow_up: ev.follow_up,
                             timestamp_ms: ev.timestamp_ms,
+                            audit: ev.audit,
                         });
                         // Conversation trace (SPEC §3.3): join the 120 s
                         // slot's trace or start a fresh one; a stale slot
@@ -202,6 +203,38 @@ impl VoiceBridge {
                             conv.id(),
                         )
                         .user_text(ev.transcript.clone());
+                        // Capture-window audit (SPEC appendix A #54, first
+                        // thinking entry of every round): what the
+                        // microphone actually delivered — peak/RMS/speech
+                        // ratio before any model ran. This is the
+                        // "called it and nothing happened" forensics: an
+                        // empty transcript with speech-level energy is an
+                        // ASR miss; near-silence means nothing was said;
+                        // both now land in the record instead of a bare
+                        // no-reply turn.
+                        if let Some(a) = ev.audit {
+                            let origin = if ev.follow_up {
+                                "跟问段"
+                            } else if ev.keyword.is_empty() {
+                                "免唤醒段"
+                            } else {
+                                "唤醒后捕获"
+                            };
+                            let verbatim = if ev.transcript.trim().is_empty() {
+                                " · 空转写（ASR 未听到内容）"
+                            } else {
+                                ""
+                            };
+                            draft = draft.think(
+                                "voice.audit",
+                                "meter",
+                                format!(
+                                    "{origin} · 峰 {:+.1}dB · RMS {:+.1}dB · 语音占比 {:.0}%{verbatim}",
+                                    a.peak_dbfs, a.rms_dbfs, a.speech_ratio * 100.0
+                                ),
+                                0,
+                            );
+                        }
                         // Interruption gate (SPEC appendix A #45): a
                         // transcript while a round is running is an
                         // interruption candidate, not a second racing
@@ -1599,6 +1632,7 @@ mod tests {
             timestamp_ms: 1_700_000_000_000,
             speaker: "米基".to_string(),
             follow_up: false,
+            audit: None,
         }
     }
 

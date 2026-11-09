@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Voice round audit trail (2026-11-09).** Every voice round (wake
+  capture and follow-up windows) now carries a capture-window level
+  audit — peak/RMS dBFS plus the fraction of 20 ms frames at
+  speech level — attached to the `voice_transcript` SSE event and
+  recorded as the first thinking entry (`voice.audit`) of every
+  §3.4 turn. An empty transcript with speech-level energy now
+  reads as an ASR miss in the record instead of a bare no-reply
+  row; near-silence means nothing was said; near-full-scale flags
+  clipping. (sherpa-onnx 1.13.8 exposes no KWS confidence, so wake
+  quality has no numeric score yet — noted in SPEC appendix A #54.)
+
 - **Audio fixture for tests and benchmarks (2026-11-09).**
   `MIBEE_EYE_AUDIO_FIXTURE=<wav>` replaces the microphone entirely: the
   always-on audio monitor plays the WAV through the real

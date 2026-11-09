@@ -6,9 +6,27 @@
 # there before running `cargo audit`. A repo-local copy alone does nothing,
 # which is how the 2026-10-15 "audit clean" claim stayed stale for so long.
 
+# RUSTSEC-2026-0459 — libsqlite3-sys bundled SQLite CVE-2026-119375 (page-size
+# mismatch WAL makes queries return uninitialized page-cache memory; fixed in
+# SQLite 3.54.0). Accepted for this product (2026-11-09):
+#   - Attack surface is LOCAL-FILE-WRITE only: the advisory requires an
+#     attacker who can WRITE the victim's database/WAL pair to craft the
+#     page-size mismatch. This product's databases live in the operator's
+#     own data directory; anyone who can write them already outranks the
+#     information the flaw leaks (stale in-process memory bytes).
+#   - The fix line (libsqlite3-sys >= 0.39.0) rides rusqlite 0.41 — a
+#     major upgrade of a pinned workspace dependency (security crate
+#     wraps its Connection API); tracked as its own task, not smuggled
+#     into a feature batch.
+#   - No SQL from untrusted parties is executed (the product issues only
+#     its own prepared statements).
+# Re-evaluate: upgrade rusqlite to 0.41+, then remove this entry.
+# Enforced by CI: tools/check-audit-waiver.sh (Waiver 6) fails when
+# libsqlite3-sys reaches 0.39.0+ (dead config) or the premise shifts.
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0459",
     # zip (build-only, see rationale below — one comment, four advisories)
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",
