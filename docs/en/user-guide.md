@@ -270,7 +270,9 @@ input and **every listening feature is opt-in**.
 ### Meeting mode (local meeting minutes)
 
 Capability `meeting` (needs the `[voice]` ASR models + the pyannote
-segmentation model, default `models/voice/diarization/pyannote.onnx`).
+segmentation model, default `models/voice/diarization/pyannote.onnx`;
+available on the `mibee-eye` / `mibee-mic` / `mibee-meet` forms — the
+dedicated dictation program is `mibee-meet`).
 The **Meeting minutes** card in the Records view:
 
 1. Press **Start meeting** — the device records the microphone into a

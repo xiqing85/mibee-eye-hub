@@ -805,7 +805,12 @@ num_threads = 1
 录任何音频的承诺不变——只有显式会话窗口内落盘；`keep_audio=false`（缺省）
 时处理完成（含失败）即删音频，只留文字；到 `max_duration_secs` 自动停止
 并走同一管线。依赖 `[voice]` 的 ASR 模型与说话人嵌入模型在场（会议复用
-同一套文件）；处理需要 `voice` feature 构建。模型资产见 `models/README.md`。
+同一套文件）；处理需要 `voice` feature 构建。**形态可用性**：meeting 属
+*transcribe* 家族——`mibee-eye` / `mibee-mic` / `mibee-meet` 三形态携带，
+`mibee-cam` / `mibee-talk` 裁掉；专用听写部署用 `mibee-meet` 跑
+`[voice] enabled = false`（只借用模型路径，不开唤醒词引擎）。命名档位
+预设把 meeting 钉在 `full` 档——basic/standard 档主机需钉
+`[resources] tier = "full"`。模型资产见 `models/README.md`。
 
 ```toml
 [meeting]

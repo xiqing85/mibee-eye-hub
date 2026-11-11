@@ -243,7 +243,9 @@ fail-open 放行（日志 WARN 一次）。验证阈值 `speaker_threshold` 缺�
 ### 会议模式（本地会议纪要）
 
 能力位 `meeting`（需 `[voice]` ASR 模型 + pyannote 分割模型，缺省
-`models/voice/diarization/pyannote.onnx`）。记录页的**会议纪要**卡片：
+`models/voice/diarization/pyannote.onnx`；`mibee-eye` / `mibee-mic` /
+`mibee-meet` 三形态可用——专用听写程序即 `mibee-meet`）。
+记录页的**会议纪要**卡片：
 
 1. 点**开始会议**——设备开始把麦克风录成会话 WAV（界面上出现醒目的
    录音指示；**此外的任何时刻都不录音频**）。
