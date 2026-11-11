@@ -34,8 +34,15 @@ cargo build --release
 
 The release binaries will be available at `target/release/`:
 `mibee-eye` (full form), `mibee-cam` (visual AI + streaming),
-`mibee-mic` (audio pickup), `mibee-talk` (intercom). Pick the form that
+`mibee-mic` (audio pickup), `mibee-talk` (intercom), `mibee-meet`
+(dictation: meeting minutes). Pick the form that
 matches the host's role; every form serves the same Web UI and API.
+
+`mibee-meet` needs the `voice` feature (`cargo build --release --features voice`)
+and runs with `[meeting] enabled = true`; the wake-word engine (`[voice] enabled`)
+stays off — the ASR model paths are all it borrows. On hosts whose hardware
+tier resolves below `full` (most spare laptops), also pin `[resources] tier = "full"`:
+the shared tier preset scopes meeting to the full tier.
 
 Default ports:
 - Web UI: 8443 (HTTPS with self-signed TLS)

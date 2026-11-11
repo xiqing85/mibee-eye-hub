@@ -33,8 +33,14 @@ cargo build --release
 ```
 
 发布版二进制文件将位于 `target/release/`：`mibee-eye`（全功能）、
-`mibee-cam`（视觉 AI + 推流）、`mibee-mic`（拾音）、`mibee-talk`（对讲）。
+`mibee-cam`（视觉 AI + 推流）、`mibee-mic`（拾音）、`mibee-talk`（对讲）、
+`mibee-meet`（听写：会议纪要）。
 按主机角色选择形态；所有形态共享同一 Web 界面与 API。
+
+`mibee-meet` 需要 `voice` feature（`cargo build --release --features voice`），
+并以 `[meeting] enabled = true` 运行；唤醒词引擎（`[voice] enabled`）保持关闭——
+它只借用其中的 ASR 模型路径。硬件档位低于 `full` 的主机（多数闲置笔记本）
+需再钉 `[resources] tier = "full"`：共享的档位预设把 meeting 归在 full 档。
 
 默认端口：
 - Web UI：8443（HTTPS 使用自签名 TLS）

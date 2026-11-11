@@ -81,7 +81,7 @@ pub struct Args {
 }
 
 /// The full-form assembly. `form` names the calling bin ("eye" / "cam" /
-/// "mic" / "talk") for the startup banner.
+/// "mic" / "talk" / "meet") for the startup banner.
 pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
     // Process-level setup (OpenMP cap + rustls provider) lives in the
     // runtime tree now (design-capability-split M1 slice 1).
@@ -401,9 +401,22 @@ pub async fn run_full(form: &'static str, args: Args) -> anyhow::Result<()> {
                 model_paths: vec![
                     config.meeting.segmentation_model.clone(),
                     config.meeting.punctuation_model.clone(),
+                    // Meeting runs its own ASR pass over the session
+                    // WAV, loading the paraformer weights itself. When
+                    // the voice engine is off (pickup/dictation
+                    // deployments leave `[voice]` off), those bytes ride
+                    // this feature's bill; when voice is admitted
+                    // earlier in priority order, file_cost_mib_shared
+                    // already billed the file and it costs nothing here.
+                    config.voice.paraformer_model.clone(),
                 ],
                 overhead_mib: 30,
-                depends_on: Some("voice"),
+                // No depends_on: meeting rides the voice *models*
+                // (billed above), not the voice engine — dictation
+                // deployments run with `[voice]` off, and the old
+                // dependency cut reported an informational "dependency"
+                // there even though meeting runs fine standalone.
+                depends_on: None,
             },
             FeatureInput {
                 name: "vlm",

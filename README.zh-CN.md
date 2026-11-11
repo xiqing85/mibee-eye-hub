@@ -17,7 +17,7 @@
 
 ## 功能特性
 
-- **一份代码、四种形态（roadmap M2）** — `mibee-eye`（全功能）、`mibee-cam`（视觉 AI + 推流）、`mibee-mic`（拾音）、`mibee-talk`（对讲：麦克上行 + 扬声器播放）。形态门控在引擎构建前强制关闭形态外的配置族——同一二进制家族适配 PC、闲置笔记本与无头机器，无需裁配置
+- **一份代码、五种形态（roadmap M2）** — `mibee-eye`（全功能）、`mibee-cam`（视觉 AI + 推流）、`mibee-mic`（拾音）、`mibee-talk`（对讲：麦克上行 + 扬声器播放）、`mibee-meet`（听写：按需会议录音 → 说话人分离 → 转写纪要）。形态门控在引擎构建前强制关闭形态外的配置族——同一二进制家族适配 PC、闲置笔记本与无头机器，无需裁配置
 - **本地采集** — 摄像头通过 V4L2（Linux）/ MSMF（Windows），麦克风通过 ALSA / WASAPI
 - **对外协议** — RTSP 服务端（客户端拉流）、RTMP 推流、ONVIF 设备端点、GB/T 28181 设备注册（全部默认关闭，通过 Web 界面启用）
 - **GB/T 28181-2022 设备面** — 告警事件（SSE `alarm` + Alarm NOTIFY，AI 上升沿 + 冷却）、DeviceControl（IFrameCmd 强制关键帧、RecordCmd 录像门）、优雅注销（REGISTER Expires: 0）、静态 MobilePosition 上报、DeviceConfig FrameMirror 运行时镜像、SIP-Date 校时观察——全部随共享库 gb28181-rs 提供

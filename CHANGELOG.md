@@ -19,6 +19,23 @@
 
 ### Added
 
+- **Fifth form factor `mibee-meet` — dictation as a dedicated program
+  (2026-11-11).** New thin bin for meeting minutes: microphone in,
+  explicit start → stop sessions through the same Web UI, no camera,
+  speaker or conversation stack (build with `--features voice`; the
+  wake-word engine stays off — only the `[voice]` ASR model paths are
+  borrowed). The form gate regroups `meeting` out of the dialogue
+  family into a new `transcribe` family: `mibee-mic` gains meeting
+  minutes (the speech-to-text extension design §2 always intended to
+  ride the audio family), cam/talk still shed it. Meeting's boot
+  billing now includes the paraformer ASR weights it loads itself
+  (previously under-billed whenever `[voice]` was off), and its
+  resource-gate `depends_on: voice` was dropped — the cut was
+  informational only and read misleadingly on dictation deployments
+  where the voice engine is off. Note: the shared tier preset still
+  scopes meeting to `full`; pin `[resources] tier = "full"` on
+  basic/standard-tier hosts (see getting-started).
+
 - **MCP configuration trust gate (2026-11-10).** `[[agent.mcp_servers]]`
   entries are fingerprinted (sha256 over command+args+env) and an
   unconfirmed — new or edited — launch line is REFUSED at refresh with
