@@ -15,7 +15,7 @@ Part of the **MiBee Eye** camera family: [mibee-eye-rs](https://github.com/xiqin
 
 ## Features
 
-- **Four form factors, one codebase (roadmap M2)** — `mibee-eye` (full), `mibee-cam` (visual AI + streaming), `mibee-mic` (audio pickup), `mibee-talk` (intercom: mic upstream + speaker playback). A form-profile gate force-disables config families outside the form before any engine builds — the same binary family fits PCs, spare laptops and headless boxes without config surgery
+- **Five form factors, one codebase (roadmap M2)** — `mibee-eye` (full), `mibee-cam` (visual AI + streaming), `mibee-mic` (audio pickup), `mibee-talk` (intercom: mic upstream + speaker playback), `mibee-meet` (dictation: on-demand meeting recording → diarization → transcription minutes). A form-profile gate force-disables config families outside the form before any engine builds — the same binary family fits PCs, spare laptops and headless boxes without config surgery
 - **Local capture** — webcam via V4L2 (Linux) / MSMF (Windows), microphone via ALSA / WASAPI
 - **Outbound protocols** — RTSP server (clients pull), RTMP push, ONVIF device endpoint, GB/T 28181 device registration (all default-OFF, enabled via Web UI)
 - **GB/T 28181-2022 device surface** — alarm events (SSE `alarm` + Alarm NOTIFY, AI rising-edge with cooldown), DeviceControl (IFrameCmd force-keyframe, RecordCmd recording gate), graceful deregistration (REGISTER Expires: 0), static MobilePosition reporting, DeviceConfig FrameMirror runtime mirroring, SIP-Date drift observation, Catalog/DeviceInfo/keepalive per the shared gb28181-rs library

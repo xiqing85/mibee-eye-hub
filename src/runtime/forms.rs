@@ -22,8 +22,13 @@ pub struct FormProfile {
     pub audio: bool,
     /// Spoken interaction: TTS playback and the voice bridge.
     pub voice_out: bool,
+    /// Dictation: on-demand meeting recording → speaker diarization →
+    /// per-segment ASR minutes (SPEC appendix A #27). Rides the audio
+    /// family (it needs a microphone, not a conversation stack) — mic and
+    /// meet carry it, cam and talk do not.
+    pub transcribe: bool,
     /// Dialogue family: LLM, VLM, decision triage, agent tools,
-    /// conversations log, meeting diarization.
+    /// conversations log.
     pub dialogue: bool,
 }
 
@@ -33,6 +38,7 @@ impl FormProfile {
         vision_ai: true,
         audio: true,
         voice_out: true,
+        transcribe: true,
         dialogue: true,
     };
 
@@ -49,27 +55,44 @@ impl FormProfile {
         vision_ai: true,
         audio: true,
         voice_out: false,
+        transcribe: false,
         dialogue: false,
     };
 
     /// The audio-pickup form (design §2 basic form 2): microphone, sound
     /// events, ASR transcribe records, KWS/speaker. No camera (hence no
     /// visual AI), no speaker output, no dialogue — the extension form
-    /// (speech-to-text records) rides the audio family alone.
+    /// (speech-to-text records) rides the audio family, so meeting
+    /// minutes stay admitted here.
     pub const MIC: FormProfile = FormProfile {
         vision_ai: false,
         audio: true,
         voice_out: false,
+        transcribe: true,
         dialogue: false,
     };
 
     /// The intercom form (design §2 basic form 3): talkback both ways —
     /// microphone upstream plus speaker playback — and the PTZ proxy.
-    /// Audio in and out; no camera AI, no dialogue.
+    /// Audio in and out; no camera AI, no dictation, no dialogue.
     pub const TALK: FormProfile = FormProfile {
         vision_ai: false,
         audio: true,
         voice_out: true,
+        transcribe: false,
+        dialogue: false,
+    };
+
+    /// The dictation form (design §2 extension): the meeting-minutes
+    /// capability as a dedicated program. Microphone in (the 16 kHz
+    /// monitor; ASR model paths ride `[voice]`), explicit start → stop
+    /// sessions through the same web UI; no camera, no speaker, no
+    /// conversation stack. Build with `--features voice`.
+    pub const MEET: FormProfile = FormProfile {
+        vision_ai: false,
+        audio: true,
+        voice_out: false,
+        transcribe: true,
         dialogue: false,
     };
 
@@ -81,6 +104,7 @@ impl FormProfile {
             "cam" => Self::CAM,
             "mic" => Self::MIC,
             "talk" => Self::TALK,
+            "meet" => Self::MEET,
             _ => Self::EYE,
         }
     }
@@ -109,7 +133,6 @@ impl FormProfile {
                 ("llm", config.llm.enabled),
                 ("vlm", config.vlm.enabled),
                 ("decision", config.decision.enabled),
-                ("meeting", config.meeting.enabled),
                 ("conversations", config.conversations.enabled),
                 ("agent", config.agent.enabled),
             ] {
@@ -124,9 +147,19 @@ impl FormProfile {
             config.llm.enabled = false;
             config.vlm.enabled = false;
             config.decision.enabled = false;
-            config.meeting.enabled = false;
             config.conversations.enabled = false;
             config.agent.enabled = false;
+        }
+        // Meeting minutes ride the audio family, not dialogue: forms
+        // without the transcribe family (cam/talk) shed it with the same
+        // one-line log; mic and meet keep it.
+        if !self.transcribe && config.meeting.enabled {
+            tracing::info!(
+                form,
+                section = "meeting",
+                "form gate: disabled (not in this form)"
+            );
+            config.meeting.enabled = false;
         }
         if !self.vision_ai {
             for (name, on) in [
@@ -192,6 +225,7 @@ mod tests {
             config.llm.enabled,
             config.vlm.enabled,
             config.decision.enabled,
+            // Meeting is transcribe-family now: cam does not carry it.
             config.meeting.enabled,
             config.conversations.enabled,
             config.agent.enabled,
@@ -238,6 +272,7 @@ mod tests {
         assert_eq!(FormProfile::for_form("cam"), FormProfile::CAM);
         assert_eq!(FormProfile::for_form("mic"), FormProfile::MIC);
         assert_eq!(FormProfile::for_form("talk"), FormProfile::TALK);
+        assert_eq!(FormProfile::for_form("meet"), FormProfile::MEET);
     }
 
     #[test]
@@ -247,6 +282,12 @@ mod tests {
         // The pickup family: microphone pipeline + sound events.
         assert!(config.audio_ai.enabled);
         assert!(config.voice.enabled, "ASR/KWS ride the voice engine");
+        // The speech-to-text extension rides the audio family (design
+        // §2): the pickup form also takes meeting minutes.
+        assert!(
+            config.meeting.enabled,
+            "dictation is an audio capability, not dialogue"
+        );
         // No speaker, no camera AI, no dialogue.
         for off in [
             config.tts.enabled,
@@ -256,7 +297,34 @@ mod tests {
             config.llm.enabled,
             config.vlm.enabled,
             config.decision.enabled,
-            config.meeting.enabled,
+            config.conversations.enabled,
+            config.agent.enabled,
+        ] {
+            assert!(!off);
+        }
+    }
+
+    #[test]
+    fn meet_keeps_transcribe_only() {
+        // The dictation form (design §2 extension): microphone + meeting
+        // minutes, nothing else — the dedicated shape of the capability
+        // mic carries as its extension layer.
+        let mut config = everything_on();
+        FormProfile::MEET.apply("meet", &mut config);
+        assert!(
+            config.audio_ai.enabled,
+            "the monitor device rides [audio_ai]"
+        );
+        assert!(config.voice.enabled, "ASR model paths ride [voice]");
+        assert!(config.meeting.enabled, "transcribe is the form's purpose");
+        for off in [
+            config.tts.enabled,
+            config.ai.enabled,
+            config.face.enabled,
+            config.ocr.enabled,
+            config.llm.enabled,
+            config.vlm.enabled,
+            config.decision.enabled,
             config.conversations.enabled,
             config.agent.enabled,
         ] {
@@ -272,7 +340,7 @@ mod tests {
         assert!(config.audio_ai.enabled);
         assert!(config.voice.enabled);
         assert!(config.tts.enabled, "the output-device family stays on");
-        // No camera AI, no dialogue.
+        // No camera AI, no dictation, no dialogue.
         for off in [
             config.ai.enabled,
             config.face.enabled,
@@ -289,8 +357,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_is_idempotent_for_mic_and_talk() {
-        for (tag, profile) in [("mic", FormProfile::MIC), ("talk", FormProfile::TALK)] {
+    fn apply_is_idempotent_for_mic_talk_and_meet() {
+        for (tag, profile) in [
+            ("mic", FormProfile::MIC),
+            ("talk", FormProfile::TALK),
+            ("meet", FormProfile::MEET),
+        ] {
             let mut config = everything_on();
             profile.apply(tag, &mut config);
             let once = config.clone();
