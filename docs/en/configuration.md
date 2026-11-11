@@ -865,8 +865,14 @@ unchanged — samples only land on disk inside an explicit session;
 too), keeping only the text; the session auto-stops at
 `max_duration_secs` and feeds the same pipeline. Depends on the
 `[voice]` ASR and speaker-embedding model files (meetings reuse them);
-processing needs a `voice`-feature build. Model assets: see
-`models/README.md`.
+processing needs a `voice`-feature build. **Form availability**: meeting
+rides the *transcribe* family — the `mibee-eye` / `mibee-mic` /
+`mibee-meet` forms carry it, `mibee-cam` / `mibee-talk` shed it. A
+dedicated dictation deployment runs `mibee-meet` with
+`[voice] enabled = false` (only the model paths are borrowed, not the
+wake-word engine). The named-tier preset scopes meeting to `full` —
+pin `[resources] tier = "full"` on basic/standard-tier hosts. Model
+assets: see `models/README.md`.
 
 ```toml
 [meeting]
