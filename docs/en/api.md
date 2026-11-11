@@ -175,11 +175,18 @@ transparency surface; capability key `tools` (`{enabled, count}`).
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/tools` | Tool list → `{"tools":[{name, description, input_schema, source}]}`; `source` = `"builtin"` or `"mcp:<server>"` |
+| POST | `/api/tools/mcp/{name}/trust` | Confirm an MCP server's CURRENT launch line (trust gate, from 2026-11-10) → `{"trusted", "fingerprint", "command", "tools_total"}`; unknown server 404. |
 
 Built-ins: `time.now`, `weather.current` (requires `[tools] weather_city`),
 `camera.snapshot` (fresh frame + viewing endpoint). Live executions ride
 the SSE `agent_step` event and land in the conversation record's
 `thinking` entries as `source:"tool"`.
+
+**MCP trust gate**: `[[agent.mcp_servers]]` entries are fingerprinted by
+launch line (command+args+env) — a new or EDITED entry is refused at
+startup (the log names the confirm method) until this endpoint confirms
+the current fingerprint; confirmations are never grandfathered across
+launch-line edits. Persisted in the settings bag `agent.mcp_trust`.
 
 ### Away mode (SPEC §3.6)
 
