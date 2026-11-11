@@ -468,6 +468,12 @@ impl VoiceEngine {
             Ok(internals) => {
                 info!(
                     keyword_file = %config.keywords_file,
+                    keywords_bytes = std::fs::read(&config.keywords_file)
+                        .map(|b| b.len())
+                        .unwrap_or(0),
+                    keywords_threshold = config.keywords_threshold,
+                    keywords_score = config.keywords_score,
+                    num_threads = config.num_threads,
                     capture_secs = config.capture_secs,
                     speaker_model = %config.speaker_embedding_model,
                     speaker_features = internals.embed.is_some(),
@@ -1605,24 +1611,32 @@ pub fn bench_voice(manifest_path: &str) -> anyhow::Result<serde_json::Value> {
                 f64::from(wav.sample_rate) / f64::from(capture::audio_monitor::TARGET_RATE),
             );
             let samples = resampler.process(&wav.samples);
-            // KWS pass.
+            // KWS pass, TWO laps (2026-11-11 root cause): the streaming
+            // zipformer needs left-context — a cold-start stream fed a
+            // short clip once scores below threshold every time (the
+            // service hits because its stream is evergreen; the
+            // audio-fixture loop hits on lap 2+). Lap 1 warms the
+            // stream with the clip itself; hits count from lap 2.
             let kws_started = std::time::Instant::now();
             let stream = kws.create_stream();
             let mut wake: Option<String> = None;
-            let mut pos = 0_usize;
-            while pos < samples.len() {
-                let take = (samples.len() - pos).min(512);
-                let chunk = &samples[pos..pos + take];
-                pos += take;
-                stream.accept_waveform(16_000, chunk);
-                while kws.is_ready(&stream) {
-                    kws.decode(&stream);
-                }
-                if let Some(hit) = kws.get_result(&stream)
-                    && !hit.keyword.is_empty()
-                {
-                    wake = Some(hit.keyword);
-                    break;
+            'laps: for lap in 0..2 {
+                let mut pos = 0_usize;
+                while pos < samples.len() {
+                    let take = (samples.len() - pos).min(512);
+                    let chunk = &samples[pos..pos + take];
+                    pos += take;
+                    stream.accept_waveform(16_000, chunk);
+                    while kws.is_ready(&stream) {
+                        kws.decode(&stream);
+                    }
+                    if let Some(hit) = kws.get_result(&stream)
+                        && !hit.keyword.is_empty()
+                        && lap > 0
+                    {
+                        wake = Some(hit.keyword);
+                        break 'laps;
+                    }
                 }
             }
             let kws_ms = kws_started.elapsed().as_millis() as u64;
@@ -1727,6 +1741,27 @@ pub fn selftest_voice(path: &str) -> anyhow::Result<serde_json::Value> {
         let capture_samples = (u64::from(config.capture_secs)
             * u64::from(capture::audio_monitor::TARGET_RATE))
             as usize;
+        // Warm lap first (2026-11-11 root cause, same as bench_voice):
+        // the streaming KWS needs left-context; a short clip fed to a
+        // cold stream never scores. Feed the clip once silently, then
+        // the scoring lap — hits on lap 1 of the scoring pass behave
+        // like the evergreen service stream.
+        for chunk in samples.chunks(512) {
+            stream.accept_waveform(16_000, chunk);
+            while kws.is_ready(&stream) {
+                kws.decode(&stream);
+            }
+            // A wake word hit during the warm lap would linger in
+            // get_result and mis-attribute to the scoring lap: long
+            // clips self-warm anyway, so consume+reset and let the
+            // scoring lap re-detect it in place.
+            if kws
+                .get_result(&stream)
+                .is_some_and(|h| !h.keyword.is_empty())
+            {
+                kws.reset(&stream);
+            }
+        }
         while pos < samples.len() {
             let take = (samples.len() - pos).min(512);
             let chunk = &samples[pos..pos + take];
@@ -2079,6 +2114,169 @@ mod tests {
         // Empty `from` never fires (config typo guard).
         let r = rules(&[("", "x")]);
         assert_eq!(apply_replacements("abc", &r), "abc");
+    }
+
+    /// Diagnostic (2026-11-11): the live monitor path hits 小蜜蜂 on
+    /// wake16n.wav while selftest/bench (direct feed) do not — bisect
+    /// which feed property flips it: (A) bench-faithful direct feed,
+    /// (B) i16 quantization round-trip like the AudioChunk path,
+    /// (C) 320-sample chunks, (D) one-shot whole-clip accept. Env:
+    /// KWS_DIAG_WAV=/path/wav (run from a cwd whose models/voice/kws
+    /// is the deployment set).
+    #[test]
+    #[cfg(feature = "voice")]
+    #[ignore = "needs real models: run from a models-bearing cwd, KWS_DIAG_WAV"]
+    fn kws_diag_feed_shape_bisect() {
+        let Ok(wav_path) = std::env::var("KWS_DIAG_WAV") else {
+            return;
+        };
+        let bytes = std::fs::read(&wav_path).unwrap();
+        let wav = crate::audio_ai::wav::parse_wav(&bytes).unwrap();
+        let mut rs = capture::audio_monitor::LinearResampler::new(
+            f64::from(wav.sample_rate) / f64::from(capture::audio_monitor::TARGET_RATE),
+        );
+        let samples = rs.process(&wav.samples);
+        // Absolute model paths from KWS_DIAG_MODELS (the test process
+        // runs from the manifest root, not the operator's shell cwd).
+        let root = std::env::var("KWS_DIAG_MODELS").unwrap_or_else(|_| ".".into());
+        let mut cfg = VoiceConfig {
+            enabled: true,
+            ..VoiceConfig::default()
+        };
+        cfg.kws_encoder = format!("{root}/encoder.int8.onnx");
+        cfg.kws_decoder = format!("{root}/decoder.int8.onnx");
+        cfg.kws_joiner = format!("{root}/joiner.int8.onnx");
+        cfg.kws_tokens = format!("{root}/tokens.txt");
+        cfg.keywords_file = format!("{root}/keywords.txt");
+        let run = |label: &str, feed: &[f32], chunk: usize| {
+            let kws = build_kws(&cfg).unwrap();
+            let stream = kws.create_stream();
+            let mut hits = 0usize;
+            let mut pos = 0usize;
+            while pos < feed.len() {
+                let take = (feed.len() - pos).min(chunk);
+                stream.accept_waveform(16_000, &feed[pos..pos + take]);
+                pos += take;
+                while kws.is_ready(&stream) {
+                    kws.decode(&stream);
+                }
+                if let Some(hit) = kws.get_result(&stream)
+                    && !hit.keyword.is_empty()
+                {
+                    hits += 1;
+                    kws.reset(&stream);
+                }
+            }
+            println!("diag {label}: {hits} hits");
+        };
+        // A: bench-faithful (f32 direct, 512).
+        run("A-direct-512", &samples, 512);
+        // B: i16 round-trip like the monitor's AudioChunk path.
+        let quant: Vec<f32> = samples
+            .iter()
+            .map(|&s| ((s.clamp(-1.0, 1.0) * 32_767.0) as i16) as f32 / 32_768.0)
+            .collect();
+        run("B-i16roundtrip-512", &quant, 512);
+        // C: 320-sample chunks (32ms alternate framing).
+        run("C-direct-320", &samples, 320);
+        // D: whole clip in one accept.
+        run("D-direct-oneshot", &samples, samples.len().max(1));
+        // E: faithful monitor-fixture pipeline — per-32ms-window
+        // resampler.process (ratio 1.0), i16 quantize like AudioChunk,
+        // f32/32768 on the consumer side, 512-sample accepts.
+        {
+            let kws = build_kws(&cfg).unwrap();
+            let stream = kws.create_stream();
+            let mut rs = capture::audio_monitor::LinearResampler::new(1.0);
+            let mut hits = 0usize;
+            let mut pos = 0usize;
+            while pos < samples.len() {
+                let take = (samples.len() - pos).min(512);
+                let out = rs.process(&samples[pos..pos + take]);
+                pos += take;
+                let chunk: Vec<f32> = out
+                    .iter()
+                    .map(|&s| ((s.clamp(-1.0, 1.0) * 32_767.0) as i16) as f32 / 32_768.0)
+                    .collect();
+                if chunk.is_empty() {
+                    continue;
+                }
+                stream.accept_waveform(16_000, &chunk);
+                while kws.is_ready(&stream) {
+                    kws.decode(&stream);
+                }
+                if let Some(hit) = kws.get_result(&stream)
+                    && !hit.keyword.is_empty()
+                {
+                    hits += 1;
+                    kws.reset(&stream);
+                }
+            }
+            println!("diag E-monitor-faithful: {hits} hits");
+        }
+        // F: looped playback — the fixture loops the clip from its
+        // start; hits may only arrive from the SECOND lap on, when the
+        // stream has one full lap of context.
+        {
+            let kws = build_kws(&cfg).unwrap();
+            let stream = kws.create_stream();
+            let mut hits = 0usize;
+            let mut first_hit_lap = 0usize;
+            for lap in 0..6 {
+                let mut pos = 0usize;
+                while pos < samples.len() {
+                    let take = (samples.len() - pos).min(512);
+                    stream.accept_waveform(16_000, &samples[pos..pos + take]);
+                    pos += take;
+                    while kws.is_ready(&stream) {
+                        kws.decode(&stream);
+                    }
+                    if let Some(hit) = kws.get_result(&stream)
+                        && !hit.keyword.is_empty()
+                    {
+                        hits += 1;
+                        if first_hit_lap == 0 {
+                            first_hit_lap = lap + 1;
+                        }
+                        kws.reset(&stream);
+                    }
+                }
+            }
+            println!("diag F-looped-6laps: {hits} hits, first hit on lap {first_hit_lap}");
+        }
+        // G: the selftest shape after the 2026-11-11 fix — one silent
+        // warm lap (hit-reset included), then the scoring lap.
+        {
+            let kws = build_kws(&cfg).unwrap();
+            let stream = kws.create_stream();
+            let mut hits = 0usize;
+            for chunk in samples.chunks(512) {
+                stream.accept_waveform(16_000, chunk);
+                while kws.is_ready(&stream) {
+                    kws.decode(&stream);
+                }
+                if kws
+                    .get_result(&stream)
+                    .is_some_and(|h| !h.keyword.is_empty())
+                {
+                    kws.reset(&stream);
+                }
+            }
+            for chunk in samples.chunks(512) {
+                stream.accept_waveform(16_000, chunk);
+                while kws.is_ready(&stream) {
+                    kws.decode(&stream);
+                }
+                if let Some(hit) = kws.get_result(&stream)
+                    && !hit.keyword.is_empty()
+                {
+                    hits += 1;
+                    println!("diag G-selftest-shape hit: {}", hit.keyword);
+                    kws.reset(&stream);
+                }
+            }
+            println!("diag G-selftest-shape: {hits} hits");
+        }
     }
 
     #[test]
