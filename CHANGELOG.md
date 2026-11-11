@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Offline KWS never hit short clips — root cause found and fixed
+  (2026-11-11).** The streaming zipformer needs left-context: a
+  cold-start stream fed a short clip once scores below threshold
+  EVERY time, at any threshold (bisected across chunk size,
+  quantization, one-shot feed, monitor-faithful pipeline — all zero;
+  looped playback hits on lap 2). The service hits because its
+  stream is evergreen; the audio fixture hits because it loops.
+  `--bench-voice` and `--selftest-voice` now warm the stream with one
+  silent lap of the clip itself (hits consumed/reset) before the
+  scoring lap — verified against the real deployment models
+  (小蜜蜂 hit). The bisect lives on as an `#[ignore]` diagnostic
+  (`KWS_DIAG_WAV`/`KWS_DIAG_MODELS`) with variants A-G.
+
 ### Added
 
 - **MCP configuration trust gate (2026-11-10).** `[[agent.mcp_servers]]`
