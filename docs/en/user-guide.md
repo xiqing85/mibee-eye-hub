@@ -448,6 +448,8 @@ mibee-eye --selftest-llm "你好"          # chat: one LLM completion
 mibee-eye --selftest-tts "你好，世界"     # TTS: synthesize + play
 mibee-eye --selftest-vlm frame.jpg       # VLM: describe one JPEG
 mibee-eye --selftest-ocr page.jpg        # OCR: recognize text
+mibee-eye --bench-voice manifest.json    # fixed-corpus benchmark: KWS/ASR timing + character
+                                         #   error rate (JSON manifest {"rounds":[{"wav","expect","label"}]})
 ```
 
 A self-test passes only when the model loaded and produced sane output; it

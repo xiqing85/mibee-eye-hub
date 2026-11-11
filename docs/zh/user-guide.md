@@ -354,6 +354,8 @@ mibee-eye --selftest-llm "你好"          # 对话：一次 LLM 补全
 mibee-eye --selftest-tts "你好，世界"     # TTS：合成并播放
 mibee-eye --selftest-vlm frame.jpg       # VLM：描述一张 JPEG
 mibee-eye --selftest-ocr page.jpg        # OCR：识别文字
+mibee-eye --bench-voice manifest.json    # 固定语料基准：KWS/ASR 计时 + 字错率（JSON 清单
+                                         #   {"rounds":[{"wav","expect","label"}]}，前后对比 A/B）
 ```
 
 自检只有在模型加载成功且输出合理时才通过；文件或 feature 缺失时以引擎

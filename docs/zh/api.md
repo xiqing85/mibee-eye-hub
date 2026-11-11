@@ -156,10 +156,16 @@ Cookie 会话 + CSRF 双提交：
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/tools` | 工具清单 → `{"tools":[{name, description, input_schema, source}]}`；`source` = `"builtin"` 或 `"mcp:<服务器名>"` |
+| POST | `/api/tools/mcp/{name}/trust` | 确认一个 MCP 服务器的**当前**启动行（信任门，2026-11-10 起）→ `{"trusted", "fingerprint", "command", "tools_total"}`；未知服务器 404 |
 
 内置工具：`time.now`、`weather.current`（需 `[tools] weather_city`）、
 `camera.snapshot`（最新画面 + 查看地址）。实时执行经 SSE `agent_step`
 事件送出，并落进对话记录 `thinking` 的 `source:"tool"` 条目。
+
+**MCP 信任门**：`[[agent.mcp_servers]]` 条目按启动行（command+args+env）
+内容指纹化——新增或**编辑过**的条目默认**拒启**（日志告警点名确认方
+法），经本端点确认当前指纹后立即生效；旧确认不世袭（改启动行需重新
+确认）。持久化于 settings 袋 `agent.mcp_trust`。
 
 ### 离家模式（规范 §3.6）
 
