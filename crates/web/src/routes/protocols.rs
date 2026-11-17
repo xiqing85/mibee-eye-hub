@@ -807,6 +807,9 @@ mod tests {
         // GET /api/config returns this DB-backed field; PUT validation must
         // accept it or the settings editor's no-op round-trip 400s (see #50).
         assert!(props.contains_key("ptz_onvif_endpoint"));
+        assert!(props.contains_key("ptz_profile_token"));
+        assert!(props.contains_key("ptz_username"));
+        assert!(props.contains_key("ptz_password"));
     }
 
     #[test]

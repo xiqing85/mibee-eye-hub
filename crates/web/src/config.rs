@@ -159,6 +159,15 @@ pub struct Gb28181Config {
     /// settings editor's no-op round-trip does not 400.
     #[serde(default)]
     pub ptz_onvif_endpoint: String,
+    /// ONVIF PTZ proxy head credentials, persisted in the same GB28181
+    /// protocol-config document. Round-tripped by GET/PUT; `ptz_password`
+    /// is redacted/restored like the SIP password.
+    #[serde(default = "default_ptz_profile_token")]
+    pub ptz_profile_token: String,
+    #[serde(default)]
+    pub ptz_username: String,
+    #[serde(default)]
+    pub ptz_password: String,
     #[serde(default)]
     pub gb35114: Gb35114Config,
 }
@@ -220,6 +229,10 @@ fn default_gb28181_heartbeat_interval() -> u64 {
 fn default_gb28181_heartbeat_timeout() -> u32 {
     3
 }
+fn default_ptz_profile_token() -> String {
+    "Profile_1".to_string()
+}
+
 fn default_gb28181_channel_id() -> String {
     "34020000001320000001".into()
 }
@@ -248,6 +261,9 @@ impl Default for Gb28181Config {
             local_sip_port: 5060,
             talkback_playback: default_gb28181_talkback_playback(),
             ptz_onvif_endpoint: String::new(),
+            ptz_profile_token: default_ptz_profile_token(),
+            ptz_username: String::new(),
+            ptz_password: String::new(),
             gb35114: Gb35114Config::default(),
         }
     }
