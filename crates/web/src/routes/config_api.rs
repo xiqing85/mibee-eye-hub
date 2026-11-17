@@ -670,7 +670,8 @@ pub fn redact_secrets(mut value: serde_json::Value) -> serde_json::Value {
         match value {
             serde_json::Value::Object(map) => {
                 for (key, child) in map.iter_mut() {
-                    if SECRET_KEYS.contains(&key.to_ascii_lowercase().as_str())
+                    let key_lc = key.to_ascii_lowercase();
+                    if (SECRET_KEYS.contains(&key_lc.as_str()) || key_lc.ends_with("_password"))
                         && !matches!(child, serde_json::Value::Null)
                         && child.as_str() != Some("")
                     {
@@ -748,6 +749,7 @@ pub(crate) mod tests {
             "list": [{ "password": "in-array" }],
             "push_url": "rtmp://user:pw@ingest.example/live/key",
             "ai": { "cpai_token": "cpai-bearer-secret", "cpai_endpoint": "http://nvr.lan:32168/v1/vision/detection" },
+            "ptz_password": "ptz-head-secret",
         });
         let redacted = redact_secrets(doc);
         assert_eq!(redacted["password"], serde_json::json!(REDACTED));
@@ -755,6 +757,8 @@ pub(crate) mod tests {
         assert_eq!(redacted["list"][0]["password"], serde_json::json!(REDACTED));
         assert_eq!(redacted["push_url"], serde_json::json!(REDACTED));
         assert_eq!(redacted["ai"]["cpai_token"], serde_json::json!(REDACTED));
+        // Suffix `_password` keys (GB28181 PTZ proxy head) are secrets too.
+        assert_eq!(redacted["ptz_password"], serde_json::json!(REDACTED));
         // The endpoint URL is configuration, not a credential — it renders.
         assert_eq!(
             redacted["ai"]["cpai_endpoint"],

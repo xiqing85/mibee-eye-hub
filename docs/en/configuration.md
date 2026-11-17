@@ -511,6 +511,9 @@ register_interval_secs = 60
 | `talkback_playback` | bool | `true` | Play platform voice talkback on the local output device (fail-open 488 when unavailable) |
 | `talkback_upstream` | bool | `false` | Send microphone audio upstream during talkback/pickup sessions (G.711 20 ms frames, §9.2 send half); off = receive-only intercom |
 | `ptz_onvif_endpoint` | string | `""` | ONVIF endpoint of the external PTZ head used by the GB28181 PTZ proxy (M4-a); empty = no proxy. The settings editor round-trips this field verbatim |
+| `ptz_profile_token` | string | `Profile_1` | ONVIF Profile token used by the PTZ proxy |
+| `ptz_username` | string | `""` | ONVIF auth username for the PTZ proxy |
+| `ptz_password` | string | `""` | ONVIF auth password for the PTZ proxy (GET redacts to `****`, restored on save) |
 | `ptz_onvif_endpoint` | String | `""` | External ONVIF head endpoint (M4-a PTZ proxy): `http://host:port/onvif/device_service`; empty = no head, PTZ stays a no-op ack |
 | `ptz_profile_token` | String | `"Profile_1"` | Media profile token the PTZ commands address |
 | `ptz_username` | String | `""` | ONVIF WS-UsernameToken username (empty = anonymous) |
