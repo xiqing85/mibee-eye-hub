@@ -153,6 +153,12 @@ pub struct Gb28181Config {
     /// (GB/T 28181-2022 §9.2 send half). Off = receive-only intercom.
     #[serde(default)]
     pub talkback_upstream: bool,
+    /// ONVIF endpoint of the external PTZ head used by the GB28181 PTZ proxy
+    /// (M4-a). Empty = no proxy; a value here is advertised back by
+    /// `GET /api/config` and must be accepted by `PUT /api/config` so the
+    /// settings editor's no-op round-trip does not 400.
+    #[serde(default)]
+    pub ptz_onvif_endpoint: String,
     #[serde(default)]
     pub gb35114: Gb35114Config,
 }
@@ -241,6 +247,7 @@ impl Default for Gb28181Config {
             channel_id: default_gb28181_channel_id(),
             local_sip_port: 5060,
             talkback_playback: default_gb28181_talkback_playback(),
+            ptz_onvif_endpoint: String::new(),
             gb35114: Gb35114Config::default(),
         }
     }

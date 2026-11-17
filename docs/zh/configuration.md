@@ -472,6 +472,7 @@ register_interval_secs = 60
 | `heartbeat_timeout_count` | u32 | `3` | 判定重连前允许丢失的心跳次数 |
 | `talkback_playback` | bool | `true` | 在本机输出设备播放平台语音对讲（不可用时 fail-open 488） |
 | `talkback_upstream` | bool | `false` | 对讲/拾音会话中向平台上行麦克风音频（G.711 20ms 帧，§9.2 发送半边）；关闭=只收不发的单向对讲 |
+| `ptz_onvif_endpoint` | string | `""` | GB28181 PTZ 代理使用的外部 ONVIF 云台端点（M4-a）；空=不启用代理。设置页保存会原样回传此字段 |
 | `ptz_onvif_endpoint` | String | `""` | 外接云台 ONVIF 端点（M4-a PTZ 代理）：`http://host:port/onvif/device_service`；空 = 无云台，PTZ 指令保持 no-op 应答 |
 | `ptz_profile_token` | String | `"Profile_1"` | PTZ 命令面向的媒体 profile token |
 | `ptz_username` | String | `""` | ONVIF WS-UsernameToken 认证用户名（空 = 匿名） |

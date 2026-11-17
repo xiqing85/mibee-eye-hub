@@ -804,6 +804,9 @@ mod tests {
         assert!(props.contains_key("register_interval_secs"));
         assert!(props.contains_key("talkback_playback"));
         assert!(props.contains_key("talkback_upstream"));
+        // GET /api/config returns this DB-backed field; PUT validation must
+        // accept it or the settings editor's no-op round-trip 400s (see #50).
+        assert!(props.contains_key("ptz_onvif_endpoint"));
     }
 
     #[test]
