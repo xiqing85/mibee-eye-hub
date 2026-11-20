@@ -78,10 +78,10 @@ pub async fn insert_hearing_record(
         .execute(&mut *tx)
         .await
         .context("hearing record: insert")?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM hearing_records WHERE id NOT IN \
          (SELECT id FROM hearing_records ORDER BY id DESC LIMIT {HEARING_RECORDS_CAP})"
-    ))
+    )))
     .execute(&mut *tx)
     .await
     .context("hearing record: prune")?;
@@ -200,10 +200,10 @@ pub async fn insert_conversation_turn_with_cap(
         .fetch_one(&mut *tx)
         .await
         .context("conversation turn: rowid")?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM conversation_turns WHERE id NOT IN \
          (SELECT id FROM conversation_turns ORDER BY id DESC LIMIT {cap})"
-    ))
+    )))
     .execute(&mut *tx)
     .await
     .context("conversation turn: prune")?;
@@ -335,10 +335,10 @@ pub async fn insert_away_event_with_cap(
     .fetch_all(&mut *tx)
     .await
     .context("away event: pruned names")?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM away_events WHERE id NOT IN \
          (SELECT id FROM away_events ORDER BY id DESC LIMIT {cap})"
-    ))
+    )))
     .execute(&mut *tx)
     .await
     .context("away event: prune")?;
@@ -402,9 +402,9 @@ const AWAY_EVENT_COLUMNS: &str = "id, camera_id, kind, started_ms, labels, face_
 /// cap 200).
 pub async fn list_away_events(pool: &SqlitePool, limit: i64) -> Result<Vec<AwayEventRecord>> {
     let limit = limit.clamp(1, 200);
-    let rows: Vec<AwayEventRow> = sqlx::query_as(&format!(
+    let rows: Vec<AwayEventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {AWAY_EVENT_COLUMNS} FROM away_events ORDER BY id DESC LIMIT ?1"
-    ))
+    )))
     .bind(limit)
     .fetch_all(pool)
     .await
@@ -414,9 +414,9 @@ pub async fn list_away_events(pool: &SqlitePool, limit: i64) -> Result<Vec<AwayE
 
 /// Fetch one away event (snapshot endpoint join key).
 pub async fn get_away_event(pool: &SqlitePool, id: i64) -> Result<Option<AwayEventRecord>> {
-    let row: Option<AwayEventRow> = sqlx::query_as(&format!(
+    let row: Option<AwayEventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {AWAY_EVENT_COLUMNS} FROM away_events WHERE id = ?1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -433,9 +433,9 @@ async fn patch_away_field(
     column: &str,
     value: &str,
 ) -> Result<Option<AwayEventRecord>> {
-    let rows = sqlx::query_as::<_, AwayEventRow>(&format!(
+    let rows = sqlx::query_as::<_, AwayEventRow>(sqlx::AssertSqlSafe(format!(
         "UPDATE away_events SET {column} = ?1 WHERE id = ?2 RETURNING {AWAY_EVENT_COLUMNS}"
-    ))
+    )))
     .bind(value)
     .bind(id)
     .fetch_all(pool)
@@ -460,10 +460,10 @@ pub async fn update_away_reply(
     id: i64,
     reply: &str,
 ) -> Result<Option<AwayEventRecord>> {
-    let rows = sqlx::query_as::<_, AwayEventRow>(&format!(
+    let rows = sqlx::query_as::<_, AwayEventRow>(sqlx::AssertSqlSafe(format!(
         "UPDATE away_events SET visitor_reply = ?1, state = 'answered' WHERE id = ?2 \
          RETURNING {AWAY_EVENT_COLUMNS}"
-    ))
+    )))
     .bind(reply)
     .bind(id)
     .fetch_all(pool)
@@ -527,9 +527,9 @@ pub async fn list_away_events_since(
     limit: i64,
 ) -> Result<Vec<AwayEventRecord>> {
     let limit = limit.clamp(1, 50);
-    let rows: Vec<AwayEventRow> = sqlx::query_as(&format!(
+    let rows: Vec<AwayEventRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
         "SELECT {AWAY_EVENT_COLUMNS} FROM away_events WHERE started_ms >= ?1          ORDER BY id DESC LIMIT ?2"
-    ))
+    )))
     .bind(since_ms)
     .bind(limit)
     .fetch_all(pool)
@@ -1190,7 +1190,7 @@ pub(crate) async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             continue;
         }
 
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .execute(pool)
             .await
             .with_context(|| format!("Failed to apply migration {num} ({name})"))?;

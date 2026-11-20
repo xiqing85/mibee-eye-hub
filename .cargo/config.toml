@@ -9,3 +9,8 @@ fmt-check = "fmt --check"
 [env]
 # Use nextest-compatible test output style
 CARGO_TERM_COLOR = "always"
+# target/debug/incremental grew to 45G within two months and filled the disk
+# (2026-11-10, masquerading as an LLVM linker crash). Incremental saves a few
+# seconds per local build but is not worth an unbounded cache — CI has no
+# use for it at all. Cleanup + policy tracked in mibee-eye-hub#15.
+CARGO_INCREMENTAL = "0"

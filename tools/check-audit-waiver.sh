@@ -6,18 +6,6 @@
 # each one re-derives its justification here on every run. The script fails the
 # job when a premise breaks — fix the dependency, never widen the ignore list.
 #
-# Waiver 1: RUSTSEC-2023-0071 (`rsa`) — UNREACHABLE-only waiver.
-#   `rsa` is pulled in only by sqlx 0.8's Cargo.toml, which lists every
-#   backend unconditionally (sqlx-mysql -> rsa), and this application is
-#   SQLite-only so the MySQL RSA authentication path it exposes is never
-#   executed. Fails when:
-#     a. `rsa` becomes reachable for some real target — a live vulnerability
-#        being waved away;
-#     b. a patched version of `rsa` exists — the waiver is obsolete and
-#        should be replaced by an upgrade;
-#     c. `rsa` disappears from the lockfile entirely — the waiver is dead
-#        config and should be removed.
-#
 # Waiver 2: RUSTSEC-2026-0367/0368/0369 (`zip` 2.x) — BUILD-ONLY waiver.
 #   The only consumer is `sherpa-onnx-sys` 1.13.8's build script, which
 #   unpacks release archives it downloads; `zip` is never compiled into a
@@ -44,87 +32,10 @@ fi
 fail=0
 
 # ════════════════════════════════════════════════════════════════════════════
-# Waiver 1 — rsa / RUSTSEC-2023-0071 (unreachable)
-# ════════════════════════════════════════════════════════════════════════════
-
-ADVISORY="RUSTSEC-2023-0071"
-PACKAGE="rsa"
-
-echo "check-audit-waiver: verifying the ${ADVISORY} (${PACKAGE}) waiver"
-
-# ── 1c. Is the package still in the graph at all? ──────────────────────────
-if ! grep -qE "^name = \"${PACKAGE}\"" Cargo.lock; then
-    echo "check-audit-waiver: ${PACKAGE} is no longer in Cargo.lock." >&2
-    echo "  The waiver is dead config — remove ${ADVISORY} from tools/audit.toml" >&2
-    echo "  and drop this script from the audit job." >&2
-    exit 1
-fi
-
-# ── 1a. Is it reachable for a real target? ─────────────────────────────────
-# `--target all` resolves the graph for every platform, which is what a bare
-# `cargo tree -i` misses: it only reports the current host's graph, and
-# `rsa` can look absent locally while being pulled in elsewhere.
-REACHABLE="$(cargo tree --target all --invert "${PACKAGE}" 2>/dev/null || true)"
-
-if [[ -n "${REACHABLE//[[:space:]]/}" ]]; then
-    echo "check-audit-waiver: ${PACKAGE} IS reachable for at least one target:" >&2
-    echo "${REACHABLE}" >&2
-    echo >&2
-    echo "  The waiver is no longer valid. This is a live advisory, not a" >&2
-    echo "  structural lockfile artefact. Fix the dependency — do not widen" >&2
-    echo "  the ignore list." >&2
-    fail=1
-fi
-
-# ── 1b. Has upstream shipped a patch? ─────────────────────────────────────
-# The advisory's `patched = []` is intentional (RustCrypto/RSA#626), so a
-# release appearing here means the waiver should become an upgrade.
-PATCHED="$(python3 - <<'PY'
-import json, subprocess, sys, urllib.request
-
-# Prefer a local advisory DB if cargo-audit has one; fall back to the advisory
-# API so the check works on a fresh CI runner.
-try:
-    out = subprocess.run(
-        ["cargo", "audit", "--json", "--file", "Cargo.lock", "--no-fetch"],
-        capture_output=True, text=True, check=False,
-    )
-    data = json.loads(out.stdout)
-    for v in data.get("vulnerabilities", {}).get("list", []):
-        if v["advisory"]["id"] == "RUSTSEC-2023-0071":
-            print(",".join(v["versions"].get("patched") or []))
-            sys.exit(0)
-    # Advisory withdrawn or absent -> nothing to patch.
-    print("")
-    sys.exit(0)
-except Exception:
-    # cargo-audit unavailable or DB not fetched yet: try the API.
-    try:
-        with urllib.request.urlopen(
-            "https://rustsec.org/advisories/RUSTSEC-2023-0071.json", timeout=20
-        ) as fh:
-            print(",".join(json.load(fh).get("versions", {}).get("patched") or []))
-    except Exception:
-        print("UNKNOWN")
-PY
-)"
-
-echo "check-audit-waiver: patched versions found upstream: ${PATCHED:-none}"
-
-if [[ "${PATCHED}" == "UNKNOWN" ]]; then
-    echo "check-audit-waiver: WARNING could not determine whether a patch exists." >&2
-    echo "  Not fatal, but the waiver is no longer being proven current." >&2
-elif [[ -n "${PATCHED}" ]]; then
-    echo "check-audit-waiver: a patched ${PACKAGE} now exists (${PATCHED})." >&2
-    echo "  The waiver is obsolete — upgrade instead of ignoring." >&2
-    fail=1
-fi
-
-# ════════════════════════════════════════════════════════════════════════════
 # Waiver 2 — zip / RUSTSEC-2026-0367,0368,0369 (build-only)
 # ════════════════════════════════════════════════════════════════════════════
 
-ZIP_ADVISORIES="RUSTSEC-2026-0367/0368/0369/0429"
+ZIP_ADVISORIES="RUSTSEC-2026-0367/0368/0369/0429/0545/0548"
 
 echo "check-audit-waiver: verifying the ${ZIP_ADVISORIES} (zip) waiver"
 
@@ -353,53 +264,6 @@ if [[ -n "${STRAY//[[:space:]]/}" ]]; then
     fail=1
 else
     echo "check-audit-waiver: zvariant stays under the ksni/zbus family (as the waiver assumes)"
-fi
-
-# ════════════════════════════════════════════════════════════════════════════
-# Waiver 6 — libsqlite3-sys / RUSTSEC-2026-0459 (local-file-write-only)
-# ════════════════════════════════════════════════════════════════════════════
-
-SQLITE_ADVISORY="RUSTSEC-2026-0459"
-
-echo "check-audit-waiver: verifying the ${SQLITE_ADVISORY} (libsqlite3-sys bundled SQLite) waiver"
-
-SQLITE_LOCK="$(grep -A1 '^name = "libsqlite3-sys"$' Cargo.lock | grep version | cut -d'"' -f2)"
-
-# 6c. Still in the lock at all?
-if [[ -z "${SQLITE_LOCK}" ]]; then
-    echo "check-audit-waiver: libsqlite3-sys left the lockfile." >&2
-    echo "  The waiver is dead config — remove ${SQLITE_ADVISORY} from tools/audit.toml." >&2
-    fail=1
-fi
-
-# 6b. Has the fix line been reached (rusqlite 0.41 upgrade done)?
-if python3 -c "
-import sys
-ver = '${SQLITE_LOCK}'.split('.')
-for i, part in enumerate([0, 39, 0]):
-    cur = int(ver[i]) if i < len(ver) and ver[i].isdigit() else 0
-    if cur != part:
-        sys.exit(0 if cur > part else 1)
-sys.exit(0)
-"; then
-    echo "check-audit-waiver: libsqlite3-sys ${SQLITE_LOCK} >= 0.39.0 — advisory no longer applies." >&2
-    echo "  The waiver is dead config — remove ${SQLITE_ADVISORY} from tools/audit.toml." >&2
-    fail=1
-else
-    echo "check-audit-waiver: libsqlite3-sys ${SQLITE_LOCK} pre-fix (waiver premise holds)"
-fi
-
-# 6a. Premise guard: the vulnerable bundled copy must come via the known
-# product deps (rusqlite / sqlx). A stray new dependent changes the story.
-SQLITE_DEPS="$(cargo tree --target all --invert "libsqlite3-sys@${SQLITE_LOCK}" 2>/dev/null | grep -oE '^[a-z0-9_-]+ v' | sed -E 's/ v$//' | sort -u || true)"
-SQLITE_STRAY="$(printf '%s\n' "${SQLITE_DEPS}" | grep -vE '^(libsqlite3-sys|rusqlite|sqlx|sqlx-sqlite|hashlink|fallible-iterator|fallible-streaming-iterator|smallvec|mibee-eye|web|security)$' || true)"
-if [[ -n "${SQLITE_STRAY//[[:space:]]/}" ]]; then
-    echo "check-audit-waiver: libsqlite3-sys gained unexpected dependents:" >&2
-    echo "${SQLITE_STRAY}" >&2
-    echo "  Review the waiver — the rusqlite/sqlx premise may no longer hold." >&2
-    fail=1
-else
-    echo "check-audit-waiver: libsqlite3-sys stays under rusqlite/sqlx (as the waiver assumes)"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════

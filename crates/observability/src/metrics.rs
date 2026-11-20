@@ -798,6 +798,22 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `MODEL_EVENT_SINK` is a process-global OnceLock. Two tests in this
+    /// binary emit `model_call` signals: the sink-recording test below and
+    /// `test_model_call_guard_is_noop_safe_without_registration`. When they
+    /// run in parallel under a loaded `cargo test --workspace`, the second
+    /// test's signals land in the first test's recorder and break its exact
+    /// `seen.len()` assertion (observed 2026-11-09/11, mibee-eye-hub#15).
+    /// Serialize both tests with a test-local mutex — no production change.
+    static MODEL_SINK_TEST_LOCK: Mutex<()> = Mutex::new(());
+    fn model_sink_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test poisons the mutex; the other test must still run.
+        MODEL_SINK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Live signals (SPEC §6 `model_call`, appendix A #50): one Start on
     /// entry, exactly one End (explicit or drop) with duration + outcome.
@@ -805,7 +821,7 @@ mod tests {
     /// lives in this single test.
     #[test]
     fn model_call_signals_start_then_single_end() {
-        use std::sync::Mutex;
+        let _serial = model_sink_test_guard();
         #[derive(Debug)]
         struct Rec(String, ModelCallPhase, Option<u64>, Option<bool>);
         let seen: std::sync::Arc<Mutex<Vec<Rec>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -1324,6 +1340,7 @@ mod tests {
 
     #[test]
     fn test_model_call_guard_is_noop_safe_without_registration() {
+        let _serial = model_sink_test_guard();
         // Unit tests never call register_metrics() — the global is absent,
         // so the guard must measure-and-export only, never panic.
         let guard = model_call("ocr", "pp-ocrv5");

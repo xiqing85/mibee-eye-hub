@@ -41,8 +41,8 @@ opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
 opentelemetry-prometheus = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 prometheus = "0.14"
-rusqlite = { version = "0.32", features = ["bundled"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+sqlx = { version = "0.9.1", features = ["runtime-tokio", "sqlite", "json"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
