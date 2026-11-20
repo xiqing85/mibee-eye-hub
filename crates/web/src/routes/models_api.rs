@@ -494,6 +494,15 @@ mod tests {
     /// process-global; tests that swap the catalog hold the guard).
     static CATALOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The guards above only hold `CATALOG_LOCK` for the instant they
+    /// set/clear the global — not across the test body. With parallel
+    /// tests, the pin-less override could land between this test's
+    /// "real catalog" clear and its activate call, bypassing the sha
+    /// integrity gate (409 → 200, seen on CI 2026-11-20). Serialize the
+    /// two catalog-swapping tests for their whole async body with a
+    /// tokio mutex (a std MutexGuard across await trips clippy).
+    static CATALOG_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     struct CatalogOverride;
 
     impl CatalogOverride {
@@ -516,6 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_lists_installed_state_and_tasks() {
+        let _serial = CATALOG_TEST_SERIAL.lock().await;
         let dir = fake_root(&format!("{}-{}", std::module_path!(), line!()));
         install_yunet(&dir);
         let (app, _pool, _mgr) = app_with(&dir).await;
@@ -551,6 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn download_unknown_404_and_nosource_404() {
+        let _serial = CATALOG_TEST_SERIAL.lock().await;
         let dir = fake_root(&format!("{}-{}", std::module_path!(), line!()));
         let (app, _pool, _mgr) = app_with(&dir).await;
         let res = app
@@ -577,6 +588,7 @@ mod tests {
 
     #[tokio::test]
     async fn activate_restart_class_persists_and_is_idempotent() {
+        let _serial = CATALOG_TEST_SERIAL.lock().await;
         let dir = fake_root(&format!("{}-{}", std::module_path!(), line!()));
         install_yunet(&dir);
         let (app, pool, _mgr) = app_with(&dir).await;
@@ -635,8 +647,10 @@ mod tests {
     /// size must NOT activate — 409 with the mismatching file named.
     #[tokio::test]
     async fn activate_blocks_on_integrity_mismatch() {
-        // RAII hold of the REAL catalog (override cleared) across the
-        // awaits — a plain guard would trip await_holding_lock.
+        let _serial = CATALOG_TEST_SERIAL.lock().await;
+        // RAII clear of the REAL catalog override; cross-test exclusion is
+        // provided by CATALOG_TEST_SERIAL above (a std guard held across
+        // await would trip await_holding_lock).
         struct RealCatalog;
         impl RealCatalog {
             fn hold() -> Self {
@@ -679,6 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_guards_active_and_missing() {
+        let _serial = CATALOG_TEST_SERIAL.lock().await;
         let dir = fake_root(&format!("{}-{}", std::module_path!(), line!()));
         install_yunet(&dir);
         let (app, pool, _mgr) = app_with(&dir).await;
@@ -731,6 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn routing_endpoints_roundtrip_and_reject_garbage() {
+        let _serial = CATALOG_TEST_SERIAL.lock().await;
         use streaming::model_route::Provider;
         let routing = Arc::new(std::sync::RwLock::new(
             streaming::model_route::RoutingConfig::default(),
